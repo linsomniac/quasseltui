@@ -292,8 +292,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.mode == "ui":
         return _ui(args)
 
-    parser.print_help(sys.stderr)
-    return 2
+    # No subcommand given. Route through `parser.exit` so this error
+    # path looks identical to every other argparse failure (unknown
+    # flag, bad type, etc.), which raise `SystemExit(2)` from inside
+    # `parse_args`. Programmatic callers and tests can then handle
+    # all CLI-usage errors with a single `pytest.raises(SystemExit)`
+    # instead of branching on "sometimes returns, sometimes raises".
+    parser.exit(2, parser.format_help())
 
 
 def _ui_demo(_args: argparse.Namespace) -> int:

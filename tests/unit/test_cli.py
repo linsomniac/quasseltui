@@ -713,3 +713,28 @@ async def test_dump_state_sanitizes_malicious_irc_strings(
     assert "\\x1b" in out
     assert "\\x07" in out
     assert "\\x08" in out
+
+
+def test_main_with_no_subcommand_prints_help_and_exits_2(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression for phase 7 follow-up: running `quasseltui` with no
+    subcommand used to print a placeholder "under construction" banner
+    and exit 0, which left new users unable to discover the six
+    available subcommands. The fix routes through `parser.exit(2, ...)`
+    so the bare-invocation path looks identical to every other argparse
+    error (unknown flag, bad type, etc.) — it raises `SystemExit(2)`
+    after printing the full help to stderr. This test pins that user-
+    visible contract so a future refactor cannot silently drop it.
+    """
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main([])
+
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    # Full help page, not just argparse's one-line usage error.
+    assert "usage: quasseltui" in err
+    # Every subcommand advertised in `build_parser` must appear so the
+    # user immediately sees what they can actually run next.
+    for subcommand in ("probe-only", "login-only", "stream-only", "dump-state", "ui-demo", "ui"):
+        assert subcommand in err

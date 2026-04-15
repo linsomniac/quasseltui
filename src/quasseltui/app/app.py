@@ -54,13 +54,16 @@ from quasseltui.app.bridge import ClientBridge
 from quasseltui.app.messages import (
     ActiveBufferUpdated,
     BufferListUpdated,
+    BufferSelected,
+    LineSubmitted,
     SessionEnded,
 )
 from quasseltui.app.screens.chat import ChatScreen
 from quasseltui.app.widgets.buffer_tree import BufferTree
 from quasseltui.app.widgets.message_log import MessageLog
 from quasseltui.client.state import ClientState
-from quasseltui.protocol.usertypes import BufferId
+from quasseltui.protocol.errors import QuasselError
+from quasseltui.protocol.usertypes import BufferId, BufferInfo, NetworkId
 from quasseltui.util.text import sanitize_terminal
 
 if TYPE_CHECKING:
@@ -110,8 +113,17 @@ class QuasselApp(App[None]):
     # instance attribute, so we annotate with `ClassVar` to satisfy
     # ruff's RUF012 mutable-default lint without fighting the framework
     # contract.
+    #
+    # The alt+up/alt+down cycle bindings use `priority=True` so they
+    # fire even while the `Input` widget has focus — without priority,
+    # Textual's `Input` swallows arrow keys as cursor-move events and
+    # the user would have to Tab out of the input before they could
+    # switch buffers. Picking alt+arrow rather than plain arrow keeps
+    # plain cursor navigation inside the input working as expected.
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+q", "quit", "Quit", priority=True),
+        Binding("alt+up", "prev_buffer", "Previous buffer", priority=True, show=False),
+        Binding("alt+down", "next_buffer", "Next buffer", priority=True, show=False),
     ]
 
     def __init__(
@@ -180,6 +192,97 @@ class QuasselApp(App[None]):
         else:
             log.clear()
 
+    @on(BufferSelected)
+    def _on_buffer_selected(self, event: BufferSelected) -> None:
+        """Flip to a user-requested buffer.
+
+        The tree posts this on click/Enter; the alt+up/alt+down
+        actions post it too, so there is exactly one code path that
+        changes `active_buffer_id`. Idempotent — if the incoming
+        buffer_id already matches the current active pointer we
+        early-return, which breaks the one-round-trip feedback loop
+        between `tree.set_active_buffer` → `tree.select_node` →
+        `NodeSelected` → `BufferSelected` that the programmatic
+        cycle bindings create.
+        """
+        if event.buffer_id == self.active_buffer_id:
+            return
+        self._set_active_buffer(event.buffer_id)
+
+    @on(LineSubmitted)
+    async def _on_line_submitted(self, event: LineSubmitted) -> None:
+        """Forward a typed line to the core via `QuasselClient.send_input`.
+
+        The widget drops empty lines before posting, so the handler
+        doesn't have to re-check. We still guard three other cases
+        that can all happen in practice:
+
+        1. No client (`ui-demo` mode) — silently drop; there's no
+           one to send to.
+        2. No active buffer — the user hit Enter before any buffer
+           landed on screen. Without the guard we'd raise into
+           Textual's bubbling machinery and corrupt the event loop.
+        3. `QuasselError` from `send_input` — typically "buffer
+           unknown" after a racey removal, or a socket write failure
+           when the connection is already gone. Logging is the right
+           response for phase 9; phase 11's status bar will make it
+           user-visible via a toast.
+        """
+        if self._client is None:
+            return
+        if self.active_buffer_id is None:
+            _log.debug("dropping input line with no active buffer: %r", event.text)
+            return
+        try:
+            await self._client.send_input(self.active_buffer_id, event.text)
+        except QuasselError as exc:
+            _log.warning("send_input failed: %s", exc)
+
+    def action_prev_buffer(self) -> None:
+        """Cycle backward through the tree's buffer ordering."""
+        self._cycle_buffer(-1)
+
+    def action_next_buffer(self) -> None:
+        """Cycle forward through the tree's buffer ordering."""
+        self._cycle_buffer(1)
+
+    def _cycle_buffer(self, delta: int) -> None:
+        """Move `active_buffer_id` to the next/previous buffer.
+
+        The ordering matches `BufferTree._populate` — networks sorted
+        by id, then buffers within a network sorted by (type, name).
+        Mirrors rather than queries the tree because the tree may not
+        be mounted yet (e.g. if the user somehow triggers the binding
+        during the transient pre-screen state). `_set_active_buffer`
+        will then ask the tree to move its cursor, if one exists.
+        """
+        ordered = _ordered_buffer_ids(self._state)
+        if not ordered:
+            return
+        if self.active_buffer_id not in ordered:
+            self._set_active_buffer(ordered[0])
+            return
+        idx = ordered.index(self.active_buffer_id)
+        target = ordered[(idx + delta) % len(ordered)]
+        self._set_active_buffer(target)
+
+    def _set_active_buffer(self, buffer_id: BufferId) -> None:
+        """Single code path for flipping the active buffer.
+
+        Called by `_on_buffer_selected` and by the cycle actions.
+        Updates `active_buffer_id`, posts `ActiveBufferUpdated` so
+        the message log redraws, and asks the tree to move its
+        cursor so the sidebar visual stays consistent with the
+        active pointer. All three steps are guarded against a
+        no-op flip at the caller level, so calling this with the
+        current id is cheap but also unexpected.
+        """
+        self.active_buffer_id = buffer_id
+        self.post_message(ActiveBufferUpdated(buffer_id=buffer_id))
+        tree = self._find(BufferTree)
+        if tree is not None:
+            tree.set_active_buffer(buffer_id)
+
     def _find(self, widget_type: type[_WidgetT]) -> _WidgetT | None:
         """Query the current screen for a widget, returning None if absent.
 
@@ -222,6 +325,29 @@ class QuasselApp(App[None]):
         _log.warning("session ended: %s", safe_reason)
         if self._client is not None and event.fatal:
             self.exit(return_code=1, message=f"quasseltui: {safe_reason}")
+
+
+def _ordered_buffer_ids(state: ClientState) -> list[BufferId]:
+    """Flatten `state.buffers` into the same order `BufferTree` renders.
+
+    Networks are sorted by id; within a network, buffers are sorted
+    by `(type, name.lower())` so status rises above channels and
+    channels rise above queries. Mirrors `BufferTree._populate` and
+    its `_buffer_sort_key` so alt+up/alt+down cycles match the
+    visual order on screen — users would (rightly) find it jarring
+    if the cycle order disagreed with the sidebar.
+    """
+    ordered: list[BufferId] = []
+    for network_id in sorted(state.networks, key=int):
+        target = NetworkId(int(network_id))
+        network_buffers = [buf for buf in state.buffers.values() if buf.network_id == target]
+        network_buffers.sort(key=_cycle_sort_key)
+        ordered.extend(buf.buffer_id for buf in network_buffers)
+    return ordered
+
+
+def _cycle_sort_key(buf: BufferInfo) -> tuple[int, str]:
+    return (buf.type.value, buf.name.lower())
 
 
 __all__ = [

@@ -53,6 +53,44 @@ class ActiveBufferUpdated(Message):
         self.buffer_id = buffer_id
 
 
+class BufferSelected(Message):
+    """The user asked to switch the active buffer.
+
+    Posted by the `BufferTree` when a leaf is clicked or Enter is
+    pressed on it, and also by the app's own alt+up/alt+down
+    cycle-buffer actions. The app handler is the single place that
+    flips `QuasselApp.active_buffer_id` and posts the follow-up
+    `ActiveBufferUpdated`, so the tree and the cycling bindings share
+    one code path and can't drift from each other.
+    """
+
+    def __init__(self, buffer_id: BufferId) -> None:
+        super().__init__()
+        self.buffer_id = buffer_id
+
+
+class LineSubmitted(Message):
+    """The user pressed Enter in the input bar.
+
+    `InputBar` posts this with the current line contents (which it
+    then clears). The app handler is responsible for routing the
+    text to `QuasselClient.send_input` — the widget stays dumb and
+    has no client reference of its own. Phase 11 will slot /-command
+    parsing into the same handler without widening the message.
+
+    Named `LineSubmitted` rather than `InputSubmitted` on purpose:
+    Textual derives handler method names from the message class name
+    (snake-cased), and `InputSubmitted` would collide with the
+    built-in `on_input_submitted` handler for `Input.Submitted`,
+    causing Textual to route both messages to the same method and
+    trip over `event.value` not existing on our custom class.
+    """
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = text
+
+
 class SessionEnded(Message):
     """The live client disconnected.
 
@@ -78,5 +116,7 @@ class SessionEnded(Message):
 __all__ = [
     "ActiveBufferUpdated",
     "BufferListUpdated",
+    "BufferSelected",
+    "LineSubmitted",
     "SessionEnded",
 ]

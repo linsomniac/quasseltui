@@ -28,6 +28,7 @@ from typing import Any
 from quasseltui.qt.datastream import QDataStreamError, QDataStreamReader, QDataStreamWriter
 from quasseltui.qt.types import QMetaType
 from quasseltui.qt.usertypes import (
+    name_for_python_value,
     normalize_name,
     read_user_type_payload,
     write_user_type_payload,
@@ -332,6 +333,20 @@ def write_variant(
         return
 
     if type_id is None:
+        # Dataclass values registered in `quasseltui.qt.usertypes` auto-
+        # route through the UserType envelope so callers (most
+        # importantly the signalproxy encoder's `*message.params`
+        # spread) can pass a `BufferInfo` without pre-wrapping it.
+        # Without this, `_infer_type_id` would raise a `TypeError` for
+        # every dataclass value and every RpcCall carrying one would
+        # have to be rebuilt through a per-message wrapper.
+        inferred_user_type = name_for_python_value(value)
+        if inferred_user_type is not None:
+            writer.write_uint32(QMetaType.UserType)
+            writer.write_uint8(0)
+            writer.write_qbytearray(inferred_user_type)
+            write_user_type_payload(writer, inferred_user_type, value)
+            return
         type_id = _infer_type_id(value)
 
     writer.write_uint32(type_id)

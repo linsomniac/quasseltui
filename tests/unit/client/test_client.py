@@ -325,3 +325,54 @@ class TestBufferSeeding:
         added = [e for e in events if isinstance(e, BufferAdded)]
         assert {a.name for a in added} == {"#python", "#rust"}
         assert client.state.buffers[BufferId(10)].name == "#python"
+
+
+class TestSendInput:
+    """Phase 9: outbound `sendInput` path — UI → core."""
+
+    async def test_send_input_emits_expected_rpc_call(self) -> None:
+        """`send_input` must produce a `RpcCall` with the Quassel-signature
+        `signalName` and the full `BufferInfo` as the first parameter.
+
+        Regression guard for two easy-to-make mistakes: (a) sending just
+        the `BufferId` int (which the core would reject because the
+        slot signature expects a `BufferInfo`), and (b) using the wrong
+        signal-name prefix or argument spelling, which core would also
+        silently drop.
+        """
+        buf = _buffer(10, 1, "#python")
+        session = _session(network_ids=[1], buffer_infos=[buf])
+        script: list[ProtocolEvent] = [_session_ready(session, frozenset())]
+        client, fake = _make_client(script)
+        # Drain the session-ready fan-out so state.buffers is populated.
+        await _drain(client)
+        fake.sent.clear()
+
+        await client.send_input(buf.buffer_id, "hello world")
+
+        rpc_calls = [m for m in fake.sent if isinstance(m, RpcCall)]
+        assert len(rpc_calls) == 1
+        rpc = rpc_calls[0]
+        assert rpc.signal_name == b"2sendInput(BufferInfo,QString)"
+        assert len(rpc.params) == 2
+        assert rpc.params[0] == buf  # full BufferInfo, not bare id
+        assert rpc.params[1] == "hello world"
+
+    async def test_send_input_raises_for_unknown_buffer(self) -> None:
+        """Racey deletion: the user hits Enter on a buffer that was just
+        removed by the core. Without the guard we'd write a `RpcCall`
+        carrying `None` through the variant encoder and blow up there;
+        catching it at the public entry point lets the UI surface it
+        as a non-fatal warning instead.
+        """
+        from quasseltui.protocol.errors import QuasselError as _QuasselError
+
+        session = _session(network_ids=[1])
+        script: list[ProtocolEvent] = [_session_ready(session, frozenset())]
+        client, _ = _make_client(script)
+        await _drain(client)
+
+        import pytest
+
+        with pytest.raises(_QuasselError):
+            await client.send_input(BufferId(9999), "ghost")

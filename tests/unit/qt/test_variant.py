@@ -412,3 +412,64 @@ class TestShortAndQDateTime:
         writer = QDataStreamWriter()
         with pytest.raises(TypeError, match="cannot serialize"):
             write_variant(writer, "not a datetime", type_id=QMetaType.QDateTime)
+
+
+class TestUserTypeAutoRouting:
+    """Phase 9 glue: write_variant must auto-route registered dataclasses
+    through the UserType envelope so SignalProxy params can include a
+    bare `BufferInfo` without every call site having to spell out
+    `user_type_name=b"BufferInfo"`.
+    """
+
+    def test_bufferinfo_auto_routes_through_user_type_envelope(self) -> None:
+        """A `BufferInfo` passed to `write_variant` with no type hint
+        must emit a QVariant<UserType=BufferInfo> envelope and round-
+        trip to an equal value via `read_variant`. Without the auto-
+        routing, `_infer_type_id` would raise a `TypeError` and every
+        outbound `sendInput` RpcCall would fail at encode time.
+        """
+        # Importing the module triggers registration of BufferInfo's
+        # codec + py_type mapping as a side effect.
+        from quasseltui.protocol import usertypes as _usertypes  # noqa: F401
+        from quasseltui.protocol.usertypes import (
+            BufferId,
+            BufferInfo,
+            BufferType,
+            NetworkId,
+        )
+
+        buf = BufferInfo(
+            buffer_id=BufferId(42),
+            network_id=NetworkId(1),
+            type=BufferType.Channel,
+            group_id=0,
+            name="#python",
+        )
+        writer = QDataStreamWriter()
+        write_variant(writer, buf)  # no type_id, no user_type_name
+        blob = writer.to_bytes()
+        # Leading 4 bytes = type id; must be UserType (127).
+        assert blob[:4] == b"\x00\x00\x00\x7f"
+
+        reader = QDataStreamReader(blob)
+        decoded = read_variant(reader)
+        assert reader.at_end()
+        assert decoded == buf
+
+    def test_bufferid_auto_routes_through_user_type_envelope(self) -> None:
+        """Mirrors the BufferInfo test for `BufferId` — the phase-10
+        `requestBacklog` RPC will also lean on this path.
+        """
+        from quasseltui.protocol import usertypes as _usertypes  # noqa: F401
+        from quasseltui.protocol.usertypes import BufferId
+
+        bid = BufferId(17)
+        writer = QDataStreamWriter()
+        write_variant(writer, bid)
+        blob = writer.to_bytes()
+        assert blob[:4] == b"\x00\x00\x00\x7f"
+
+        reader = QDataStreamReader(blob)
+        decoded = read_variant(reader)
+        assert reader.at_end()
+        assert decoded == bid

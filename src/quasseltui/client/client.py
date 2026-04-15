@@ -48,12 +48,20 @@ from quasseltui.protocol.connection import (
 )
 from quasseltui.protocol.enums import DEFAULT_CLIENT_FEATURES
 from quasseltui.protocol.errors import QuasselError
-from quasseltui.protocol.signalproxy import InitRequest
+from quasseltui.protocol.signalproxy import InitRequest, RpcCall
 from quasseltui.protocol.transport import TlsOptions
+from quasseltui.protocol.usertypes import BufferId
 from quasseltui.sync.buffer_syncer import BufferSyncer
 from quasseltui.sync.dispatcher import Dispatcher
 from quasseltui.sync.events import ClientDisconnected, ClientEvent
 from quasseltui.sync.network import Network
+
+# Qt-metacall-style signature string used by Quassel core's SignalProxy to
+# dispatch `RpcCall` to the user-input handler. The leading "2" is the
+# Qt MOC signal marker; the argument list is the C++ signature of
+# `UserInputHandler::sendInput(BufferInfo, QString)`. Hard-coded here
+# because it's a protocol constant, not a configurable choice.
+_SEND_INPUT_SIGNAL = b"2sendInput(BufferInfo,QString)"
 
 
 class QuasselClient:
@@ -152,6 +160,45 @@ class QuasselClient:
                     yield self._pending_events.pop(0)
             if isinstance(proto_event, ProtoDisconnected):
                 return
+
+    async def send_input(self, buffer_id: BufferId, text: str) -> None:
+        """Send user input (chat line or /-command) for `buffer_id`.
+
+        Builds a Quassel `RpcCall` that the core routes to its
+        `UserInputHandler::sendInput(BufferInfo, QString)` slot, which
+        is the single entry point for everything a client can make a
+        user "say" in a buffer — plain chat lines go through unchanged,
+        and lines starting with `/` are parsed core-side into `JOIN`,
+        `PART`, `PRIVMSG`, etc. The core then round-trips the resulting
+        IRC output back to us as a `displayMsg` `Sync` event, which the
+        dispatcher turns into a `MessageReceived` — so the line appears
+        in the active buffer via the same code path as every other
+        message, with no special "echo" handling here.
+
+        The full `BufferInfo` dataclass is sent as the first parameter
+        (not just the id) because Quassel's `sendInput` signature takes
+        `BufferInfo`, and the `group_id` / `type` fields carry enough
+        context for the core to skip a database lookup. We fetch it
+        from `self.state.buffers` rather than requiring the caller to
+        hand us one — the UI already knows the buffer id and should
+        not have to reach into `ClientState` on every keystroke.
+
+        Raises `QuasselError` if the buffer is unknown (e.g. the user
+        hit Enter on a stale active pointer from a racey buffer
+        removal), if we're not in the CONNECTED state, or if the
+        underlying socket write fails. Callers — the app's
+        `InputSubmitted` handler in particular — should catch
+        `QuasselError` and surface a non-fatal status line instead of
+        killing the whole session.
+        """
+        buffer_info = self.state.buffers.get(buffer_id)
+        if buffer_info is None:
+            raise QuasselError(f"cannot send to unknown buffer {int(buffer_id)}")
+        rpc = RpcCall(
+            signal_name=_SEND_INPUT_SIGNAL,
+            params=[buffer_info, text],
+        )
+        await self._connection.send(rpc)
 
     async def close(self) -> None:
         """Idempotent shutdown. Safe to call in a ``finally`` block."""

@@ -13,23 +13,35 @@ Renders `ClientState.networks` + `ClientState.buffers` as a two-level tree:
     └── #debian
 ```
 
-Each leaf's `data` attribute carries the `BufferInfo` that phase 8 will
-use to drive the active-buffer selection. Network-level nodes carry
-`None` as `data`, so downstream code can cheaply discriminate
-"user clicked a network header" vs "user clicked a buffer".
+Each leaf's `data` attribute carries the `BufferInfo` that drives the
+active-buffer selection. Network-level nodes carry `None` as `data`, so
+downstream code can cheaply discriminate "user clicked a network header"
+vs "user clicked a buffer".
 
-Phase 6 responsibility: render the tree once on mount. No interactivity
-— arrow-key navigation + click → `BufferSelected` message lands in
-phase 8.
+Interactivity (phase 8): `on_tree_node_selected` posts a `BufferSelected`
+message for every leaf selection — click, Enter, or a programmatic
+`select_node` call from the app's alt+up/alt+down cycle bindings. The
+app is the single authority for `active_buffer_id`; this widget never
+mutates app state directly.
+
+Cursor preservation: `refresh_from_state()` can fire at any moment (a
+channel join, a buffer rename, a network disconnect). We remember the
+last buffer the app told us was active in `_active_hint` and re-seek
+to it after rebuilding so a sidebar refresh doesn't dump the user back
+to the top of the list. The app also calls `set_active_buffer()` when
+alt+up/down moves the cursor programmatically, keeping the sidebar
+visual in sync with the active buffer pointer.
 """
 
 from __future__ import annotations
 
 from rich.text import Text
 from textual.widgets import Tree
+from textual.widgets.tree import TreeNode
 
+from quasseltui.app.messages import BufferSelected
 from quasseltui.client.state import ClientState
-from quasseltui.protocol.usertypes import BufferInfo, BufferType, NetworkId
+from quasseltui.protocol.usertypes import BufferId, BufferInfo, BufferType, NetworkId
 from quasseltui.util.text import sanitize_terminal
 
 
@@ -42,6 +54,11 @@ class BufferTree(Tree[BufferInfo | None]):
         super().__init__(label="networks", id=id)
         self._state = state
         self.show_root = False
+        # `_active_hint` is the buffer_id the app most recently told us
+        # is active. Used by `refresh_from_state` to re-seek the cursor
+        # after a rebuild, so a sidebar refresh caused by a live event
+        # doesn't lose the user's place.
+        self._active_hint: BufferId | None = None
 
     def on_mount(self) -> None:
         self._populate()
@@ -56,12 +73,66 @@ class BufferTree(Tree[BufferInfo | None]):
         expanded flag) and `_populate()` then rebuilds the children
         from scratch, so a stale hierarchy cannot survive the call.
 
-        Phase 8 will want to preserve the cursor position across
-        refreshes; that belongs in the phase-8 diff (interactive
-        buffer switching) and is deliberately left out here.
+        If the app has told us which buffer is active, we re-seek
+        the cursor to it after the rebuild. Without this, a live
+        `BufferAdded` during an active session would bounce the
+        cursor back to the first leaf and confuse the user.
         """
         self.clear()
         self._populate()
+        if self._active_hint is not None:
+            self._select_leaf_for_buffer(self._active_hint)
+
+    def set_active_buffer(self, buffer_id: BufferId) -> None:
+        """Remember the app-side active buffer and move the cursor to it.
+
+        Called from `QuasselApp._set_active_buffer` after the alt+up /
+        alt+down cycle bindings flip `active_buffer_id`. Calling
+        `select_node` posts a `Tree.NodeSelected` that our own handler
+        forwards as `BufferSelected` — that round-trips back to the
+        app, which early-returns because `active_buffer_id` already
+        matches. One idempotent round-trip, not a loop.
+        """
+        self._active_hint = buffer_id
+        self._select_leaf_for_buffer(buffer_id)
+
+    def on_tree_node_selected(self, event: Tree.NodeSelected[BufferInfo | None]) -> None:
+        """Forward leaf selections as `BufferSelected` messages.
+
+        Fires on click, Enter, and programmatic `select_node` calls.
+        Network-header nodes carry `None` as data — we ignore them so
+        a stray click on a header doesn't try to switch to a
+        non-existent buffer. We also stop the original message from
+        bubbling further up the DOM; the app subscribes to our
+        `BufferSelected` instead, which keeps the contract narrow.
+        """
+        event.stop()
+        buf = event.node.data
+        if buf is None:
+            return
+        self.post_message(BufferSelected(buffer_id=buf.buffer_id))
+
+    def _select_leaf_for_buffer(self, buffer_id: BufferId) -> None:
+        """Move the tree cursor to the leaf for `buffer_id`, if present.
+
+        Silently no-ops if the buffer is not in the tree yet — this
+        can happen during a race where the app flips the active
+        pointer before the bridge has emitted the `BufferAdded` that
+        would cause us to include the leaf. The next
+        `refresh_from_state` will fix it via the `_active_hint`
+        re-seek path.
+        """
+        leaf = self._find_leaf_for_buffer(buffer_id)
+        if leaf is not None:
+            self.select_node(leaf)
+
+    def _find_leaf_for_buffer(self, buffer_id: BufferId) -> TreeNode[BufferInfo | None] | None:
+        for network_node in self.root.children:
+            for leaf in network_node.children:
+                data = leaf.data
+                if data is not None and data.buffer_id == buffer_id:
+                    return leaf
+        return None
 
     def _populate(self) -> None:
         """Walk the client state once and build the tree.

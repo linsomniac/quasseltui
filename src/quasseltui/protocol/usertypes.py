@@ -415,15 +415,25 @@ USER_TYPE_MESSAGE = b"Message"
 
 
 def _register_all() -> None:
-    register_user_type(USER_TYPE_BUFFER_ID, _read_buffer_id, _write_buffer_id)
-    register_user_type(USER_TYPE_NETWORK_ID, _read_network_id, _write_network_id)
-    register_user_type(USER_TYPE_IDENTITY_ID, _read_identity_id, _write_identity_id)
-    register_user_type(USER_TYPE_USER_ID, _read_user_id, _write_user_id)
-    register_user_type(USER_TYPE_ACCOUNT_ID, _read_account_id, _write_account_id)
-    register_user_type(USER_TYPE_MSG_ID, _read_msg_id, _write_msg_id)
-    register_user_type(USER_TYPE_BUFFER_INFO, _read_buffer_info, _write_buffer_info)
+    # `py_type=` populates the Python-type → user-type-name map in
+    # `quasseltui.qt.usertypes` so `write_variant(writer, buf_info)`
+    # can auto-route through the UserType envelope. Identity is
+    # deliberately excluded — its Python representation is a plain
+    # `dict`, which would shadow `QVariantMap` handling and break
+    # every SignalProxy map parameter we pass through.
+    register_user_type(USER_TYPE_BUFFER_ID, _read_buffer_id, _write_buffer_id, py_type=BufferId)
+    register_user_type(USER_TYPE_NETWORK_ID, _read_network_id, _write_network_id, py_type=NetworkId)
+    register_user_type(
+        USER_TYPE_IDENTITY_ID, _read_identity_id, _write_identity_id, py_type=IdentityId
+    )
+    register_user_type(USER_TYPE_USER_ID, _read_user_id, _write_user_id, py_type=UserId)
+    register_user_type(USER_TYPE_ACCOUNT_ID, _read_account_id, _write_account_id, py_type=AccountId)
+    register_user_type(USER_TYPE_MSG_ID, _read_msg_id, _write_msg_id, py_type=MsgId)
+    register_user_type(
+        USER_TYPE_BUFFER_INFO, _read_buffer_info, _write_buffer_info, py_type=BufferInfo
+    )
     register_user_type(USER_TYPE_IDENTITY, _read_identity, _write_identity)
-    register_user_type(USER_TYPE_MESSAGE, _read_message, _write_message)
+    register_user_type(USER_TYPE_MESSAGE, _read_message, _write_message, py_type=Message)
 
 
 _register_all()

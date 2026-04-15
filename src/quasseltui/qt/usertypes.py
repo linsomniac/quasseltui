@@ -40,22 +40,60 @@ UserTypeWriter = Callable[[QDataStreamWriter, Any], None]
 
 _USER_TYPE_READERS: dict[bytes, UserTypeReader] = {}
 _USER_TYPE_WRITERS: dict[bytes, UserTypeWriter] = {}
+# Reverse lookup: a registered Python class → its on-wire user-type name.
+# Used by `write_variant` so a caller passing e.g. a `BufferInfo` dataclass
+# doesn't have to explicitly specify `user_type_name=b"BufferInfo"`; the
+# envelope is inferred from the value's Python type. Populated only for
+# types with an unambiguous mapping (`Identity` is deliberately *not*
+# here because its payload is a plain `dict`, which collides with
+# `QVariantMap` handling).
+_PY_TYPE_TO_NAME: dict[type, bytes] = {}
 
 
-def register_user_type(name: bytes, reader: UserTypeReader, writer: UserTypeWriter) -> None:
+def register_user_type(
+    name: bytes,
+    reader: UserTypeReader,
+    writer: UserTypeWriter,
+    *,
+    py_type: type | None = None,
+) -> None:
     """Register codecs for a user-type by its on-wire name.
 
     `name` is the bytes you'd see in the QVariant envelope after stripping
     any trailing null byte — typically just the ASCII type name like
     `b"BufferInfo"`. Registering the same name twice is allowed and last
     wins; this makes the registry test-friendly.
+
+    `py_type` is an optional Python class whose instances should be
+    serialized through this user-type envelope when passed directly to
+    `write_variant` without an explicit `user_type_name`. Supply it only
+    when the mapping is unambiguous — do *not* set it for types whose
+    instances collide with a built-in primitive or container (for
+    example `Identity`, whose Python representation is `dict` and
+    would shadow `QVariantMap` handling).
     """
     _USER_TYPE_READERS[name] = reader
     _USER_TYPE_WRITERS[name] = writer
+    if py_type is not None:
+        _PY_TYPE_TO_NAME[py_type] = name
 
 
 def is_registered(name: bytes) -> bool:
     return name in _USER_TYPE_READERS
+
+
+def name_for_python_value(value: Any) -> bytes | None:
+    """Return the registered user-type name for `value`, or `None`.
+
+    Used by `quasseltui.qt.variant.write_variant` to route dataclass
+    values (e.g. `BufferInfo`) through the UserType envelope without
+    the caller having to spell out the name on every call site. Uses
+    `type(value)` rather than `isinstance` so a subclass doesn't
+    silently inherit the mapping — Quassel user-types are leaf types
+    in practice, and letting a subclass dispatch to the base-class
+    codec would be a surprising footgun if anyone ever adds one.
+    """
+    return _PY_TYPE_TO_NAME.get(type(value))
 
 
 def read_user_type_payload(reader: QDataStreamReader, name: bytes) -> Any:

@@ -36,6 +36,13 @@ from quasseltui.client.state import ClientState
 class ChatScreen(Screen[None]):
     """Three-pane chat screen — buffer tree · message log + input."""
 
+    # Focus the input bar first so the user can type a message
+    # immediately without having to Tab away from the sidebar. The
+    # sidebar is still focusable via Tab; the alt+up/alt+down app
+    # bindings cycle buffers regardless of where focus lives, so the
+    # user never has to leave the input to switch buffers.
+    AUTO_FOCUS = "InputBar"
+
     def __init__(self, state: ClientState) -> None:
         super().__init__()
         self._state = state

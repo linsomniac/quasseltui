@@ -1,18 +1,23 @@
 """Bottom-pane input prompt.
 
-Phase 6: visual placeholder — the user can type and the text is
-captured, but nothing is sent anywhere. Phase 9 wires the Enter key
-to `QuasselClient.send_input()`.
+On Enter, the current line is posted to the app as an
+`InputSubmitted` message and the widget's value is cleared. The
+widget intentionally has no reference to `QuasselClient`: routing
+text to `send_input` lives in the app, so a phase-11 /-command
+parser can intercept the message before it hits the wire without
+having to modify this widget at all.
 
 Kept as its own widget (rather than using `Input` directly in the
-screen) so phase 11's `/command` parsing has a clear home: the
-per-message parsing of `/join`, `/msg`, `/me`, `/quit` is routing
-logic that belongs to the input widget, not the chat screen.
+screen) so a future /-command parser has a stable home and so the
+app can change the placeholder text per-buffer without reaching
+into a foreign widget class.
 """
 
 from __future__ import annotations
 
 from textual.widgets import Input
+
+from quasseltui.app.messages import LineSubmitted
 
 
 class InputBar(Input):
@@ -23,6 +28,22 @@ class InputBar(Input):
             placeholder="Type a message and press Enter…",
             id=id,
         )
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Post the submitted line to the app and clear the widget.
+
+        `event.stop()` prevents the original `Input.Submitted` from
+        bubbling into the app's handlers — the app subscribes to our
+        `LineSubmitted` instead, which carries a plain `text: str`
+        and is ergonomic to match-on. Empty lines are dropped here
+        so the app handler never has to guard against a no-op send.
+        """
+        event.stop()
+        text = event.value
+        self.value = ""
+        if not text:
+            return
+        self.post_message(LineSubmitted(text=text))
 
 
 __all__ = [

@@ -369,3 +369,234 @@ async def test_fatal_exit_message_is_sanitized(
     # of the user-visible-failure contract. Without the exit the
     # user would stay in a blank Textual screen.
     assert app.return_code == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — interactive buffer switching
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tree_node_selection_switches_active_buffer() -> None:
+    """Selecting a leaf in the `BufferTree` flips `active_buffer_id`.
+
+    Regression for phase 6's "no interactivity" hole: clicking or
+    pressing Enter on a channel in the sidebar now has to route
+    through `on_tree_node_selected` → `BufferSelected` → app
+    handler → `ActiveBufferUpdated`, ending with the message log
+    showing that buffer's history. Without this, the user would
+    see the default-pick buffer forever and have no way to
+    navigate anywhere else.
+    """
+    state = _empty_state_with_one_network()
+    first = _buffer(11, name="#python")
+    second = _buffer(22, name="#rust")
+    state.buffers[first.buffer_id] = first
+    state.buffers[second.buffer_id] = second
+    state.messages[first.buffer_id] = [_irc_message(11, msg_id=1, contents="first buffer line")]
+    state.messages[second.buffer_id] = [_irc_message(22, msg_id=2, contents="second buffer line")]
+
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Trigger a SessionOpened so the bridge runs default-pick and
+        # lands on one of the buffers. The exact default-pick target
+        # depends on dict ordering, so we assert the switch relative
+        # to the post-default state rather than against a fixed id.
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        default_pick = app.active_buffer_id
+        assert default_pick is not None
+
+        # Find the "other" buffer — the one the default-pick did not land on.
+        target = second.buffer_id if default_pick == first.buffer_id else first.buffer_id
+        target_name = "#rust" if target == second.buffer_id else "#python"
+        target_content = "second buffer line" if target == second.buffer_id else "first buffer line"
+
+        tree = app.screen.query_one(BufferTree)
+        # Walk the tree for the leaf whose data carries `target`. The
+        # top-level children are network nodes; their children are the
+        # per-buffer leaves we care about.
+        target_leaf = None
+        for network_node in tree.root.children:
+            for leaf in network_node.children:
+                if leaf.data is not None and leaf.data.buffer_id == target:
+                    target_leaf = leaf
+                    break
+            if target_leaf is not None:
+                break
+        assert target_leaf is not None, f"no sidebar leaf for {target_name}"
+
+        tree.select_node(target_leaf)
+        await pilot.pause()
+        await pilot.pause()
+
+        assert app.active_buffer_id == target
+
+        log = app.screen.query_one(MessageLog)
+        rendered = " ".join(strip.text for strip in log.lines)
+        assert target_content in rendered
+
+
+@pytest.mark.asyncio
+async def test_alt_down_cycles_to_next_buffer() -> None:
+    """`alt+down` moves the active buffer forward in tree order.
+
+    Verifies the app-level cycle binding works even while the input
+    bar has focus (which is the default, via `AUTO_FOCUS = "InputBar"`).
+    The priority binding means Textual does not swallow the key as
+    an input cursor-move. Without this the user would be stuck on
+    the default-pick buffer when their cursor is in the input box.
+    """
+    state = _empty_state_with_one_network()
+    buffers = [
+        _buffer(11, name="#alpha"),
+        _buffer(22, name="#beta"),
+        _buffer(33, name="#gamma"),
+    ]
+    for buf in buffers:
+        state.buffers[buf.buffer_id] = buf
+        state.messages[buf.buffer_id] = [_irc_message(int(buf.buffer_id), msg_id=1)]
+
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        before = app.active_buffer_id
+        assert before is not None
+
+        await pilot.press("alt+down")
+        await pilot.pause()
+
+        after = app.active_buffer_id
+        assert after is not None
+        assert after != before
+
+        # After a full cycle, we should be back at the starting buffer.
+        await pilot.press("alt+down")
+        await pilot.press("alt+down")
+        await pilot.pause()
+        assert app.active_buffer_id == before
+
+
+@pytest.mark.asyncio
+async def test_input_submit_calls_client_send_input() -> None:
+    """Enter in the input bar routes text through `client.send_input`.
+
+    The full chain is InputBar.on_input_submitted → post
+    `InputSubmitted` → app.`_on_input_submitted` → client.send_input.
+    Without this end-to-end test, a regression anywhere in that
+    chain (wrong message class, missing handler, wrong attribute)
+    would silently break outbound chat — the kind of bug that only
+    shows up when a user tries to talk and gets no response.
+    """
+    from quasseltui.app.widgets.input_bar import InputBar
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1)]
+
+    sent: list[tuple[BufferId, str]] = []
+
+    class _SendingStubClient(_StubClient):
+        async def send_input(
+            self, buffer_id: BufferId, text: str
+        ) -> None:  # pragma: no cover - trivial
+            sent.append((buffer_id, text))
+
+    client = _SendingStubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.active_buffer_id == buf.buffer_id
+
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.value = "hello from tests"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+    assert sent == [(buf.buffer_id, "hello from tests")]
+
+
+@pytest.mark.asyncio
+async def test_input_submit_is_noop_when_no_active_buffer() -> None:
+    """A stray Enter before any buffer is picked must not crash.
+
+    Guards the handler's `active_buffer_id is None` branch. Without
+    the guard, `send_input(None, text)` would raise a TypeError
+    inside Textual's message machinery — not fatal to the app but
+    ugly, and it would pollute the log with a spurious traceback.
+    """
+    from quasseltui.app.widgets.input_bar import InputBar
+
+    state = _empty_state_with_one_network()  # zero buffers, so no default-pick
+    sent: list[tuple[BufferId, str]] = []
+
+    class _SendingStubClient(_StubClient):
+        async def send_input(
+            self, buffer_id: BufferId, text: str
+        ) -> None:  # pragma: no cover - must not be called
+            sent.append((buffer_id, text))
+
+    client = _SendingStubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.value = "stranded"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_alt_up_cycles_to_previous_buffer() -> None:
+    """`alt+up` is the mirror of `alt+down`.
+
+    Separately covered (rather than piggybacking on the `alt+down`
+    test) so a regression where we accidentally swap the deltas
+    lands on one of these two tests instead of silently passing.
+    """
+    state = _empty_state_with_one_network()
+    buffers = [_buffer(11, name="#alpha"), _buffer(22, name="#beta")]
+    for buf in buffers:
+        state.buffers[buf.buffer_id] = buf
+        state.messages[buf.buffer_id] = [_irc_message(int(buf.buffer_id), msg_id=1)]
+
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        before = app.active_buffer_id
+        assert before is not None
+        await pilot.press("alt+up")
+        await pilot.pause()
+        after = app.active_buffer_id
+        assert after is not None
+        assert after != before

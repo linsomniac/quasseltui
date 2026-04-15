@@ -31,10 +31,16 @@ class BufferSyncer(SyncObject):
         super().__init__(object_name)
         self.last_seen_by_buffer: dict[int, int] = {}
         self.marker_lines_by_buffer: dict[int, int] = {}
-        # Buffer IDs the core told us no longer exist (via removeBuffer).
-        # The ClientState will use this to drop its own buffer records
-        # when it receives a BufferRemoved event.
+        # Buffer IDs the core told us no longer exist (via removeBuffer
+        # or mergeBuffersPermanently). The dispatcher drains this set on
+        # every BufferSyncer slot call and emits a `BufferRemoved` for
+        # each one, then clears the set back to empty.
         self.removed_buffers: set[int] = set()
+        # Buffer IDs the core renamed via `renameBuffer`, keyed by id and
+        # mapped to the new name. Drained the same way as `removed_buffers`
+        # — the dispatcher mutates `ClientState.buffers` on each entry and
+        # emits a `BufferRenamed` public event.
+        self.renamed_buffers: dict[int, str] = {}
 
     # -- slot handlers ------------------------------------------------------
 
@@ -61,13 +67,17 @@ class BufferSyncer(SyncObject):
             self.marker_lines_by_buffer.pop(bid, None)
 
     @sync_slot(b"renameBuffer")
-    def _sync_rename_buffer(self, _buffer_id: Any, _name: Any) -> None:
-        # We don't track buffer names in BufferSyncer — ClientState holds
-        # the canonical `BufferInfo.name` and will be updated by the
-        # dispatcher's translation of this slot into a public event. This
-        # handler exists just so the slot is recognized (otherwise the
-        # base class logs it as unknown every time).
-        return
+    def _sync_rename_buffer(self, buffer_id: Any, name: Any) -> None:
+        """Record a pending buffer rename for the dispatcher to apply.
+
+        We don't own `BufferInfo.name` — that lives on `ClientState.buffers`
+        — so the rename lands in `renamed_buffers` here and the dispatcher
+        drains it in `_emit_slot_side_effects`, updating the canonical
+        BufferInfo and emitting a public `BufferRenamed` event.
+        """
+        bid = _as_int(buffer_id)
+        if bid is not None and name is not None:
+            self.renamed_buffers[bid] = str(name)
 
     @sync_slot(b"mergeBuffersPermanently")
     def _sync_merge_buffers(self, buffer_id1: Any, buffer_id2: Any) -> None:

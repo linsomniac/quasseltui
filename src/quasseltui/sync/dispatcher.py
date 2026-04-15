@@ -42,6 +42,7 @@ from quasseltui.sync.buffer_syncer import BufferSyncer
 from quasseltui.sync.events import (
     BufferAdded,
     BufferRemoved,
+    BufferRenamed,
     ClientEvent,
     IdentityAdded,
     IrcMessage,
@@ -329,7 +330,16 @@ class Dispatcher:
         slot_name: bytes,
         obj: SyncObject,
     ) -> None:
-        """Turn a just-completed Sync call into any applicable public event."""
+        """Turn a just-completed Sync call into any applicable public event.
+
+        The BufferSyncer branch drains *all* of its pending-change sets on
+        every slot call (removals, merges, renames). That's deliberate:
+        the slot handlers accumulate into the sets and are cheap, the
+        drain is O(pending) which is usually zero, and this pattern
+        guarantees that a rename followed by a remove emits BOTH events
+        in the right order regardless of which slot happened to trigger
+        the drain.
+        """
         if class_name == Network.CLASS_NAME and slot_name in _NETWORK_UPDATE_SLOTS:
             field_name = _NETWORK_UPDATE_SLOTS[slot_name]
             assert isinstance(obj, Network)
@@ -342,18 +352,60 @@ class Dispatcher:
                 )
             )
             return
-        if class_name == BufferSyncer.CLASS_NAME and slot_name == b"removeBuffer":
+        if class_name == BufferSyncer.CLASS_NAME:
             assert isinstance(obj, BufferSyncer)
-            for bid in list(obj.removed_buffers):
+            self._drain_buffer_syncer_pending(obj)
+
+    def _drain_buffer_syncer_pending(self, syncer: BufferSyncer) -> None:
+        """Emit BufferRemoved / BufferRenamed for pending BufferSyncer ops.
+
+        Called after every BufferSyncer slot call. Splitting this into its
+        own method keeps the side-effects method short and makes the
+        "always drains pending, never interleaves rename inside remove"
+        contract visible.
+        """
+        if syncer.removed_buffers:
+            for bid in list(syncer.removed_buffers):
                 buffer_id = BufferId(bid)
+                # Only emit if we actually had the buffer in state — a
+                # second removeBuffer for an ID we already dropped is a
+                # no-op rather than a double-emit. This matches what the
+                # core does when it broadcasts the same removal to every
+                # client and one of them has already processed it.
                 if buffer_id in self._state.buffers:
                     del self._state.buffers[buffer_id]
                     self._state.messages.pop(buffer_id, None)
                     self._emit(BufferRemoved(buffer_id=buffer_id))
-            obj.removed_buffers.clear()
+            syncer.removed_buffers.clear()
+        if syncer.renamed_buffers:
+            for bid, new_name in list(syncer.renamed_buffers.items()):
+                buffer_id = BufferId(bid)
+                existing = self._state.buffers.get(buffer_id)
+                if existing is not None:
+                    # BufferInfo is a frozen dataclass — we have to rebuild
+                    # it rather than mutate. Only `name` changes; the other
+                    # fields are carried across verbatim.
+                    renamed = BufferInfo(
+                        buffer_id=existing.buffer_id,
+                        network_id=existing.network_id,
+                        type=existing.type,
+                        group_id=existing.group_id,
+                        name=new_name,
+                    )
+                    self._state.buffers[buffer_id] = renamed
+                self._emit(BufferRenamed(buffer_id=buffer_id, name=new_name))
+            syncer.renamed_buffers.clear()
 
     def _store_and_emit_message(self, raw: Message) -> None:
-        """Append a decoded `Message` to `state.messages` and emit the event."""
+        """Append a decoded `Message` to `state.messages` and emit the event.
+
+        Enforces `state.max_messages_per_buffer` as a hard retention cap:
+        once a buffer's message list exceeds the cap, the oldest messages
+        are dropped to bring it back down. Without this, a noisy channel
+        (or a malicious peer) could inflate memory unbounded over a
+        long-lived session. A cap of 0 disables retention (which means
+        the list grows forever — use only for offline tests).
+        """
         buffer_info: BufferInfo = raw.buffer_info
         buffer_id = buffer_info.buffer_id
         self._state.buffers.setdefault(buffer_id, buffer_info)
@@ -370,6 +422,12 @@ class Dispatcher:
             contents=raw.contents,
         )
         message_list.append(narrow)
+        cap = self._state.max_messages_per_buffer
+        if cap > 0 and len(message_list) > cap:
+            # Drop the oldest N so we land exactly at the cap. `del` on a
+            # slice is O(n) but only runs when the list is already oversize,
+            # and n is the overshoot (usually 1 on a steady stream).
+            del message_list[: len(message_list) - cap]
         self._emit(MessageReceived(message=narrow))
 
 

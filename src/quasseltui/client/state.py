@@ -39,7 +39,17 @@ from quasseltui.sync.network import Network
 
 @dataclass
 class ClientState:
-    """Canonical view of the current Quassel session, single-writer."""
+    """Canonical view of the current Quassel session, single-writer.
+
+    `max_messages_per_buffer` is the retention cap the dispatcher enforces
+    when a new message arrives via `displayMsg`. Without a cap, a busy
+    channel or a malicious peer could inflate memory unbounded over a
+    long-lived session — this is a practical resource-DoS vector because
+    IRC traffic is untrusted input. The default of 5000 is large enough
+    to never bite a typical user (a flood of 5000 messages is ~a day on
+    #python) but bounds the worst case. Set to 0 to disable the cap
+    entirely; only do that in tests where you control the input volume.
+    """
 
     session: SessionInit | None = None
     peer_features: frozenset[str] = field(default_factory=frozenset)
@@ -48,6 +58,7 @@ class ClientState:
     messages: dict[BufferId, list[IrcMessage]] = field(default_factory=dict)
     identities: dict[IdentityId, Identity] = field(default_factory=dict)
     buffer_syncer: BufferSyncer | None = None
+    max_messages_per_buffer: int = 5000
 
     def network_for_buffer(self, buffer_id: BufferId) -> Network | None:
         """Convenience: find the `Network` a buffer belongs to, or `None`.

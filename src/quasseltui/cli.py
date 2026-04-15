@@ -31,6 +31,7 @@ import asyncio
 import getpass
 import logging
 import os
+import re
 import sys
 from collections import defaultdict
 from collections.abc import Sequence
@@ -744,6 +745,31 @@ def _dump_state_exit_code(event: ClientDisconnected) -> int:
     return 4
 
 
+# C0 control characters (0x00-0x1f), DEL (0x7f), and C1 controls (0x80-0x9f).
+# These are what a malicious IRC peer can use to smuggle terminal escape
+# sequences through printable fields: ESC (0x1b) starts ANSI CSI/OSC,
+# 0x80-0x9f are C1 CSI equivalents on some terminals, and LF/CR/BEL/BS
+# can rewrite or spoof preceding output. We keep ONLY printable/UTF-8
+# content in `dump-state` output because a real IRC buffer (`#python`,
+# `hello world`, even `résumé`) never legitimately contains a control
+# byte. The replacement `\\xNN` preserves the original value for debugging
+# without letting the terminal interpret it.
+_TERMINAL_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _sanitize_terminal(text: str) -> str:
+    """Escape C0/C1 control characters before printing to a terminal.
+
+    Untrusted IRC payloads reach `dump-state` straight from the core, and
+    a malicious nick / topic / message body can otherwise inject ANSI
+    escapes, overwrite previous output, or trigger terminal-specific
+    OSC hyperlink / bell / title-bar behavior. Called on every user- or
+    core-provided string before it goes to `print()`; numeric IDs and
+    enum names are safe and don't need wrapping.
+    """
+    return _TERMINAL_UNSAFE_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
 def _print_state_snapshot(
     state: ClientState,
     *,
@@ -753,12 +779,15 @@ def _print_state_snapshot(
     """Pretty-print the canonical `ClientState` for dump-state and tests.
 
     Groups buffers by network, shows per-network connection state + my
-    nick, and prints the last `max_messages` IrcMessages per buffer.
+    nick, and prints the last `max_messages` IrcMessages per buffer. All
+    core-provided strings are sanitized via `_sanitize_terminal` so a
+    hostile IRC payload can't inject terminal escape sequences into our
+    output.
     """
     print()
     print("=== ClientState snapshot ===")
     feats = ", ".join(sorted(state.peer_features)) or "(none)"
-    print(f"peer_features: {feats}")
+    print(f"peer_features: {_sanitize_terminal(feats)}")
     print(
         f"counts: networks={len(state.networks)}, buffers={len(state.buffers)}, "
         f"identities={len(state.identities)}, messages={state.total_message_count()}"
@@ -766,23 +795,30 @@ def _print_state_snapshot(
     if counts:
         print("event_counts:")
         for name in sorted(counts):
-            print(f"  {name}: {counts[name]}")
+            # event names come from our own type() calls, but sanitize
+            # defensively anyway so the snapshot printer has one rule.
+            print(f"  {_sanitize_terminal(name)}: {counts[name]}")
 
     if state.identities:
         print("identities:")
         for ident_id in sorted(state.identities, key=int):
             identity = state.identities[ident_id]
-            nicks = ", ".join(identity.nicks) if identity.nicks else "(no nicks)"
-            print(f"  - [{int(ident_id)}] {identity.identity_name} ({nicks})")
+            nicks_raw = ", ".join(identity.nicks) if identity.nicks else "(no nicks)"
+            name = _sanitize_terminal(identity.identity_name or "(unnamed)")
+            nicks = _sanitize_terminal(nicks_raw)
+            print(f"  - [{int(ident_id)}] {name} ({nicks})")
 
     if state.networks:
         print("networks:")
         for network_id in sorted(state.networks, key=int):
             network = state.networks[network_id]
+            net_name = _sanitize_terminal(network.network_name or "(unnamed)")
+            my_nick = _sanitize_terminal(network.my_nick or "?")
+            current_server = _sanitize_terminal(network.current_server or "?")
             print(
-                f"  - [{int(network_id)}] {network.network_name or '(unnamed)'}  "
-                f"state={network.connection_state.name} nick={network.my_nick or '?'} "
-                f"server={network.current_server or '?'}"
+                f"  - [{int(network_id)}] {net_name}  "
+                f"state={network.connection_state.name} nick={my_nick} "
+                f"server={current_server}"
             )
             buffers = [b for b in state.buffers.values() if int(b.network_id) == int(network_id)]
             if not buffers:
@@ -790,14 +826,17 @@ def _print_state_snapshot(
             for buf in sorted(buffers, key=lambda b: (b.type.value, b.name.lower())):
                 messages = state.messages.get(buf.buffer_id, [])
                 kind = _buffer_type_label(buf.type)
+                buf_name = _sanitize_terminal(buf.name or "(unnamed)")
                 print(
-                    f"      [{kind}] {buf.name or '(unnamed)'} "
+                    f"      [{kind}] {buf_name} "
                     f"(buffer_id={int(buf.buffer_id)}, {len(messages)} msgs)"
                 )
                 if messages and max_messages > 0:
                     for msg in messages[-max_messages:]:
                         ts = msg.timestamp.strftime("%Y-%m-%d %H:%M:%S")
-                        prefix = msg.sender_prefixes or " "
-                        print(f"          {ts} {prefix}{msg.sender}: {msg.contents}")
+                        prefix = _sanitize_terminal(msg.sender_prefixes or " ")
+                        sender = _sanitize_terminal(msg.sender)
+                        contents = _sanitize_terminal(msg.contents)
+                        print(f"          {ts} {prefix}{sender}: {contents}")
     else:
         print("networks: (none)")

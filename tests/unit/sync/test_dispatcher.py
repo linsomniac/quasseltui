@@ -41,6 +41,7 @@ from quasseltui.sync.dispatcher import DISPLAY_MSG_SIGNAL, Dispatcher
 from quasseltui.sync.events import (
     BufferAdded,
     BufferRemoved,
+    BufferRenamed,
     ClientEvent,
     IdentityAdded,
     MessageReceived,
@@ -307,3 +308,93 @@ class TestBufferRemoval:
             )
         )
         assert events == []
+
+    def test_rename_buffer_updates_state_and_emits(self) -> None:
+        """Regression for codex review finding: renameBuffer was a no-op
+        in the dispatcher, leaving stale buffer names in `ClientState`."""
+        state, dispatcher, events = _make_state_and_dispatcher()
+        buf = _buffer(10, 1, "#oldname")
+        dispatcher.seed_from_session(_session(network_ids=[1], buffer_infos=[buf]), frozenset())
+        events.clear()
+
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=BufferSyncer.CLASS_NAME,
+                object_name="",
+                slot_name=b"renameBuffer",
+                params=[10, "#newname"],
+            )
+        )
+        # `ClientState.buffers` reflects the new name (BufferInfo is
+        # frozen, so the dispatcher rebuilt it).
+        assert state.buffers[BufferId(10)].name == "#newname"
+        # And a public BufferRenamed event was emitted for UI consumers.
+        renamed = [e for e in events if isinstance(e, BufferRenamed)]
+        assert len(renamed) == 1
+        assert renamed[0].buffer_id == BufferId(10)
+        assert renamed[0].name == "#newname"
+
+    def test_merge_buffers_permanently_drops_second_buffer(self) -> None:
+        """Regression for codex review finding: mergeBuffersPermanently
+        marked the merged-away buffer for removal but the dispatcher
+        only drained `removed_buffers` on the literal `removeBuffer`
+        slot — so the buffer stayed in `state.buffers` indefinitely."""
+        state, dispatcher, events = _make_state_and_dispatcher()
+        buf1 = _buffer(10, 1, "#first")
+        buf2 = _buffer(11, 1, "#second")
+        dispatcher.seed_from_session(
+            _session(network_ids=[1], buffer_infos=[buf1, buf2]), frozenset()
+        )
+        events.clear()
+
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=BufferSyncer.CLASS_NAME,
+                object_name="",
+                slot_name=b"mergeBuffersPermanently",
+                params=[10, 11],
+            )
+        )
+        # buffer 10 (the survivor) is still there, 11 is gone.
+        assert BufferId(10) in state.buffers
+        assert BufferId(11) not in state.buffers
+        assert BufferId(11) not in state.messages
+        removed = [e for e in events if isinstance(e, BufferRemoved)]
+        assert len(removed) == 1
+        assert removed[0].buffer_id == BufferId(11)
+
+    def test_message_retention_cap_drops_oldest(self) -> None:
+        """Regression for codex review finding: per-buffer message lists
+        grew unbounded, giving a noisy or malicious peer a memory-DoS
+        path. The cap is enforced on every displayMsg arrival."""
+        state, dispatcher, events = _make_state_and_dispatcher()
+        state.max_messages_per_buffer = 3
+        buf = _buffer(10, 1, "#flood")
+        dispatcher.seed_from_session(
+            _session(network_ids=[1], buffer_infos=[buf]), frozenset({"LongTime"})
+        )
+        events.clear()
+
+        for i in range(5):
+            message = Message(
+                msg_id=MsgId(i + 1),
+                timestamp=dt.datetime(2026, 4, 14, 12, 0, i, tzinfo=dt.UTC),
+                type=MessageType.Plain,
+                flags=MessageFlag.NONE,
+                buffer_info=buf,
+                sender="floodbot",
+                sender_prefixes="",
+                real_name="",
+                avatar_url="",
+                contents=f"msg {i}",
+                peer_features=frozenset({"LongTime"}),
+            )
+            dispatcher.handle_rpc(RpcCall(signal_name=DISPLAY_MSG_SIGNAL, params=[message]))
+
+        # Cap of 3 → only the last 3 messages survive (msg 2/3/4).
+        kept = state.messages[BufferId(10)]
+        assert len(kept) == 3
+        assert [m.contents for m in kept] == ["msg 2", "msg 3", "msg 4"]
+        # Every message still emitted a MessageReceived event — the cap
+        # is purely a retention limit, not a delivery filter.
+        assert len([e for e in events if isinstance(e, MessageReceived)]) == 5

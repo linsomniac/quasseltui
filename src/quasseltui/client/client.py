@@ -47,6 +47,7 @@ from quasseltui.protocol.connection import (
     SyncEvent,
 )
 from quasseltui.protocol.enums import DEFAULT_CLIENT_FEATURES
+from quasseltui.protocol.errors import QuasselError
 from quasseltui.protocol.signalproxy import InitRequest
 from quasseltui.protocol.transport import TlsOptions
 from quasseltui.sync.buffer_syncer import BufferSyncer
@@ -71,6 +72,7 @@ class QuasselClient:
         build_date: str = "1970-01-01",
         connect_timeout: float = 10.0,
         offered_features: tuple[str, ...] = DEFAULT_CLIENT_FEATURES,
+        max_messages_per_buffer: int = 5000,
     ) -> None:
         self._connection = QuasselConnection(
             host=host,
@@ -84,7 +86,7 @@ class QuasselClient:
             connect_timeout=connect_timeout,
             offered_features=offered_features,
         )
-        self.state = ClientState()
+        self.state = ClientState(max_messages_per_buffer=max_messages_per_buffer)
         self._pending_events: list[ClientEvent] = []
         self._dispatcher = Dispatcher(state=self.state, emit=self._pending_events.append)
         self._closed = False
@@ -105,10 +107,22 @@ class QuasselClient:
 
         Always yields exactly one terminal `ClientDisconnected` before
         stopping. Re-iterating after that is a no-op — the underlying
-        connection is closed.
+        connection is closed. Errors raised by the dispatcher, by the
+        `SessionReady` fan-out (InitRequest writes), or by the enclosing
+        protocol loop are converted into a terminal `ClientDisconnected`
+        so the caller never sees an uncaught exception leak out of the
+        async iterator.
         """
         async for proto_event in self._connection.events():
-            self._handle_protocol_event(proto_event)
+            try:
+                self._handle_protocol_event(proto_event)
+            except (OSError, QuasselError) as exc:
+                yield ClientDisconnected(
+                    reason=f"dispatcher error: {exc}",
+                    error=exc,
+                )
+                await self._connection.close()
+                return
             # Drain any events the dispatcher (and session fan-out below)
             # appended to our buffer.
             while self._pending_events:
@@ -119,7 +133,21 @@ class QuasselClient:
             # Fan-out sends InitRequests; the InitData responses come back
             # via `proto_event = InitDataEvent` on subsequent iterations.
             if isinstance(proto_event, SessionReady):
-                await self._fanout_init_requests()
+                try:
+                    await self._fanout_init_requests()
+                except (OSError, QuasselError) as exc:
+                    # The underlying connection.events() loop only catches
+                    # exceptions raised inside its read loop — writes made
+                    # from this side (our InitRequest fan-out) need their
+                    # own terminal-conversion or the async iterator leaks
+                    # the exception and breaks the "always yields a
+                    # terminal Disconnected" contract.
+                    yield ClientDisconnected(
+                        reason=f"init request fan-out failed: {exc}",
+                        error=exc,
+                    )
+                    await self._connection.close()
+                    return
                 while self._pending_events:
                     yield self._pending_events.pop(0)
             if isinstance(proto_event, ProtoDisconnected):

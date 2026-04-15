@@ -593,3 +593,117 @@ async def test_dump_state_missing_user_returns_1(
     assert rc == 1
     client_cls.assert_not_called()
     assert "QUASSEL_USER" in capsys.readouterr().err
+
+
+def test_sanitize_terminal_escapes_control_chars() -> None:
+    """Regression for codex review finding: untrusted IRC strings flowed
+    straight into `print()` from `dump-state`, allowing a hostile peer
+    to inject ANSI escape sequences and rewrite the operator's terminal.
+    The sanitizer must escape any C0/C1 control char."""
+    # Plain text and unicode pass through unchanged.
+    assert cli._sanitize_terminal("hello world") == "hello world"
+    assert cli._sanitize_terminal("résumé") == "résumé"
+    assert cli._sanitize_terminal("#python") == "#python"
+
+    # ESC (0x1b), the start of every ANSI escape sequence.
+    raw_red = "\x1b[31mRED"
+    cleaned = cli._sanitize_terminal(raw_red)
+    assert "\x1b" not in cleaned
+    assert "\\x1b" in cleaned
+
+    # Newline / carriage return / tab — single-line snapshot output.
+    assert "\n" not in cli._sanitize_terminal("line1\nline2")
+    assert "\r" not in cli._sanitize_terminal("over\rwrite")
+    assert "\t" not in cli._sanitize_terminal("col1\tcol2")
+
+    # NUL, BEL, BS — the usual terminal-spoofing primitives.
+    assert "\x00" not in cli._sanitize_terminal("a\x00b")
+    assert "\x07" not in cli._sanitize_terminal("a\x07b")
+    assert "\x08" not in cli._sanitize_terminal("a\x08b")
+
+    # C1 control range (0x80-0x9f) — some terminals interpret these as
+    # CSI prefixes even though they look like high-bit Latin-1 bytes.
+    assert "\x9b" not in cli._sanitize_terminal("a\x9bb")
+
+
+@pytest.mark.asyncio
+async def test_dump_state_sanitizes_malicious_irc_strings(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """End-to-end: a network whose name contains an ANSI escape MUST
+    not flow that escape into the printed snapshot. Pins the integration
+    of `_sanitize_terminal` into the snapshot printer."""
+    from datetime import UTC, datetime
+
+    from quasseltui.client.events import Disconnected as _Disconnected
+    from quasseltui.client.state import ClientState as _ClientState
+    from quasseltui.protocol.enums import MessageFlag, MessageType
+    from quasseltui.protocol.usertypes import (
+        BufferId as _BufferId,
+    )
+    from quasseltui.protocol.usertypes import (
+        BufferInfo as _BufferInfo,
+    )
+    from quasseltui.protocol.usertypes import (
+        BufferType as _BufferType,
+    )
+    from quasseltui.protocol.usertypes import (
+        MsgId as _MsgId,
+    )
+    from quasseltui.protocol.usertypes import (
+        NetworkId as _NetworkId,
+    )
+    from quasseltui.sync.events import IrcMessage
+    from quasseltui.sync.network import Network, NetworkConnectionState
+
+    class _MaliciousFakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.state = _ClientState()
+            net = Network(object_name="1")
+            net.network_name = "evil\x1b[31mNET"
+            net.my_nick = "ghost\x07"
+            net.connection_state = NetworkConnectionState.Initialized
+            self.state.networks[_NetworkId(1)] = net
+            self.state.buffers[_BufferId(10)] = _BufferInfo(
+                buffer_id=_BufferId(10),
+                network_id=_NetworkId(1),
+                type=_BufferType.Channel,
+                group_id=0,
+                name="#fake\x1b]0;OWNED\x07",
+            )
+            self.state.messages[_BufferId(10)] = [
+                IrcMessage(
+                    msg_id=_MsgId(1),
+                    buffer_id=_BufferId(10),
+                    network_id=_NetworkId(1),
+                    timestamp=datetime(2026, 4, 14, 12, 0, tzinfo=UTC),
+                    type=MessageType.Plain,
+                    flags=MessageFlag.NONE,
+                    sender="badnick\x08\x08\x08sneaky",
+                    sender_prefixes="@",
+                    contents="hi\x1b[2J\x1b[H",
+                )
+            ]
+            self._terminal = _Disconnected(reason="clean shutdown", error=None)
+
+        async def events(self) -> Any:
+            yield self._terminal
+
+        async def close(self) -> None:
+            return None
+
+    args = _make_dump_args()
+    with patch.object(cli, "QuasselClient", new=_MaliciousFakeClient):
+        await cli._dump_state(args)
+
+    out = capsys.readouterr().out
+    # No raw escape sequences anywhere in the output. The presence of
+    # any of these would indicate the terminal-injection regression
+    # has been re-introduced.
+    assert "\x1b" not in out
+    assert "\x07" not in out
+    assert "\x08" not in out
+    # The escaped form should appear in place of each control char.
+    assert "\\x1b" in out
+    assert "\\x07" in out
+    assert "\\x08" in out

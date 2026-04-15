@@ -197,6 +197,39 @@ class TestSessionFanout:
         disconnected_idx = next(i for i, e in enumerate(events) if isinstance(e, Disconnected))
         assert disconnected_idx == len(events) - 1
 
+    async def test_fanout_send_failure_yields_terminal_disconnected(self) -> None:
+        """Regression for codex review finding: an OSError from the
+        InitRequest fan-out used to bubble out of `events()` as an
+        uncaught exception, breaking the "always yields one terminal
+        Disconnected" contract. The client now catches it and converts."""
+        from quasseltui.protocol.errors import QuasselError as _QuasselError
+
+        class _BrokenSendConnection(FakeConnection):
+            async def send(self, message: SignalProxyMessage) -> None:
+                raise _QuasselError("simulated broken pipe")
+
+        script: list[ProtocolEvent] = [
+            _session_ready(_session(network_ids=[1, 2]), frozenset()),
+        ]
+        client = QuasselClient(
+            host="localhost",
+            port=4242,
+            user="t",
+            password="t",
+            tls=False,
+        )
+        broken = _BrokenSendConnection(script)
+        client._connection = broken  # type: ignore[assignment]
+
+        events = await _drain(client)
+        # The async iterator must NOT have raised — that's what the bug
+        # was. The terminal event is a Disconnected carrying the cause.
+        assert isinstance(events[-1], Disconnected)
+        assert "fan-out" in events[-1].reason
+        assert isinstance(events[-1].error, _QuasselError)
+        # And the connection was closed as part of the conversion.
+        assert broken.closed is True
+
 
 class TestHandleProtocolEvents:
     async def test_sync_event_mutates_state_and_emits_network_updated(self) -> None:

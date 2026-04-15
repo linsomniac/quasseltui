@@ -35,6 +35,15 @@ class IrcUser(SyncObject):
 
     # -- slot handlers ------------------------------------------------------
 
+    # AIDEV-NOTE: Quassel's IrcUser objectName is built from `<netId>/<nick>`
+    # at construction, but Quassel does NOT re-address the SyncObject when
+    # the nick changes — the C++ IrcUser keeps its original objectName for
+    # the lifetime of the user (see src/common/ircuser.cpp). So the
+    # dispatcher registry key staying bound to the old nick is correct
+    # behavior, not a bug. Leaving this note because it's a natural
+    # source of confusion when reading the dispatcher's lookup-by-key
+    # logic. If a future Quassel version DOES re-address on nick change,
+    # we'd need to re-key `_objects` in `Dispatcher` from `setNick`.
     @sync_slot(b"setNick")
     def _sync_set_nick(self, nick: str) -> None:
         if nick:

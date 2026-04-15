@@ -20,7 +20,8 @@ from typing import Any
 
 import pytest
 
-from quasseltui.protocol.transport import CLOSE_WRITER_GRACE_SECONDS, close_writer
+from quasseltui.protocol import transport as transport_module
+from quasseltui.protocol.transport import close_writer
 
 
 class _FakeTransport:
@@ -105,30 +106,26 @@ async def test_close_writer_returns_quickly_on_happy_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_close_writer_aborts_on_tls_wait_closed_hang() -> None:
+async def test_close_writer_aborts_on_tls_wait_closed_hang(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Regression for cpython gh-88021 TLS close hang.
 
     A TLS peer that never replies to our `close_notify` used to stall
     every teardown path in quasseltui forever — including Textual's
     `on_unmount` after Ctrl+Q, leaving the user staring at a dead
-    restored terminal. `close_writer` must now bound the wait with
-    `CLOSE_WRITER_GRACE_SECONDS` and fall through to `transport.abort()`
-    so the process can exit.
+    restored terminal. `close_writer` must now bound the wait and
+    fall through to `transport.abort()` so the process can exit.
 
-    We cheat the clock by monkey-patching `asyncio.wait_for`'s timeout
-    via a very short grace window isn't enough — the real `wait_for`
-    will still create a timer task. Instead we pass a writer that
-    hangs forever and assert `close_writer` returns within a bound that
-    covers `CLOSE_WRITER_GRACE_SECONDS` plus a generous scheduler slack.
+    The production grace window is 2 seconds; we monkeypatch it down
+    to 10ms so this test (and its sibling below) returns in a few
+    milliseconds instead of waiting on a real wall-clock timer. That
+    keeps the suite fast and removes the scheduler-slack fudge factor
+    an `elapsed < grace + slack` assertion would need.
     """
+    monkeypatch.setattr(transport_module, "CLOSE_WRITER_GRACE_SECONDS", 0.01)
     writer = _HangingWriter()
-    started = asyncio.get_running_loop().time()
     await close_writer(writer)  # type: ignore[arg-type]
-    elapsed = asyncio.get_running_loop().time() - started
-    # The close_writer contract is "return within grace + a little
-    # scheduling slop". Two seconds of grace + one second of slack is
-    # plenty; on CI we observed <2.1s in practice.
-    assert elapsed < CLOSE_WRITER_GRACE_SECONDS + 1.0
     assert writer.closed is True
     assert writer.transport.aborted is True
 
@@ -148,14 +145,19 @@ async def test_close_writer_swallows_oserror_from_dead_peer() -> None:
 
 
 @pytest.mark.asyncio
-async def test_close_writer_handles_none_transport_on_timeout() -> None:
+async def test_close_writer_handles_none_transport_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Defensive branch: a writer whose `transport` attribute is `None`.
 
     Not a shape we produce, but asyncio's `StreamWriter.transport` is
     typed `BaseTransport | None` and the close_writer fallback has a
     `None` guard. Pin it so a future refactor doesn't reintroduce the
     `AttributeError: 'NoneType' object has no attribute 'abort'` bug.
+    The grace window is monkeypatched down for the same reason as the
+    hang-path test above — we don't need a real 2s wait here.
     """
+    monkeypatch.setattr(transport_module, "CLOSE_WRITER_GRACE_SECONDS", 0.01)
 
     class _NoTransportWriter:
         def __init__(self) -> None:

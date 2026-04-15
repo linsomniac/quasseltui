@@ -117,8 +117,8 @@ async def close_writer(writer: asyncio.StreamWriter) -> None:
     The protocol layer often wants to tear down the connection in error
     paths where the socket may already be half-closed. We don't want a
     secondary `ConnectionResetError` to mask the original failure, so
-    errors are logged nothing / return nothing — the close is
-    best-effort.
+    transport-level errors from a dead peer are swallowed silently —
+    the close is best-effort.
 
     Additionally, `StreamWriter.wait_closed()` on a TLS transport is
     prone to hanging in Python 3.11 when the peer does not reply to our

@@ -21,6 +21,21 @@ The output files are append-only — re-run with `--clean` to start fresh.
 After TLS upgrade we can no longer tee the actual TCP bytes (they're
 inside the tunnel), so we log the plaintext frames as they'd appear on an
 unencrypted core. That's the format the offline replay tests need anyway.
+
+Security notes
+--------------
+
+This script enforces the same TLS-downgrade fail-closed policy as the
+production `login-only` CLI: if we offered Encryption and the core's
+probe reply did not enable it, we abort BEFORE sending `ClientInit`.
+Override only with `--no-tls`. Do not let this drift from the CLI policy.
+
+By default the saved `<prefix>.sent.bin` does NOT include the real
+`ClientLogin` frame — we substitute a synthetic placeholder
+(`User=<redacted>`, `Password=<redacted>`) so the fixture preserves the
+wire shape without leaking credentials. Pass `--capture-secrets` to
+record the real credentials, but only do so if you intend to delete the
+file immediately or use throwaway credentials.
 """
 
 from __future__ import annotations
@@ -86,6 +101,16 @@ def main() -> int:
         "--user",
         help="Username for ClientLogin (env: QUASSEL_USER).",
     )
+    parser.add_argument(
+        "--capture-secrets",
+        action="store_true",
+        help=(
+            "Write the REAL ClientLogin frame (with username and password) "
+            "to <prefix>.sent.bin. WARNING: the file will contain reusable "
+            "credentials in cleartext — delete or use throwaway creds. "
+            "Without this flag the saved frame is a synthetic placeholder."
+        ),
+    )
     args = parser.parse_args()
 
     sent_path = Path(f"{args.prefix}.sent.bin")
@@ -101,6 +126,10 @@ def main() -> int:
 async def _capture(args: argparse.Namespace, sent_path: Path, recv_path: Path) -> int:
     sent_log = sent_path.open("ab")
     recv_log = recv_path.open("ab")
+    # Initialize early so the `finally` cleanup is safe even if
+    # `open_tcp_connection` itself raises before assignment. Without this
+    # we'd leak an UnboundLocalError that masks the real failure.
+    writer: asyncio.StreamWriter | None = None
     try:
         reader, writer = await open_tcp_connection(args.host, args.port)
 
@@ -123,6 +152,22 @@ async def _capture(args: argparse.Namespace, sent_path: Path, recv_path: Path) -
                 options=TlsOptions(verify=not args.insecure),
             )
             print("TLS upgraded")
+        elif not args.no_tls:
+            # Fail-closed mirror of the production `login-only` CLI policy
+            # (`src/quasseltui/cli.py::_login_only`). The probe reply is
+            # unauthenticated until TLS starts, so a MITM can strip the
+            # Encryption bit. If we offered TLS and the core didn't enable
+            # it we MUST abort before sending anything else — otherwise
+            # this developer tool would leak the real password in the
+            # next phase. Override only with --no-tls (a deliberate "I
+            # know what I'm doing" choice).
+            print(
+                "abort: core did not enable TLS but we offered it. This is a "
+                "downgrade and would leak any credentials in the next phase. "
+                "Re-run with --no-tls if you actually trust this network path.",
+                file=sys.stderr,
+            )
+            return 5
 
         # ClientInit (framed)
         init_payload = encode_client_init(
@@ -163,9 +208,25 @@ async def _capture(args: argparse.Namespace, sent_path: Path, recv_path: Path) -
                 print("\naborted at password prompt", file=sys.stderr)
                 return 1
 
-        login_payload = encode_client_login(ClientLogin(user=user, password=password))
-        sent_log.write(_framed(login_payload))
-        await write_frame(writer, login_payload)
+        # Always send the REAL credentials to the core — that's the whole
+        # point of `--login`. But only persist them to the sent-log fixture
+        # if `--capture-secrets` was passed; otherwise write a synthetic
+        # placeholder frame so the fixture file stays committable and the
+        # password never lands on disk via this tool.
+        real_login_payload = encode_client_login(ClientLogin(user=user, password=password))
+        if args.capture_secrets:
+            print(
+                "WARNING: --capture-secrets is set; the saved sent.bin will "
+                "contain real credentials in cleartext.",
+                file=sys.stderr,
+            )
+            sent_log.write(_framed(real_login_payload))
+        else:
+            placeholder_payload = encode_client_login(
+                ClientLogin(user="<redacted>", password="<redacted>"),
+            )
+            sent_log.write(_framed(placeholder_payload))
+        await write_frame(writer, real_login_payload)
 
         try:
             login_ack_payload = await read_frame(reader)
@@ -203,9 +264,10 @@ async def _capture(args: argparse.Namespace, sent_path: Path, recv_path: Path) -
         print(f"protocol error: {exc}", file=sys.stderr)
         return 1
     finally:
-        writer.close()
-        with contextlib.suppress(OSError):
-            await writer.wait_closed()
+        if writer is not None:
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
         sent_log.close()
         recv_log.close()
         print(f"wrote {sent_path}, {recv_path}")

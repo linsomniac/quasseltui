@@ -1,6 +1,6 @@
 """Command-line entry point for quasseltui.
 
-Four diagnostic subcommands at the moment:
+Five subcommands at the moment:
 
 - `probe-only` (phase 2) runs the probe handshake, optional TLS upgrade,
   `ClientInit` round-trip, and exits. Useful for sanity-checking that a
@@ -19,9 +19,12 @@ Four diagnostic subcommands at the moment:
   `--duration` seconds and prints the populated `ClientState` snapshot
   when it's done. This validates the sync/dispatcher + state layers
   end-to-end against a real core.
+- `ui-demo` (phase 6) launches the Textual TUI against a hand-built
+  static `ClientState` — no network, no credentials. Phase 7 will add
+  a real `ui` command that runs the live client.
 
-All four modes are headless and exit when done — the Textual UI lands in
-phase 6+.
+The first four modes are headless and exit when done; `ui-demo` starts
+an interactive Textual app and exits on `Ctrl+Q`.
 """
 
 from __future__ import annotations
@@ -241,6 +244,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum messages per buffer to print in the summary (default: 5).",
     )
 
+    sub.add_parser(
+        "ui-demo",
+        help=(
+            "Launch the Textual UI against static placeholder data. "
+            "Useful for eyeballing the layout without needing a core. "
+            "Press Ctrl+Q to quit."
+        ),
+    )
+
     return parser
 
 
@@ -256,8 +268,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_stream_only(args))
     if args.mode == "dump-state":
         return asyncio.run(_dump_state(args))
+    if args.mode == "ui-demo":
+        return _ui_demo(args)
 
     print(f"quasseltui {__version__} — under construction")
+    return 0
+
+
+def _ui_demo(_args: argparse.Namespace) -> int:
+    """Launch the Textual UI against the static demo state.
+
+    Imported lazily so that running any of the diagnostic subcommands
+    (or just `--version` / `--help`) does not pull Textual into the
+    process. Textual's import time is noticeable and the four
+    offline-diagnostic subcommands share a reason not to pay for it.
+    """
+    from quasseltui.app.app import QuasselApp
+    from quasseltui.app.demo_data import build_demo_state
+
+    QuasselApp(build_demo_state()).run()
     return 0
 
 

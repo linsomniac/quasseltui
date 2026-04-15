@@ -1,0 +1,38 @@
+/* quasseltui — main chat screen styling.
+ *
+ * Phase 6 goal: three panes visible, not pretty. The layout is a
+ * Horizontal wrapping a left sidebar + right Vertical; the Vertical
+ * holds the message log above a docked input bar.
+ *
+ * Keep this file small and stylistically boring — phase 11 owns the
+ * theme pass. Any rule here should be load-bearing for layout, not
+ * colour choices.
+ */
+
+Screen {
+    layers: base;
+}
+
+BufferTree {
+    width: 28;
+    min-width: 20;
+    border: round $primary;
+    padding: 0 1;
+}
+
+#main-column {
+    width: 1fr;
+}
+
+MessageLog {
+    height: 1fr;
+    border: round $primary;
+    padding: 0 1;
+}
+
+InputBar {
+    dock: bottom;
+    height: 3;
+    border: round $accent;
+    padding: 0 1;
+}

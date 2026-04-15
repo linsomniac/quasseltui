@@ -19,23 +19,38 @@ import asyncio
 
 import pytest
 
-from quasseltui.protocol.errors import HandshakeError
+from quasseltui.protocol.errors import AuthError, HandshakeError
 from quasseltui.protocol.framing import encode_frame
 from quasseltui.protocol.handshake import (
     decode_handshake_payload,
     encode_client_init,
+    encode_client_login,
     encode_handshake_payload,
     recv_handshake_message,
 )
 from quasseltui.protocol.messages import (
     CLIENT_INIT,
+    CLIENT_LOGIN,
     ClientInit,
     ClientInitAck,
     ClientInitReject,
+    ClientLogin,
+    ClientLoginAck,
+    CoreSetupReject,
+    SessionInit,
+    parse_handshake_message,
 )
-from quasseltui.qt.datastream import QDataStreamReader
+from quasseltui.protocol.usertypes import (
+    USER_TYPE_BUFFER_INFO,
+    USER_TYPE_NETWORK_ID,
+    BufferId,
+    BufferInfo,
+    BufferType,
+    NetworkId,
+)
+from quasseltui.qt.datastream import QDataStreamReader, QDataStreamWriter
 from quasseltui.qt.types import QMetaType
-from quasseltui.qt.variant import read_qvariantlist
+from quasseltui.qt.variant import read_qvariantlist, write_variant
 
 
 class TestEncodeHandshakePayload:
@@ -336,3 +351,215 @@ class TestRecvHandshakeMessage:
         result = await recv_handshake_message(reader)
         assert isinstance(result, ClientInitReject)
         assert result.error_string == "no good"
+
+
+class TestEncodeClientLogin:
+    def test_produces_user_password_pair(self) -> None:
+        msg = ClientLogin(user="sean", password="hunter2")
+        decoded = decode_handshake_payload(encode_client_login(msg))
+        assert decoded == {
+            "MsgType": CLIENT_LOGIN,
+            "User": "sean",
+            "Password": "hunter2",
+        }
+
+    def test_password_with_unicode_round_trips(self) -> None:
+        msg = ClientLogin(user="user", password="🔒passwørd")
+        decoded = decode_handshake_payload(encode_client_login(msg))
+        assert decoded["Password"] == "🔒passwørd"
+
+
+class TestParseClientLogin:
+    def test_login_ack_parses(self) -> None:
+        result = parse_handshake_message({"MsgType": "ClientLoginAck"})
+        assert isinstance(result, ClientLoginAck)
+
+    def test_login_reject_raises_auth_error(self) -> None:
+        # Credentials failures bounce out as an exception so the connection
+        # state machine can't accidentally fall through to "all good" — the
+        # type system guarantees you handled it.
+        with pytest.raises(AuthError, match="bad password"):
+            parse_handshake_message({"MsgType": "ClientLoginReject", "Error": "bad password"})
+
+    def test_login_reject_with_no_error_string_still_raises(self) -> None:
+        with pytest.raises(AuthError, match="core rejected credentials"):
+            parse_handshake_message({"MsgType": "ClientLoginReject"})
+
+    def test_core_setup_reject_returned_as_value(self) -> None:
+        # CoreSetupReject is informational (we don't run setup) so it stays
+        # a regular return value — the CLI surfaces it as a friendly error.
+        result = parse_handshake_message({"MsgType": "CoreSetupReject", "Error": "missing field"})
+        assert isinstance(result, CoreSetupReject)
+        assert result.error_string == "missing field"
+
+
+class TestParseSessionInit:
+    """SessionInit is the meatiest handshake message — its `SessionState`
+    nested map carries lists of user-type values. These tests verify the
+    structural validation and the typed unpacking, not the Quassel byte
+    format (that lives in `test_usertypes.py`).
+    """
+
+    def _build_session_state(
+        self,
+        *,
+        identities: list[dict[str, object]] | None = None,
+        network_ids: list[NetworkId] | None = None,
+        buffer_infos: list[BufferInfo] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "MsgType": "SessionInit",
+            "SessionState": {
+                "Identities": identities or [],
+                "NetworkIds": network_ids or [],
+                "BufferInfos": buffer_infos or [],
+            },
+        }
+
+    def test_empty_session_state_parses(self) -> None:
+        result = parse_handshake_message(self._build_session_state())
+        assert isinstance(result, SessionInit)
+        assert result.identities == ()
+        assert result.network_ids == ()
+        assert result.buffer_infos == ()
+
+    def test_full_session_state(self) -> None:
+        result = parse_handshake_message(
+            self._build_session_state(
+                identities=[{"identityName": "default", "identityId": 1}],
+                network_ids=[NetworkId(1), NetworkId(2)],
+                buffer_infos=[
+                    BufferInfo(
+                        buffer_id=BufferId(10),
+                        network_id=NetworkId(1),
+                        type=BufferType.Channel,
+                        group_id=0,
+                        name="#python",
+                    ),
+                    BufferInfo(
+                        buffer_id=BufferId(11),
+                        network_id=NetworkId(1),
+                        type=BufferType.Status,
+                        group_id=0,
+                        name="",
+                    ),
+                ],
+            )
+        )
+        assert isinstance(result, SessionInit)
+        assert len(result.identities) == 1
+        assert result.identities[0]["identityName"] == "default"
+        assert result.network_ids == (NetworkId(1), NetworkId(2))
+        assert len(result.buffer_infos) == 2
+        assert result.buffer_infos[0].name == "#python"
+
+    def test_missing_session_state_rejected(self) -> None:
+        with pytest.raises(HandshakeError, match="missing required field 'SessionState'"):
+            parse_handshake_message({"MsgType": "SessionInit"})
+
+    def test_session_state_wrong_type_rejected(self) -> None:
+        with pytest.raises(HandshakeError, match=r"SessionState.*expected dict"):
+            parse_handshake_message({"MsgType": "SessionInit", "SessionState": "oops"})
+
+    def test_identities_must_be_list_of_dicts(self) -> None:
+        with pytest.raises(HandshakeError, match=r"Identities'\[0\].*expected dict"):
+            parse_handshake_message(
+                {
+                    "MsgType": "SessionInit",
+                    "SessionState": {
+                        "Identities": ["not a dict"],
+                        "NetworkIds": [],
+                        "BufferInfos": [],
+                    },
+                }
+            )
+
+    def test_network_ids_must_be_network_id_instances(self) -> None:
+        # If a future core sends raw ints in NetworkIds (skipping the user
+        # type wrapper) we should refuse — better to crash visibly than
+        # decode something we'll later mis-key on.
+        with pytest.raises(HandshakeError, match=r"NetworkIds'\[0\].*expected NetworkId"):
+            parse_handshake_message(
+                {
+                    "MsgType": "SessionInit",
+                    "SessionState": {
+                        "Identities": [],
+                        "NetworkIds": [42],
+                        "BufferInfos": [],
+                    },
+                }
+            )
+
+    def test_buffer_infos_must_be_buffer_info_instances(self) -> None:
+        with pytest.raises(HandshakeError, match=r"BufferInfos'\[0\].*expected BufferInfo"):
+            parse_handshake_message(
+                {
+                    "MsgType": "SessionInit",
+                    "SessionState": {
+                        "Identities": [],
+                        "NetworkIds": [],
+                        "BufferInfos": [{"not": "a bufferinfo"}],
+                    },
+                }
+            )
+
+    def test_session_init_round_trips_through_full_codec(self) -> None:
+        """Encode a SessionInit envelope by hand and decode it back through
+        `decode_handshake_payload` + `parse_handshake_message`.
+
+        We can't call `encode_handshake_payload({"SessionState": {...}})`
+        with our dataclasses inside, because `write_variant`'s type
+        inference doesn't know about `BufferInfo` etc. So we hand-build the
+        outer flattened-map payload to mirror exactly what a real core
+        would emit — and the decoder/parser still has to put it back
+        together correctly.
+        """
+        bi = BufferInfo(
+            buffer_id=BufferId(1),
+            network_id=NetworkId(1),
+            type=BufferType.Channel,
+            group_id=0,
+            name="#test",
+        )
+
+        # The flattened handshake payload is a QVariantList of
+        # [key0, value0, key1, value1, ...] where keys are
+        # QVariant<QByteArray> and values keep their typed envelopes.
+        writer = QDataStreamWriter()
+        writer.write_uint32(2 * 2)  # 2 fields, 2 entries each (key + value)
+
+        write_variant(writer, b"MsgType", type_id=QMetaType.QByteArray)
+        write_variant(writer, "SessionInit", type_id=QMetaType.QString)
+
+        write_variant(writer, b"SessionState", type_id=QMetaType.QByteArray)
+
+        # Nested QVariant<QVariantMap> for SessionState. Hand-encode the
+        # envelope (type=8, is_null=0) followed by the QVariantMap body.
+        writer.write_uint32(QMetaType.QVariantMap)
+        writer.write_uint8(0)
+        writer.write_uint32(3)  # 3 keys in the inner map
+
+        # Each entry: QString key, then a typed QVariant value.
+        writer.write_qstring("BufferInfos")
+        writer.write_uint32(QMetaType.QVariantList)
+        writer.write_uint8(0)
+        writer.write_uint32(1)
+        write_variant(writer, bi, user_type_name=USER_TYPE_BUFFER_INFO)
+
+        writer.write_qstring("Identities")
+        writer.write_uint32(QMetaType.QVariantList)
+        writer.write_uint8(0)
+        writer.write_uint32(0)  # empty list
+
+        writer.write_qstring("NetworkIds")
+        writer.write_uint32(QMetaType.QVariantList)
+        writer.write_uint8(0)
+        writer.write_uint32(1)
+        write_variant(writer, NetworkId(1), user_type_name=USER_TYPE_NETWORK_ID)
+
+        decoded = decode_handshake_payload(writer.to_bytes())
+        result = parse_handshake_message(decoded)
+        assert isinstance(result, SessionInit)
+        assert result.network_ids == (NetworkId(1),)
+        assert result.buffer_infos == (bi,)
+        assert result.identities == ()

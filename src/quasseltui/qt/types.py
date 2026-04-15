@@ -26,6 +26,7 @@ class QMetaType(IntEnum):
     QString = 10
     QStringList = 11
     QByteArray = 12
-    # Phase 3+ will add QDateTime (16), QTime (15), QDate (14), and the
-    # UserType marker (127) as we encounter them. Keep this list in sync with
-    # the dispatch table in `quasseltui.qt.variant`.
+    # Phase 4 will add QDate (14), QTime (15), QDateTime (16) for IRC
+    # message timestamps. Keep this list in sync with the dispatch table in
+    # `quasseltui.qt.variant`.
+    UserType = 127

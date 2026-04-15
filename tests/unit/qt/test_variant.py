@@ -243,3 +243,112 @@ class TestContainerLimits:
         from quasseltui.qt.variant import read_qvariantlist as _read
 
         assert _read(reader) == items
+
+
+class TestUserTypeEnvelope:
+    """The QVariant<UserType> envelope is its own little wire format. These
+    tests pin the bytes against hand-built blobs so any silent change
+    (forgetting the trailing-null normalization, swapping QString for
+    QByteArray on the name, ...) blows up loudly.
+    """
+
+    def setup_method(self) -> None:
+        from quasseltui.qt.usertypes import register_user_type
+
+        # Toy "Pair" type: payload is two uint32s. We register it for the
+        # duration of these tests and tear down afterwards so no test
+        # pollution leaks into the rest of the suite.
+        def _read(reader: QDataStreamReader) -> tuple[int, int]:
+            return (reader.read_uint32(), reader.read_uint32())
+
+        def _write(writer: QDataStreamWriter, value: object) -> None:
+            assert isinstance(value, tuple)
+            writer.write_uint32(int(value[0]))
+            writer.write_uint32(int(value[1]))
+
+        register_user_type(b"PairTest", _read, _write)
+
+    def teardown_method(self) -> None:
+        from quasseltui.qt.usertypes import _USER_TYPE_READERS, _USER_TYPE_WRITERS
+
+        _USER_TYPE_READERS.pop(b"PairTest", None)
+        _USER_TYPE_WRITERS.pop(b"PairTest", None)
+
+    def test_user_type_round_trip_with_explicit_name(self) -> None:
+        writer = QDataStreamWriter()
+        write_variant(writer, (3, 7), user_type_name=b"PairTest")
+        reader = QDataStreamReader(writer.to_bytes())
+        assert read_variant(reader) == (3, 7)
+        assert reader.at_end()
+
+    def test_user_type_envelope_byte_layout(self) -> None:
+        # type=127, is_null=0, name=QByteArray("PairTest"), payload=(3, 7)
+        writer = QDataStreamWriter()
+        write_variant(writer, (3, 7), user_type_name=b"PairTest")
+        blob = writer.to_bytes()
+        # 4-byte type id
+        assert blob[:4] == b"\x00\x00\x00\x7f"  # 127
+        # 1-byte is_null = 0
+        assert blob[4] == 0
+        # 4-byte QByteArray length, then "PairTest" (no trailing null on write)
+        assert blob[5:9] == b"\x00\x00\x00\x08"
+        assert blob[9:17] == b"PairTest"
+        # 8 bytes of payload
+        assert blob[17:25] == b"\x00\x00\x00\x03\x00\x00\x00\x07"
+
+    def test_user_type_name_with_trailing_nulls_is_normalized_on_read(self) -> None:
+        # Hand-build the envelope with the name as "PairTest\0" — this is what
+        # an older Quassel core would emit. Our decoder should strip the NUL
+        # and look up the same handler.
+        writer = QDataStreamWriter()
+        writer.write_uint32(127)  # UserType
+        writer.write_uint8(0)  # not null
+        writer.write_qbytearray(b"PairTest\x00")
+        writer.write_uint32(11)
+        writer.write_uint32(13)
+        reader = QDataStreamReader(writer.to_bytes())
+        assert read_variant(reader) == (11, 13)
+        assert reader.at_end()
+
+    def test_unregistered_user_type_raises(self) -> None:
+        writer = QDataStreamWriter()
+        writer.write_uint32(127)
+        writer.write_uint8(0)
+        writer.write_qbytearray(b"Mystery")
+        # Garbage payload — we shouldn't even get this far before the lookup
+        # fails.
+        writer.write_uint32(0)
+        reader = QDataStreamReader(writer.to_bytes())
+        with pytest.raises(QDataStreamError, match=r"unsupported QVariant<UserType> name"):
+            read_variant(reader)
+
+    def test_user_type_with_null_flag_consumes_payload(self) -> None:
+        # is_null=1 must NOT skip the payload — the payload is still on the
+        # wire because Qt's QVariant::save always serializes it. The decoded
+        # value collapses to None for the caller, but the stream cursor must
+        # still advance past those bytes.
+        writer = QDataStreamWriter()
+        writer.write_uint32(127)
+        writer.write_uint8(1)  # is_null
+        writer.write_qbytearray(b"PairTest")
+        writer.write_uint32(0)  # payload byte 1
+        writer.write_uint32(0)  # payload byte 2
+        # And a follow-on Int variant we'd misread if the cursor was wrong.
+        write_variant(writer, 42, type_id=QMetaType.Int)
+
+        reader = QDataStreamReader(writer.to_bytes())
+        first = read_variant(reader)
+        second = read_variant(reader)
+        assert first is None
+        assert second == 42
+        assert reader.at_end()
+
+    def test_write_with_both_type_id_and_user_type_name_rejected(self) -> None:
+        writer = QDataStreamWriter()
+        with pytest.raises(QDataStreamError, match="not both"):
+            write_variant(
+                writer,
+                (1, 2),
+                type_id=QMetaType.QVariantList,
+                user_type_name=b"PairTest",
+            )

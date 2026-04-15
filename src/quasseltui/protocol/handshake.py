@@ -30,8 +30,8 @@ from quasseltui.protocol.framing import read_frame, write_frame
 from quasseltui.protocol.messages import (
     CLIENT_INIT,
     ClientInit,
-    ClientInitAck,
-    ClientInitReject,
+    ClientLogin,
+    HandshakeMessage,
     parse_handshake_message,
 )
 from quasseltui.qt.datastream import QDataStreamError, QDataStreamReader, QDataStreamWriter
@@ -121,11 +121,21 @@ async def send_client_init(writer: asyncio.StreamWriter, msg: ClientInit) -> Non
     await write_frame(writer, encode_client_init(msg))
 
 
+def encode_client_login(msg: ClientLogin) -> bytes:
+    """Build a `ClientLogin` payload for the auth half of the handshake."""
+    return encode_handshake_payload(msg.to_map())
+
+
+async def send_client_login(writer: asyncio.StreamWriter, msg: ClientLogin) -> None:
+    """Frame and send a `ClientLogin` over the post-ClientInitAck stream."""
+    await write_frame(writer, encode_client_login(msg))
+
+
 async def recv_handshake_message(
     reader: asyncio.StreamReader,
     *,
     max_frame_bytes: int | None = None,
-) -> ClientInitAck | ClientInitReject:
+) -> HandshakeMessage:
     """Read one framed handshake reply and decode it into a typed dataclass.
 
     `max_frame_bytes` is forwarded to `read_frame`; leave it `None` to use
@@ -133,6 +143,12 @@ async def recv_handshake_message(
     and lets `QDataStreamError` propagate from the binary codec — both
     classes of failure should bubble up to the connection state machine,
     which handles them by closing the socket.
+
+    `ClientLoginReject` is converted into an `AuthError` exception by
+    `parse_handshake_message`, so callers do NOT need to special-case it
+    — they only need to catch `AuthError` (a subclass of `HandshakeError`)
+    if they want to distinguish credential failures from other handshake
+    failures.
     """
     kwargs: dict[str, Any] = {}
     if max_frame_bytes is not None:
@@ -149,7 +165,9 @@ __all__ = [
     "CLIENT_INIT",
     "decode_handshake_payload",
     "encode_client_init",
+    "encode_client_login",
     "encode_handshake_payload",
     "recv_handshake_message",
     "send_client_init",
+    "send_client_login",
 ]

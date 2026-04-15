@@ -10,9 +10,13 @@ The dispatch table below maps `QMetaType` IDs to a `(reader, writer)` pair.
 Container types (QVariantList, QVariantMap, QStringList) are recursive over
 QVariant so they live here rather than in a separate module.
 
-This file grows on demand. Phase 1 covers only the types needed for `ClientInit`
-plus their immediate companions: Bool, Int, UInt, LongLong, ULongLong, QString,
-QStringList, QByteArray, QVariantList, QVariantMap.
+`QMetaType.UserType` (127) is special: instead of looking up a payload codec
+by numeric ID we read a `QByteArray` name out of the stream and dispatch via
+`quasseltui.qt.usertypes`. Phase 3 adds this for the Quassel custom types
+(`BufferInfo`, `BufferId`, `NetworkId`, `Identity`, ...).
+
+This file grows on demand. Phase 1 covered only the types needed for
+`ClientInit`; phase 3 adds the UserType envelope.
 """
 
 from __future__ import annotations
@@ -22,6 +26,11 @@ from typing import Any
 
 from quasseltui.qt.datastream import QDataStreamError, QDataStreamReader, QDataStreamWriter
 from quasseltui.qt.types import QMetaType
+from quasseltui.qt.usertypes import (
+    normalize_name,
+    read_user_type_payload,
+    write_user_type_payload,
+)
 
 QVariantMap = dict[str, Any]
 QVariantList = list[Any]
@@ -220,11 +229,25 @@ def read_variant(reader: QDataStreamReader) -> Any:
     on a typed-null variant we'd desynchronize the entire surrounding stream.
     The payload is read and then the value is collapsed to `None` for the
     caller.
+
+    `QMetaType.UserType` is dispatched via `quasseltui.qt.usertypes`: we read
+    the type-name as a QByteArray, strip any trailing null bytes, then call
+    the registered payload reader. Unknown user types raise rather than
+    silently desynchronize the stream.
     """
     type_id = reader.read_uint32()
     is_null = reader.read_uint8()
     if type_id == QMetaType.Invalid:
         return None
+    if type_id == QMetaType.UserType:
+        raw_name = reader.read_qbytearray()
+        if raw_name is None:
+            raise QDataStreamError(f"QVariant<UserType> name is null at offset {reader.position}")
+        name = normalize_name(raw_name)
+        value = read_user_type_payload(reader, name)
+        if is_null:
+            return None
+        return value
     fn = _READERS.get(type_id)
     if fn is None:
         raise QDataStreamError(
@@ -240,6 +263,8 @@ def write_variant(
     writer: QDataStreamWriter,
     value: Any,
     type_id: int | None = None,
+    *,
+    user_type_name: bytes | None = None,
 ) -> None:
     """Encode a single QVariant envelope.
 
@@ -248,6 +273,12 @@ def write_variant(
     a Python `int` as a `QMetaType.UInt` or `LongLong` rather than the default
     `Int`).
 
+    `user_type_name` switches the encoder into UserType mode: the envelope
+    becomes `(127, is_null=0, QByteArray(name), payload)` and the payload is
+    written by the codec registered under `name` in
+    `quasseltui.qt.usertypes`. Passing both `type_id` and `user_type_name`
+    is a programming error.
+
     Passing `value=None` with no `type_id` produces an Invalid variant. Passing
     `value=None` with a `type_id` is rejected: writing a typed-null QVariant
     would require synthesizing a default payload for the type, which we don't
@@ -255,16 +286,27 @@ def write_variant(
     cannot distinguish from a real one. Callers that need this should add a
     typed-null sentinel and explicit handling at that point.
     """
-    if value is None and type_id is None:
+    if user_type_name is not None and type_id is not None:
+        raise QDataStreamError("write_variant: pass either type_id or user_type_name, not both")
+
+    if value is None and type_id is None and user_type_name is None:
         writer.write_uint32(QMetaType.Invalid)
         writer.write_uint8(1)
         return
 
     if value is None:
         raise QDataStreamError(
-            f"typed-null QVariant writes are not supported (type_id={type_id}); "
+            f"typed-null QVariant writes are not supported "
+            f"(type_id={type_id}, user_type_name={user_type_name!r}); "
             "use write_variant(writer, None) for an Invalid variant or pass a real value"
         )
+
+    if user_type_name is not None:
+        writer.write_uint32(QMetaType.UserType)
+        writer.write_uint8(0)
+        writer.write_qbytearray(user_type_name)
+        write_user_type_payload(writer, user_type_name, value)
+        return
 
     if type_id is None:
         type_id = _infer_type_id(value)

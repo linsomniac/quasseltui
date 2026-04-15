@@ -97,17 +97,49 @@ async def start_tls_on_writer(
         raise TransportError(f"TLS upgrade to {host} failed: {exc}") from exc
 
 
+CLOSE_WRITER_GRACE_SECONDS = 2.0
+"""Upper bound on how long we wait for a graceful TLS close_notify reply.
+
+`StreamWriter.wait_closed()` on a TLS transport waits for the peer to
+reply with its own `close_notify` alert. If the peer never bothers
+(broken core, already-closed socket, network partition) this blocks
+forever on Python 3.11 — see cpython gh-88021, which was only fixed in
+3.12. We can't upgrade the target runtime unilaterally, so we cap the
+grace window here and fall back to `transport.abort()` on timeout so
+process teardown is snappy. Two seconds is generous for any core that
+is actually going to reply; anything longer would delay Ctrl+Q in the
+TUI noticeably."""
+
+
 async def close_writer(writer: asyncio.StreamWriter) -> None:
-    """Close a writer cleanly, swallowing errors from an already-dead peer.
+    """Close a writer cleanly, swallowing errors and bounding the wait.
 
     The protocol layer often wants to tear down the connection in error
     paths where the socket may already be half-closed. We don't want a
-    secondary `ConnectionResetError` to mask the original failure, so this
-    helper logs nothing and returns nothing — it just makes the close
+    secondary `ConnectionResetError` to mask the original failure, so
+    errors are logged nothing / return nothing — the close is
     best-effort.
+
+    Additionally, `StreamWriter.wait_closed()` on a TLS transport is
+    prone to hanging in Python 3.11 when the peer does not reply to our
+    `close_notify` — the known gh-88021 deadlock, fixed in 3.12. Since
+    this helper runs on every teardown path (including the TUI's
+    `on_unmount` → `QuasselClient.close` chain on Ctrl+Q), a hang here
+    would leave the process stuck in a restored terminal with no
+    explanation. Bound the wait with `asyncio.wait_for` and fall back
+    to `transport.abort()` — which synchronously forces the socket
+    closed without waiting for the peer's `close_notify` — if the
+    graceful close doesn't land in `CLOSE_WRITER_GRACE_SECONDS`.
     """
     try:
         writer.close()
-        await writer.wait_closed()
+    except (OSError, ssl.SSLError):
+        return
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=CLOSE_WRITER_GRACE_SECONDS)
+    except TimeoutError:
+        transport = writer.transport
+        if transport is not None:
+            transport.abort()
     except (OSError, ssl.SSLError):
         pass

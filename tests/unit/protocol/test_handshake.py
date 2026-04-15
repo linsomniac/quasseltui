@@ -249,6 +249,65 @@ class TestParseClientInitAck:
             parse_handshake_message({})
 
 
+class TestStrictClientInitAckParsing:
+    """Codex review caught that `int(data["ProtocolVersion"])` and similar
+    casts can leak `TypeError`/`ValueError` past the `QuasselError` handler.
+    These tests pin that all schema/type failures arrive as `HandshakeError`.
+    """
+
+    def _ack(self, **overrides: object) -> dict[str, object]:
+        base: dict[str, object] = {
+            "MsgType": "ClientInitAck",
+            "CoreFeatures": 0,
+            "FeatureList": [],
+            "Configured": True,
+        }
+        base.update(overrides)
+        return base
+
+    def test_missing_required_field_rejected(self) -> None:
+        with pytest.raises(HandshakeError, match="missing required field 'CoreFeatures'"):
+            ClientInitAck.from_map({"MsgType": "ClientInitAck", "Configured": True})
+
+    def test_wrong_type_for_int_field_rejected(self) -> None:
+        with pytest.raises(HandshakeError, match=r"CoreFeatures.*expected int"):
+            ClientInitAck.from_map(self._ack(CoreFeatures="not-an-int"))
+
+    def test_bool_in_int_field_rejected(self) -> None:
+        # `bool` is an `int` subclass, so a naive isinstance check would
+        # let `True` through as a valid integer. Defensive type check
+        # rejects it explicitly.
+        with pytest.raises(HandshakeError, match=r"CoreFeatures.*expected int"):
+            ClientInitAck.from_map(self._ack(CoreFeatures=True))
+
+    def test_wrong_type_for_bool_field_rejected(self) -> None:
+        with pytest.raises(HandshakeError, match=r"Configured.*expected bool"):
+            ClientInitAck.from_map(self._ack(Configured=1))
+
+    def test_wrong_type_for_string_in_list_rejected(self) -> None:
+        with pytest.raises(HandshakeError, match=r"FeatureList'\[1\].*expected str"):
+            ClientInitAck.from_map(self._ack(FeatureList=["ok", 42]))
+
+    def test_wrong_type_for_optional_int_field_rejected(self) -> None:
+        with pytest.raises(HandshakeError, match=r"ProtocolVersion.*expected int"):
+            ClientInitAck.from_map(self._ack(ProtocolVersion="ten"))
+
+    def test_storage_backends_must_be_list(self) -> None:
+        with pytest.raises(HandshakeError, match=r"StorageBackends.*expected list"):
+            ClientInitAck.from_map(self._ack(StorageBackends="oops"))
+
+    def test_optional_protocol_version_absence_ok(self) -> None:
+        ack = ClientInitAck.from_map(self._ack())
+        assert ack.protocol_version is None
+
+    def test_minimal_valid_ack_still_parses(self) -> None:
+        # Sanity: the strict validator did not break the canonical case.
+        ack = ClientInitAck.from_map(self._ack(CoreFeatures=0xC03F, ProtocolVersion=10))
+        assert ack.core_features == 0xC03F
+        assert ack.protocol_version == 10
+        assert ack.configured is True
+
+
 class TestRecvHandshakeMessage:
     @pytest.mark.asyncio
     async def test_reads_framed_ack(self) -> None:

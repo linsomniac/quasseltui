@@ -49,7 +49,19 @@ def build_parser() -> argparse.ArgumentParser:
     probe_only.add_argument(
         "--no-tls",
         action="store_true",
-        help="Do not offer encryption during the probe (plain TCP only).",
+        help=(
+            "Do not offer encryption during the probe (plain TCP only). "
+            "Implies --allow-plaintext. Use only against trusted local cores."
+        ),
+    )
+    probe_only.add_argument(
+        "--allow-plaintext",
+        action="store_true",
+        help=(
+            "Allow the session to continue if the core does not enable TLS "
+            "even though we offered it. Without this flag we abort to "
+            "prevent a downgrade attack from leaking credentials."
+        ),
     )
     probe_only.add_argument(
         "--insecure",
@@ -103,8 +115,18 @@ async def _probe_only(args: argparse.Namespace) -> int:
                 options=TlsOptions(verify=not args.insecure, cafile=args.cafile),
             )
             print("TLS upgrade ok")
-        elif not args.no_tls:
-            print("WARNING: core did not enable TLS — credentials would be sent in plaintext")
+        elif not args.no_tls and not args.allow_plaintext:
+            # We offered Encryption and the core's reply did not enable it.
+            # An active MITM can strip the bit because the probe reply is
+            # unauthenticated until TLS starts. Fail closed instead of
+            # leaking ClientInit (and eventually ClientLogin) in plaintext.
+            print(
+                "abort: core did not enable TLS but we offered it. This is a "
+                "downgrade and could be a MITM. Re-run with --allow-plaintext "
+                "if you actually trust this network path.",
+                file=sys.stderr,
+            )
+            return 5
 
         await send_client_init(
             writer,

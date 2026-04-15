@@ -29,6 +29,114 @@ CLIENT_INIT_ACK = "ClientInitAck"
 CLIENT_INIT_REJECT = "ClientInitReject"
 
 
+def _require_int(data: dict[str, Any], key: str) -> int:
+    """Pull a required int field out of a handshake map, or raise.
+
+    Quassel sends ints as `quint32` etc. which decode to Python `int`. Any
+    other type means the peer is broken or hostile, and we want that to
+    surface as `HandshakeError` rather than a stray `TypeError` escaping
+    past the connection state machine's `except QuasselError` handler.
+    `bool` is rejected even though it's an `int` subclass, to avoid silent
+    `True == 1` confusion in field positions where we expect a number.
+    """
+    if key not in data:
+        raise HandshakeError(f"handshake message missing required field {key!r}")
+    value = data[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HandshakeError(f"handshake field {key!r} expected int, got {type(value).__name__}")
+    return int(value)
+
+
+def _require_bool(data: dict[str, Any], key: str) -> bool:
+    if key not in data:
+        raise HandshakeError(f"handshake message missing required field {key!r}")
+    value = data[key]
+    if not isinstance(value, bool):
+        raise HandshakeError(f"handshake field {key!r} expected bool, got {type(value).__name__}")
+    return value
+
+
+def _require_str(data: dict[str, Any], key: str) -> str:
+    if key not in data:
+        raise HandshakeError(f"handshake message missing required field {key!r}")
+    value = data[key]
+    if not isinstance(value, str):
+        raise HandshakeError(f"handshake field {key!r} expected str, got {type(value).__name__}")
+    return value
+
+
+def _optional_str(data: dict[str, Any], key: str, default: str = "") -> str:
+    """Pull a `QString` field that older cores may omit. Type-checked when present."""
+    if key not in data or data[key] is None:
+        return default
+    value = data[key]
+    if not isinstance(value, str):
+        raise HandshakeError(f"handshake field {key!r} expected str, got {type(value).__name__}")
+    return value
+
+
+def _optional_int(data: dict[str, Any], key: str) -> int | None:
+    """Pull an int field that may be absent. `bool` is rejected as for `_require_int`."""
+    if key not in data or data[key] is None:
+        return None
+    value = data[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HandshakeError(f"handshake field {key!r} expected int, got {type(value).__name__}")
+    return int(value)
+
+
+def _optional_dict(data: dict[str, Any], key: str) -> dict[str, Any]:
+    """Pull a `QVariantMap` field that may be absent. Empty dict on missing/null."""
+    if key not in data or data[key] is None:
+        return {}
+    value = data[key]
+    if not isinstance(value, dict):
+        raise HandshakeError(f"handshake field {key!r} expected dict, got {type(value).__name__}")
+    return dict(value)
+
+
+def _optional_str_list(data: dict[str, Any], key: str) -> tuple[str, ...]:
+    """Pull a `QStringList` out of a handshake map, defaulting to empty.
+
+    Missing is fine — `FeatureList` was not present on older cores. A
+    present-but-non-list value is a protocol error. Each element must be a
+    `str` after the QStringList codec, anything else fails loudly.
+    """
+    if key not in data:
+        return ()
+    value = data[key]
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise HandshakeError(f"handshake field {key!r} expected list, got {type(value).__name__}")
+    out: list[str] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            raise HandshakeError(
+                f"handshake field {key!r}[{i}] expected str, got {type(item).__name__}"
+            )
+        out.append(item)
+    return tuple(out)
+
+
+def _optional_dict_list(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    """Pull a `QVariantList` of `QVariantMap` out of a handshake map.
+
+    Used for `StorageBackends` / `Authenticators`. Missing or null is an
+    empty list. Non-dict elements are dropped with no error — a forward-
+    compatible core may add new entries with shapes we don't recognize and
+    we'd rather skip them than crash the handshake.
+    """
+    if key not in data:
+        return []
+    value = data[key]
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise HandshakeError(f"handshake field {key!r} expected list, got {type(value).__name__}")
+    return [item for item in value if isinstance(item, dict)]
+
+
 @dataclass(frozen=True, slots=True)
 class ClientInit:
     """The first framed message a client sends to the core.
@@ -74,13 +182,11 @@ class StorageBackendInfo:
 
     @classmethod
     def from_map(cls, data: dict[str, Any]) -> StorageBackendInfo:
-        keys = data.get("SetupKeys") or []
-        defaults = data.get("SetupDefaults") or {}
         return cls(
-            display_name=str(data.get("DisplayName", "")),
-            description=str(data.get("Description", "")),
-            setup_keys=tuple(str(k) for k in keys),
-            setup_defaults=dict(defaults),
+            display_name=_optional_str(data, "DisplayName"),
+            description=_optional_str(data, "Description"),
+            setup_keys=_optional_str_list(data, "SetupKeys"),
+            setup_defaults=_optional_dict(data, "SetupDefaults"),
             raw=data,
         )
 
@@ -100,8 +206,8 @@ class AuthenticatorInfo:
     @classmethod
     def from_map(cls, data: dict[str, Any]) -> AuthenticatorInfo:
         return cls(
-            display_name=str(data.get("DisplayName", "")),
-            description=str(data.get("Description", "")),
+            display_name=_optional_str(data, "DisplayName"),
+            description=_optional_str(data, "Description"),
             raw=data,
         )
 
@@ -130,19 +236,17 @@ class ClientInitAck:
 
     @classmethod
     def from_map(cls, data: dict[str, Any]) -> ClientInitAck:
-        backends = data.get("StorageBackends") or []
-        auths = data.get("Authenticators") or []
         return cls(
-            core_features=int(data.get("CoreFeatures", 0)),
-            feature_list=tuple(str(s) for s in (data.get("FeatureList") or [])),
-            configured=bool(data.get("Configured", False)),
+            core_features=_require_int(data, "CoreFeatures"),
+            feature_list=_optional_str_list(data, "FeatureList"),
+            configured=_require_bool(data, "Configured"),
             storage_backends=tuple(
-                StorageBackendInfo.from_map(b) for b in backends if isinstance(b, dict)
+                StorageBackendInfo.from_map(b) for b in _optional_dict_list(data, "StorageBackends")
             ),
             authenticators=tuple(
-                AuthenticatorInfo.from_map(a) for a in auths if isinstance(a, dict)
+                AuthenticatorInfo.from_map(a) for a in _optional_dict_list(data, "Authenticators")
             ),
-            protocol_version=(int(data["ProtocolVersion"]) if "ProtocolVersion" in data else None),
+            protocol_version=_optional_int(data, "ProtocolVersion"),
             raw=data,
         )
 
@@ -162,7 +266,7 @@ class ClientInitReject:
     @classmethod
     def from_map(cls, data: dict[str, Any]) -> ClientInitReject:
         return cls(
-            error_string=str(data.get("Error", "")),
+            error_string=_optional_str(data, "Error"),
             raw=data,
         )
 

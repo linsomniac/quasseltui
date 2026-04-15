@@ -129,12 +129,30 @@ def build_probe_request(
     return b"".join(parts)
 
 
-def parse_probe_reply(reply: bytes) -> NegotiatedProtocol:
+def parse_probe_reply(
+    reply: bytes,
+    *,
+    offered_features: ConnectionFeature = ConnectionFeature.Encryption,
+) -> NegotiatedProtocol:
     """Decode the 4-byte server reply into a `NegotiatedProtocol`.
 
-    Raises `ProbeError` on a wrong-length buffer or an unrecognized
-    protocol type — both indicate the server is not actually a Quassel core
-    at the version we expect.
+    Raises `ProbeError` if:
+    - the reply isn't 4 bytes,
+    - the selected protocol is anything other than `DataStream`
+      (we don't ship support for `Internal` or `Legacy`),
+    - the core enabled connection features we did NOT offer (a buggy or
+      hostile peer trying to push us into a mode we never opted into —
+      most importantly, we never want `Compression` set since we have no
+      decompressor),
+    - the core enabled bits we don't recognize at all.
+
+    The negotiated-features check is the half of TLS-downgrade defense that
+    lives at this layer: a hostile server that asserts `Encryption` despite
+    us offering `NONE` would still get rejected here, so callers using
+    `--no-tls` can't be tricked into a confused TLS handshake. The OTHER
+    half — refusing to continue when we OFFERED encryption and the server
+    DECLINED it — has to live at the CLI/connection-policy layer, since
+    only the caller knows whether the user opted into plaintext.
     """
     if len(reply) != 4:
         raise ProbeError(f"probe reply must be 4 bytes, got {len(reply)}")
@@ -142,18 +160,39 @@ def parse_probe_reply(reply: bytes) -> NegotiatedProtocol:
     proto_byte = word & 0xFF
     peer_features = (word >> 8) & 0xFFFF
     conn_features = (word >> 24) & 0xFF
+
     try:
         protocol = ProtocolType(proto_byte)
     except ValueError as exc:
         raise ProbeError(
             f"core selected unknown protocol type {proto_byte:#x}; we only speak DataStream"
         ) from exc
-    if protocol == ProtocolType.Legacy:
-        raise ProbeError("core selected the Legacy protocol — quasseltui only speaks DataStream")
+    if protocol != ProtocolType.DataStream:
+        raise ProbeError(
+            f"core selected protocol {protocol.name} — quasseltui only speaks DataStream"
+        )
+
+    _supported_conn_bits = ConnectionFeature.Encryption | ConnectionFeature.Compression
+    unknown_bits = conn_features & ~int(_supported_conn_bits)
+    if unknown_bits:
+        raise ProbeError(f"core enabled unknown connection feature bits {unknown_bits:#x}")
+    negotiated = ConnectionFeature(conn_features)
+    extra = negotiated & ~offered_features
+    if extra:
+        raise ProbeError(
+            f"core enabled features we did not offer: {extra!r} (offered {offered_features!r})"
+        )
+    if negotiated & ConnectionFeature.Compression:
+        # Compression would require a zlib wrap on top of the framing layer
+        # which we deliberately do not implement; if a core asserts it (even
+        # if we somehow offered it) we'd be unable to decode anything that
+        # follows. Reject loudly rather than silently mis-decode.
+        raise ProbeError("core enabled Compression but quasseltui does not implement it")
+
     return NegotiatedProtocol(
         protocol=protocol,
         peer_features=peer_features,
-        connection_features=ConnectionFeature(conn_features),
+        connection_features=negotiated,
     )
 
 
@@ -172,4 +211,4 @@ async def probe(
     writer.write(build_probe_request(offered_features=offered_features))
     await writer.drain()
     reply = await _read_exactly(reader, 4)
-    return parse_probe_reply(reply)
+    return parse_probe_reply(reply, offered_features=offered_features)

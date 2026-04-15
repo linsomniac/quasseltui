@@ -94,11 +94,17 @@ class TestParseProbeReply:
         assert n.connection_features == ConnectionFeature.NONE
         assert not n.tls_required
 
-    def test_compression_only(self) -> None:
+    def test_compression_alone_rejected(self) -> None:
+        # Compression is in the supported-bits set but we deliberately
+        # don't ship a decompressor, so any reply that asserts the
+        # Compression bit must be rejected — even (especially!) when the
+        # Encryption bit is absent.
         word = 0x02 | (0x02 << 24)
-        n = parse_probe_reply(struct.pack(">I", word))
-        assert n.compression_enabled
-        assert not n.tls_required
+        with pytest.raises(ProbeError, match="Compression"):
+            parse_probe_reply(
+                struct.pack(">I", word),
+                offered_features=ConnectionFeature.Encryption | ConnectionFeature.Compression,
+            )
 
     def test_wrong_length_rejected(self) -> None:
         with pytest.raises(ProbeError, match="4 bytes"):
@@ -111,8 +117,35 @@ class TestParseProbeReply:
 
     def test_legacy_protocol_rejected(self) -> None:
         # We only speak DataStream; if a core picks Legacy that's a hard fail.
-        with pytest.raises(ProbeError, match="Legacy protocol"):
+        with pytest.raises(ProbeError, match="Legacy"):
             parse_probe_reply(struct.pack(">I", 0x00000001))
+
+    def test_internal_protocol_rejected(self) -> None:
+        # The Internal protocol is for in-process Quassel monolithic mode and
+        # is never something a real client should be presented with.
+        with pytest.raises(ProbeError, match="Internal"):
+            parse_probe_reply(struct.pack(">I", 0x00000000))
+
+    def test_unoffered_features_rejected(self) -> None:
+        # We offered NONE; the core asserts Encryption. A hostile peer doing
+        # this could try to push us into a confused TLS handshake.
+        word = 0x02 | (0x01 << 24)
+        with pytest.raises(ProbeError, match="did not offer"):
+            parse_probe_reply(
+                struct.pack(">I", word),
+                offered_features=ConnectionFeature.NONE,
+            )
+
+    def test_unknown_feature_bits_rejected(self) -> None:
+        # Bits 0x04 / 0x08 / ... in the conn-features byte are not defined
+        # by the Protocol::Feature enum at all. A buggy peer asserting them
+        # is a protocol error, not something we should silently mask.
+        word = 0x02 | (0x80 << 24)  # 0x80 is not Encryption or Compression
+        with pytest.raises(ProbeError, match="unknown connection feature"):
+            parse_probe_reply(
+                struct.pack(">I", word),
+                offered_features=ConnectionFeature.Encryption,
+            )
 
 
 class TestProbeAsync:

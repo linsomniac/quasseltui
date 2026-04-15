@@ -46,6 +46,23 @@ class BufferTree(Tree[BufferInfo | None]):
     def on_mount(self) -> None:
         self._populate()
 
+    def refresh_from_state(self) -> None:
+        """Clear the tree and rebuild it from the current state.
+
+        Called by `QuasselApp._on_buffer_list_updated` whenever the
+        bridge signals that the sidebar needs a redraw (network or
+        buffer added / removed / renamed). `Tree.clear()` replaces
+        the root node wholesale (preserving label, data, and
+        expanded flag) and `_populate()` then rebuilds the children
+        from scratch, so a stale hierarchy cannot survive the call.
+
+        Phase 8 will want to preserve the cursor position across
+        refreshes; that belongs in the phase-8 diff (interactive
+        buffer switching) and is deliberately left out here.
+        """
+        self.clear()
+        self._populate()
+
     def _populate(self) -> None:
         """Walk the client state once and build the tree.
 

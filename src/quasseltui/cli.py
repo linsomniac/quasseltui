@@ -1,6 +1,6 @@
 """Command-line entry point for quasseltui.
 
-Five subcommands at the moment:
+Six subcommands at the moment:
 
 - `probe-only` (phase 2) runs the probe handshake, optional TLS upgrade,
   `ClientInit` round-trip, and exits. Useful for sanity-checking that a
@@ -20,11 +20,15 @@ Five subcommands at the moment:
   when it's done. This validates the sync/dispatcher + state layers
   end-to-end against a real core.
 - `ui-demo` (phase 6) launches the Textual TUI against a hand-built
-  static `ClientState` — no network, no credentials. Phase 7 will add
-  a real `ui` command that runs the live client.
+  static `ClientState` — no network, no credentials. Useful for
+  eyeballing the layout without a core.
+- `ui` (phase 7) launches the Textual TUI against a live Quassel core.
+  This is the actual interactive client: it runs the full handshake,
+  streams events through `ClientBridge`, and paints the UI as state
+  updates. Requires the same credentials/TLS arguments as `dump-state`.
 
-The first four modes are headless and exit when done; `ui-demo` starts
-an interactive Textual app and exits on `Ctrl+Q`.
+The first four modes are headless and exit when done; `ui-demo` and
+`ui` start an interactive Textual app and exit on `Ctrl+Q`.
 """
 
 from __future__ import annotations
@@ -253,6 +257,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    ui = sub.add_parser(
+        "ui",
+        help=(
+            "Launch the Textual UI against a live Quassel core. Runs "
+            "the full handshake, streams events, and paints the UI as "
+            "the client state updates. Press Ctrl+Q to quit."
+        ),
+    )
+    _add_core_connect_args(
+        ui,
+        sends_credentials=True,
+        include_allow_plaintext=False,
+    )
+    _add_credential_args(ui)
+
     return parser
 
 
@@ -270,6 +289,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_dump_state(args))
     if args.mode == "ui-demo":
         return _ui_demo(args)
+    if args.mode == "ui":
+        return _ui(args)
 
     print(f"quasseltui {__version__} — under construction")
     return 0
@@ -280,13 +301,74 @@ def _ui_demo(_args: argparse.Namespace) -> int:
 
     Imported lazily so that running any of the diagnostic subcommands
     (or just `--version` / `--help`) does not pull Textual into the
-    process. Textual's import time is noticeable and the four
-    offline-diagnostic subcommands share a reason not to pay for it.
+    process. Textual's import time is noticeable and the diagnostic
+    subcommands share a reason not to pay for it.
     """
     from quasseltui.app.app import QuasselApp
     from quasseltui.app.demo_data import build_demo_state
 
     QuasselApp(build_demo_state()).run()
+    return 0
+
+
+def _ui(args: argparse.Namespace) -> int:
+    """Launch the Textual UI against a live Quassel core.
+
+    Unlike `ui-demo`, this command requires credentials and a reachable
+    core. It builds a `QuasselClient` and hands both the client and its
+    `ClientState` to `QuasselApp`; the app's `on_mount` hook then starts
+    the `ClientBridge` worker which drives the receive loop inside the
+    Textual event loop.
+
+    Exit codes: 0 when the user quits cleanly via Ctrl+Q; 1 for bad
+    arguments / missing credentials. This subcommand intentionally
+    does NOT fan out every protocol error to a unique exit code — the
+    user is interacting with the app, so protocol errors surface as
+    log warnings and the `SessionEnded` banner in the UI rather than
+    as process exit codes. For scripted exit-code semantics use
+    `dump-state` or `stream-only`.
+    """
+    user = args.user or os.environ.get("QUASSEL_USER")
+    if not user:
+        print("ui: --user or QUASSEL_USER is required", file=sys.stderr)
+        return 1
+    password = args.password or os.environ.get("QUASSEL_PASSWORD")
+    if password is None:
+        try:
+            password = getpass.getpass(f"Password for {user}@{args.host}: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nui: aborted at password prompt", file=sys.stderr)
+            return 1
+    if not password:
+        print("ui: empty password not allowed", file=sys.stderr)
+        return 1
+
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    # Lazy import for the same reason as `_ui_demo`: keep Textual out
+    # of the headless subcommands so `--version` / `--help` stay fast.
+    from quasseltui.app.app import QuasselApp
+
+    tls_options = TlsOptions(verify=not args.insecure, cafile=args.cafile)
+    client = QuasselClient(
+        host=args.host,
+        port=args.port,
+        user=user,
+        password=password,
+        tls=not args.no_tls,
+        tls_options=tls_options,
+        client_version=CLIENT_VERSION,
+        build_date=BUILD_DATE,
+        connect_timeout=args.connect_timeout,
+    )
+    # The app owns the client lifecycle from this point — its
+    # `on_unmount` closes the connection. We pass the client's own
+    # `state` so widgets render from the same store the dispatcher is
+    # writing to; a copy here would mean the UI silently lags behind.
+    QuasselApp(client.state, client=client).run()
     return 0
 
 

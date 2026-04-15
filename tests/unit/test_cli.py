@@ -599,7 +599,13 @@ def test_sanitize_terminal_escapes_control_chars() -> None:
     """Regression for codex review finding: untrusted IRC strings flowed
     straight into `print()` from `dump-state`, allowing a hostile peer
     to inject ANSI escape sequences and rewrite the operator's terminal.
-    The sanitizer must escape any C0/C1 control char."""
+    The sanitizer must escape any C0/C1 control char.
+
+    The implementation lives in `quasseltui.util.text` now (phase 6's
+    second codex review pulled it out of `cli.py`); we re-import through
+    `cli._sanitize_terminal` here to verify the cli module still re-
+    exposes the same function object.
+    """
     # Plain text and unicode pass through unchanged.
     assert cli._sanitize_terminal("hello world") == "hello world"
     assert cli._sanitize_terminal("résumé") == "résumé"

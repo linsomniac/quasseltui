@@ -19,6 +19,7 @@ from quasseltui.client.state import ClientState
 from quasseltui.protocol.enums import MessageType
 from quasseltui.protocol.usertypes import BufferId
 from quasseltui.sync.events import IrcMessage
+from quasseltui.util.text import sanitize_terminal
 
 _TYPE_PREFIX: dict[MessageType, str] = {
     MessageType.Plain: "",
@@ -86,13 +87,23 @@ def format_message(msg: IrcMessage) -> Text:
     type-specific prefix for the non-chat event types. The output is a
     `Text` (not a raw str) so phase 11 can colour senders via
     `Text.stylize` without rewriting the formatter.
+
+    Every user- or core-provided string (sender, sender_prefixes,
+    contents) is passed through `sanitize_terminal` first. A
+    `rich.text.Text` built from a plain string does NOT strip embedded
+    ANSI/C0/C1 bytes at render time — the bytes pass straight through
+    to the terminal driver — so the onus is on us to remove them here.
+    The type prefix and timestamp are compile-time ASCII and do not
+    need sanitizing.
     """
     ts = msg.timestamp.astimezone().strftime("%H:%M:%S")
     prefix = _TYPE_PREFIX.get(msg.type, "")
-    sender = _short_sender(msg.sender)
+    sender = sanitize_terminal(_short_sender(msg.sender))
+    contents = sanitize_terminal(msg.contents)
     if msg.type == MessageType.Action:
-        return Text(f"{ts} {prefix}{sender} {msg.contents}")
-    return Text(f"{ts} {prefix}{msg.sender_prefixes}{sender}: {msg.contents}")
+        return Text(f"{ts} {prefix}{sender} {contents}")
+    sender_prefixes = sanitize_terminal(msg.sender_prefixes)
+    return Text(f"{ts} {prefix}{sender_prefixes}{sender}: {contents}")
 
 
 def _short_sender(sender: str) -> str:

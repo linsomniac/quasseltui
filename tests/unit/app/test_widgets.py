@@ -1,17 +1,19 @@
 """Pure-Python unit tests for the phase 6 widget helpers.
 
 We keep these deliberately Textual-free: every assertion exercises a
-pure function (`format_message`, `_buffer_label`, `_short_sender`) that
-has no `on_mount` dependency on a running app. The "does it compose
-inside a real App" smoke test lives in `test_chat_screen.py` and uses
-`App.run_test()`.
+pure function (`format_message`, `_buffer_label`, `_short_sender`,
+`_safe_label`) that has no `on_mount` dependency on a running app. The
+"does it compose inside a real App" smoke test lives in
+`test_chat_screen.py` and uses `App.run_test()`.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 
-from quasseltui.app.widgets.buffer_tree import _buffer_label, _buffer_sort_key
+from rich.text import Text
+
+from quasseltui.app.widgets.buffer_tree import _buffer_label, _buffer_sort_key, _safe_label
 from quasseltui.app.widgets.message_log import _short_sender, format_message
 from quasseltui.protocol.enums import MessageFlag, MessageType
 from quasseltui.protocol.usertypes import (
@@ -111,3 +113,73 @@ class TestFormatMessage:
         plain = format_message(msg).plain
         assert "NOTICE" in plain
         assert "server.example.com: MOTD" in plain
+
+    def test_ansi_escape_in_contents_is_escaped(self) -> None:
+        """Regression for codex review finding: `rich.text.Text` does NOT
+        strip raw ESC bytes at render time, so any sanitization has to
+        happen in `format_message` before we build the Text. A hostile
+        message body like `\\x1b[31mREDRUM` must land in the output as a
+        `\\x1b` literal, never as a raw escape."""
+        msg = _message(sender="bad", contents="\x1b[31mREDRUM")
+        plain = format_message(msg).plain
+        assert "\x1b" not in plain
+        assert "\\x1b" in plain
+        assert "REDRUM" in plain
+
+    def test_bel_and_backspace_in_sender_are_escaped(self) -> None:
+        msg = _message(sender="spoof\x07\x08er", contents="hi")
+        plain = format_message(msg).plain
+        assert "\x07" not in plain
+        assert "\x08" not in plain
+        # The escaped form should still show the nick body for debugging.
+        assert "spoof" in plain and "er" in plain
+
+    def test_sender_prefixes_are_escaped(self) -> None:
+        msg = _message(sender="nick", contents="hi", sender_prefixes="@\x1b")
+        plain = format_message(msg).plain
+        assert "\x1b" not in plain
+
+    def test_newlines_in_contents_are_escaped(self) -> None:
+        # A multi-line contents value would let an attacker forge a line
+        # that looks like a fresh message from another sender. Dropping
+        # LF/CR to their escape form keeps the line boundary we own.
+        msg = _message(sender="eve", contents="line1\nnick!eve@evil: line2")
+        plain = format_message(msg).plain
+        assert "\n" not in plain
+        assert "\\x0a" in plain
+
+
+class TestSafeLabel:
+    def test_plain_label_passes_through(self) -> None:
+        # The input string must become the literal plain text of the
+        # returned Text — no styling, no markup interpretation.
+        label = _safe_label("#python")
+        assert isinstance(label, Text)
+        assert label.plain == "#python"
+
+    def test_rich_markup_is_not_interpreted(self) -> None:
+        """Regression for codex review finding: Textual's `Tree` runs
+        `Text.from_markup(...)` over raw `str` labels, so a channel name
+        like `"[bold red]spoof[/]"` would get parsed as markup and
+        re-styled. Wrapping the string in a `Text(...)` up front
+        bypasses that path — the markup becomes the visible text."""
+        label = _safe_label("[bold red]spoof[/]")
+        assert isinstance(label, Text)
+        # The brackets are preserved verbatim in `.plain`.
+        assert label.plain == "[bold red]spoof[/]"
+        # And no styling was applied to the returned Text.
+        assert not label._spans  # type: ignore[attr-defined]
+
+    def test_control_chars_in_label_are_escaped(self) -> None:
+        label = _safe_label("evil\x1b[31m")
+        assert "\x1b" not in label.plain
+        assert "\\x1b" in label.plain
+
+    def test_newline_in_label_is_escaped(self) -> None:
+        # Textual's `Tree.process_label` splits on newlines and keeps
+        # only the first line — meaning a label with `\n` would silently
+        # lose data. Escaping newlines here preserves the whole name.
+        label = _safe_label("line1\nline2")
+        assert "\n" not in label.plain
+        assert "line1" in label.plain
+        assert "line2" in label.plain

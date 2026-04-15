@@ -34,7 +34,6 @@ import asyncio
 import getpass
 import logging
 import os
-import re
 import sys
 from collections import defaultdict
 from collections.abc import Sequence
@@ -79,6 +78,7 @@ from quasseltui.protocol.transport import (
     start_tls_on_writer,
 )
 from quasseltui.protocol.usertypes import BufferInfo, BufferType
+from quasseltui.util.text import sanitize_terminal as _sanitize_terminal
 
 CLIENT_VERSION = f"quasseltui v{__version__}"
 BUILD_DATE = "2026-04-14"
@@ -772,31 +772,6 @@ def _dump_state_exit_code(event: ClientDisconnected) -> int:
     if "rejected clientinit" in reason:
         return 3
     return 4
-
-
-# C0 control characters (0x00-0x1f), DEL (0x7f), and C1 controls (0x80-0x9f).
-# These are what a malicious IRC peer can use to smuggle terminal escape
-# sequences through printable fields: ESC (0x1b) starts ANSI CSI/OSC,
-# 0x80-0x9f are C1 CSI equivalents on some terminals, and LF/CR/BEL/BS
-# can rewrite or spoof preceding output. We keep ONLY printable/UTF-8
-# content in `dump-state` output because a real IRC buffer (`#python`,
-# `hello world`, even `résumé`) never legitimately contains a control
-# byte. The replacement `\\xNN` preserves the original value for debugging
-# without letting the terminal interpret it.
-_TERMINAL_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-
-
-def _sanitize_terminal(text: str) -> str:
-    """Escape C0/C1 control characters before printing to a terminal.
-
-    Untrusted IRC payloads reach `dump-state` straight from the core, and
-    a malicious nick / topic / message body can otherwise inject ANSI
-    escapes, overwrite previous output, or trigger terminal-specific
-    OSC hyperlink / bell / title-bar behavior. Called on every user- or
-    core-provided string before it goes to `print()`; numeric IDs and
-    enum names are safe and don't need wrapping.
-    """
-    return _TERMINAL_UNSAFE_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
 
 
 def _print_state_snapshot(

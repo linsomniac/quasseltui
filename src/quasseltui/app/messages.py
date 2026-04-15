@@ -24,18 +24,6 @@ from textual.message import Message
 from quasseltui.protocol.usertypes import BufferId
 
 
-class SessionStarted(Message):
-    """Fired once, when the bridge sees its first `SessionOpened`.
-
-    Lets the app distinguish an early fatal disconnect (no
-    `SessionStarted` before `SessionEnded`) from a mid-session drop
-    (one was seen first). Without this signal, a failed handshake or
-    auth rejection would leave the user staring at an empty Textual
-    screen with no in-app explanation and the process still exiting
-    cleanly on Ctrl+Q.
-    """
-
-
 class BufferListUpdated(Message):
     """The sidebar needs to re-read networks/buffers from state.
 
@@ -66,22 +54,29 @@ class ActiveBufferUpdated(Message):
 
 
 class SessionEnded(Message):
-    """The live client disconnected — terminal for the session.
+    """The live client disconnected.
 
-    Phase 7 just logs this and leaves the last-known state on screen so
-    the user can still scroll the history they saw. Phase 11 will
-    surface it via a status bar notification and (optionally) feed a
-    reconnect supervisor.
+    `fatal` is `True` when the disconnect happened before the bridge
+    ever saw a `SessionOpened` — i.e. a failed handshake, auth reject,
+    TLS error, or any other pre-session failure that the user would
+    otherwise stare at a blank app over. `False` for a mid-session
+    drop, which the UI leaves on screen (the user can still scroll
+    history and quit via Ctrl+Q).
+
+    The flag is computed by the bridge, not inferred from message
+    ordering at the app layer, so the "fatal vs. drop" policy isn't
+    timing-coupled and is straightforward to extend in later phases
+    (reconnect supervisor, status bar, etc.).
     """
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, fatal: bool) -> None:
         super().__init__()
         self.reason = reason
+        self.fatal = fatal
 
 
 __all__ = [
     "ActiveBufferUpdated",
     "BufferListUpdated",
     "SessionEnded",
-    "SessionStarted",
 ]

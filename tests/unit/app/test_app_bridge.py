@@ -235,8 +235,9 @@ async def test_early_disconnect_before_session_opened_exits_fatally() -> None:
     which Textual's alternate-screen mode hides. A failed handshake
     would leave the user staring at a blank chat screen with no
     explanation and the process still exiting cleanly on Ctrl+Q.
-    The fix is to track whether `SessionStarted` has fired and exit
-    fatally on any `SessionEnded` that arrives first.
+    The fix has the bridge stamp `SessionEnded.fatal=True` on any
+    disconnect that arrives before a successful `SessionOpened`, and
+    the app exits with return code 1 when it sees that flag.
     """
     state = _empty_state_with_one_network()
     client = _StubClient(state)
@@ -244,7 +245,7 @@ async def test_early_disconnect_before_session_opened_exits_fatally() -> None:
 
     async with app.run_test() as pilot:
         await pilot.pause()
-        # Push a disconnect before any SessionStarted — the handshake
+        # Push a disconnect before any SessionOpened — the handshake
         # effectively failed (e.g., auth rejected, TLS handshake
         # error, core sent ClientInitReject).
         client.push_event(ClientDisconnected(reason="auth rejected", error=None))
@@ -262,9 +263,10 @@ async def test_disconnect_after_session_opened_does_not_exit_fatally() -> None:
     """Mid-session drops are non-fatal — the user keeps the last state.
 
     Complements `test_early_disconnect_before_session_opened_exits_fatally`
-    by pinning the other branch: once a `SessionStarted` has fired,
-    a later `SessionEnded` must NOT auto-exit the app. Phase 11 will
-    surface it in a status bar with an optional reconnect supervisor.
+    by pinning the other branch: once `SessionOpened` has fired, the
+    bridge stamps `SessionEnded.fatal=False` on any subsequent
+    disconnect, and the app does NOT auto-exit. Phase 11 will surface
+    it in a status bar with an optional reconnect supervisor.
     """
     state = _empty_state_with_one_network()
     buf = _buffer(11)
@@ -289,6 +291,42 @@ async def test_disconnect_after_session_opened_does_not_exit_fatally() -> None:
         await pilot.pause()
 
     assert app.return_code in (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_fatal_exit_reason_is_truncated_if_long(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression for codex review finding: a hostile / badly-behaving
+    core can return an arbitrarily long disconnect reason. Without a
+    cap, that would dump into stderr and the Textual exit banner.
+    After `_sanitize_and_truncate_reason` we cap at 400 characters
+    with an explicit `...[truncated]` marker.
+    """
+    import logging
+
+    state = _empty_state_with_one_network()
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    long_reason = "A" * 5000
+    with caplog.at_level(logging.WARNING, logger="quasseltui.app.app"):
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            client.push_event(ClientDisconnected(reason=long_reason, error=None))
+            await pilot.pause()
+            await pilot.pause()
+
+    logged = [r.getMessage() for r in caplog.records if "session ended" in r.getMessage()]
+    assert logged, "handler did not log the disconnect"
+    for msg in logged:
+        # The logged line is `session ended: <reason>`. The reason
+        # portion must be shorter than the original 5000 and end
+        # with the truncation marker.
+        reason_part = msg.split("session ended: ", 1)[1]
+        assert len(reason_part) < len(long_reason)
+        assert reason_part.endswith("...[truncated]")
+    assert app.return_code == 1
 
 
 @pytest.mark.asyncio

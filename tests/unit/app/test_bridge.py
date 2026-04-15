@@ -132,15 +132,12 @@ def _types_of(messages: list[Message]) -> list[str]:
 
 
 class TestBridgeTranslation:
-    async def test_session_opened_posts_session_started_first(self) -> None:
-        """Order matters: `SessionStarted` must precede `BufferListUpdated`.
+    async def test_session_opened_posts_buffer_list_and_picks_active(self) -> None:
+        """Order matters: `BufferListUpdated` precedes `ActiveBufferUpdated`.
 
-        The app uses `SessionStarted` to latch its "has a live
-        session" flag; if a later `SessionEnded` arrives *before*
-        that flag is set, the app treats it as a fatal startup
-        failure. Posting `BufferListUpdated` first would give the
-        app a confusing "tree refresh with no session yet" signal
-        and would not change the fatal-vs-drop decision anyway.
+        The sidebar update must land before the active-buffer update
+        so a handler that redraws the tree and then the log sees the
+        new buffer list before it tries to read the active pointer.
         """
         buf = _buffer_info(1)
         state = _state_with_buffers(buf)
@@ -152,13 +149,7 @@ class TestBridgeTranslation:
             state=state,
         )
         await bridge.run()
-        # Expected order: the session-handshake banner, then the
-        # sidebar refresh, then the default-pick active-buffer update.
-        assert _types_of(sink.posted) == [
-            "SessionStarted",
-            "BufferListUpdated",
-            "ActiveBufferUpdated",
-        ]
+        assert _types_of(sink.posted) == ["BufferListUpdated", "ActiveBufferUpdated"]
 
     async def test_buffer_added_posts_buffer_list_updated(self) -> None:
         buf = _buffer_info(1)
@@ -222,17 +213,45 @@ class TestBridgeTranslation:
         updates = [m for m in sink.posted if isinstance(m, BufferListUpdated)]
         assert len(updates) == 3
 
-    async def test_client_disconnected_posts_session_ended_with_reason(self) -> None:
+    async def test_client_disconnected_before_session_opened_is_fatal(self) -> None:
+        """Pre-session disconnects must stamp `SessionEnded.fatal=True`.
+
+        The bridge tracks whether it has seen `SessionOpened` and
+        computes the flag once per disconnect. That decouples the
+        app's fatal-vs-drop policy from the message arrival order,
+        which is what the codex review of the previous commit
+        called out as a correctness hazard.
+        """
         sink = _StubSink()
         bridge = ClientBridge(
-            events=_iter(ClientDisconnected(reason="core shut down", error=None)),
+            events=_iter(ClientDisconnected(reason="auth rejected", error=None)),
             sink=sink,
             state=ClientState(),
         )
         await bridge.run()
         ended = [m for m in sink.posted if isinstance(m, SessionEnded)]
         assert len(ended) == 1
-        assert ended[0].reason == "core shut down"
+        assert ended[0].reason == "auth rejected"
+        assert ended[0].fatal is True
+
+    async def test_client_disconnected_after_session_opened_is_not_fatal(self) -> None:
+        """Mid-session drops have `fatal=False` — the UI stays on screen."""
+        sink = _StubSink()
+        state = _state_with_buffers(_buffer_info(1))
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        bridge = ClientBridge(
+            events=_iter(
+                SessionOpened(session=session, peer_features=frozenset()),
+                ClientDisconnected(reason="core went away", error=None),
+            ),
+            sink=sink,
+            state=state,
+        )
+        await bridge.run()
+        ended = [m for m in sink.posted if isinstance(m, SessionEnded)]
+        assert len(ended) == 1
+        assert ended[0].reason == "core went away"
+        assert ended[0].fatal is False
 
     async def test_identity_added_is_silently_ignored(self) -> None:
         """Phase 7 doesn't surface identities in any widget.

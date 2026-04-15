@@ -320,13 +320,23 @@ def _ui(args: argparse.Namespace) -> int:
     the `ClientBridge` worker which drives the receive loop inside the
     Textual event loop.
 
-    Exit codes: 0 when the user quits cleanly via Ctrl+Q; 1 for bad
-    arguments / missing credentials. This subcommand intentionally
-    does NOT fan out every protocol error to a unique exit code — the
-    user is interacting with the app, so protocol errors surface as
-    log warnings and the `SessionEnded` banner in the UI rather than
-    as process exit codes. For scripted exit-code semantics use
-    `dump-state` or `stream-only`.
+    Exit codes:
+        0 — clean quit via Ctrl+Q (including after a mid-session
+            drop — the UI leaves the last state on screen so the
+            user can still scroll history before quitting).
+        1 — bad arguments / missing credentials, OR a pre-session
+            fatal failure (handshake rejected, auth rejected, TLS
+            handshake error, or any disconnect before the core
+            sent `SessionInit`). In the fatal-failure case the
+            sanitized reason is printed to the restored terminal
+            as an exit banner so the user sees *why*.
+
+    Mid-session drops and other runtime errors are NOT fanned out
+    into distinct exit codes — the user is interacting with the
+    app, so those surface as warning log lines and (phase 11 will
+    add) a status-bar notice. For scripted exit-code semantics
+    across every protocol-layer failure mode use `dump-state` or
+    `stream-only`.
     """
     user = args.user or os.environ.get("QUASSEL_USER")
     if not user:

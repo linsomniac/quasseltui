@@ -62,7 +62,6 @@ from quasseltui.app.messages import (
     ActiveBufferUpdated,
     BufferListUpdated,
     SessionEnded,
-    SessionStarted,
 )
 from quasseltui.client.state import ClientState
 from quasseltui.protocol.usertypes import BufferId
@@ -129,6 +128,12 @@ class ClientBridge:
             debounce_seconds if debounce_seconds is not None else self.DEBOUNCE_SECONDS
         )
         self._debounce_task: asyncio.Task[None] | None = None
+        # Tracks whether we've seen a `SessionOpened` yet. Used to
+        # stamp a `fatal` flag on `SessionEnded` so the app doesn't
+        # have to infer fatal-vs-mid-session-drop from message
+        # ordering. Set once, never reset — a mid-session drop that
+        # reconnects (phase 11) will create a new bridge instance.
+        self._session_opened: bool = False
 
     async def run(self) -> None:
         """Iterate client events and dispatch them to the sink.
@@ -160,15 +165,19 @@ class ClientBridge:
         Order matters inside this method: we always post the
         list-level update (`BufferListUpdated`) *before* any active-
         buffer update, so a handler that redraws the sidebar and then
-        the message log sees the new sidebar first. `SessionStarted`
-        comes even earlier — it's the "handshake succeeded" signal
-        the app uses to distinguish an early fatal failure from a
-        mid-session drop, so it must precede everything else the
-        session produces. Unknown event types (e.g. `IdentityAdded`
-        in phase 7) are silently dropped.
+        the message log sees the new sidebar first. Unknown event
+        types (e.g. `IdentityAdded` in phase 7) are silently dropped.
+
+        `ClientDisconnected` is special-cased to compute the `fatal`
+        flag on `SessionEnded` from `self._session_opened` rather
+        than leaving that inference to the app. That keeps the app
+        stateless on the session-lifetime dimension and makes the
+        "pre-session failure vs. mid-session drop" policy a single
+        line of logic here instead of timing-coupled message
+        observation at the handler level.
         """
         if isinstance(event, SessionOpened):
-            self._sink.post_message(SessionStarted())
+            self._session_opened = True
             self._sink.post_message(BufferListUpdated())
             self._maybe_pick_default_active_buffer()
             return
@@ -187,7 +196,9 @@ class ClientBridge:
             self._handle_message(event)
             return
         if isinstance(event, ClientDisconnected):
-            self._sink.post_message(SessionEnded(reason=event.reason))
+            self._sink.post_message(
+                SessionEnded(reason=event.reason, fatal=not self._session_opened)
+            )
             return
         # IdentityAdded and anything else — no UI effect in phase 7.
 

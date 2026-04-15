@@ -6,10 +6,11 @@ it, expose `Ctrl+Q` as the quit binding.
 Phase 7 adds the live-client wiring. When constructed with a
 `QuasselClient`, `on_mount` launches the client's receive loop as a
 Textual worker via `ClientBridge`. The bridge translates every
-`ClientEvent` into a narrow Textual `Message` (`BufferListUpdated` /
-`ActiveBufferUpdated` / `SessionEnded`) that this app handles by
-querying the current screen and calling a widget method — widgets stay
-dumb and expose a `refresh_from_state` / `set_active_buffer` surface.
+`ClientEvent` into a narrow Textual `Message` (`SessionStarted` /
+`BufferListUpdated` / `ActiveBufferUpdated` / `SessionEnded`) that
+this app handles by querying the current screen and calling a widget
+method — widgets stay dumb and expose a `refresh_from_state` /
+`set_active_buffer` surface.
 
 `ClientState` is still accepted as a constructor argument (rather than
 built here) so `ui-demo` can hand in a static state without a client.
@@ -24,6 +25,15 @@ app would need the message to be routed to it explicitly. Handling
 the messages at the app level and then calling widget methods via
 `query_one` keeps the flow one-directional (app → widget) and avoids
 the fragility of depending on Textual's bubbling order.
+
+Startup-failure handling: the app tracks whether it has seen a
+`SessionStarted` message. A `SessionEnded` that arrives *before*
+`SessionStarted` is treated as a fatal handshake/auth failure — the
+app exits with return code 1 and a sanitized error message, so the
+user sees an explanation after the terminal is restored instead of a
+blank screen. A `SessionEnded` after `SessionStarted` is a mid-
+session drop and is logged but does not auto-quit (phase 11 will
+surface it in a status bar and optionally reconnect).
 """
 
 from __future__ import annotations
@@ -42,12 +52,14 @@ from quasseltui.app.messages import (
     ActiveBufferUpdated,
     BufferListUpdated,
     SessionEnded,
+    SessionStarted,
 )
 from quasseltui.app.screens.chat import ChatScreen
 from quasseltui.app.widgets.buffer_tree import BufferTree
 from quasseltui.app.widgets.message_log import MessageLog
 from quasseltui.client.state import ClientState
 from quasseltui.protocol.usertypes import BufferId
+from quasseltui.util.text import sanitize_terminal
 
 if TYPE_CHECKING:
     from quasseltui.client.client import QuasselClient
@@ -90,6 +102,11 @@ class QuasselApp(App[None]):
         # driven explicitly by the bridge and read by the message
         # handlers below.
         self.active_buffer_id: BufferId | None = None
+        # Set from the `SessionStarted` handler. Read from
+        # `_on_session_ended` to decide whether a disconnect is a
+        # fatal startup failure (auth/TLS/handshake) or a mid-session
+        # drop. See the module docstring for the policy.
+        self._session_opened: bool = False
 
     def on_mount(self) -> None:
         self.push_screen(ChatScreen(self._state))
@@ -160,15 +177,40 @@ class QuasselApp(App[None]):
         except NoMatches:
             return None
 
+    @on(SessionStarted)
+    def _on_session_started(self, _event: SessionStarted) -> None:
+        """Latch the "session succeeded at least once" flag.
+
+        The flag is load-bearing for `_on_session_ended`: without it,
+        a pre-session fatal disconnect is indistinguishable from a
+        mid-session drop and the user gets no explanation.
+        """
+        self._session_opened = True
+
     @on(SessionEnded)
     def _on_session_ended(self, event: SessionEnded) -> None:
-        """Log the disconnect — phase 11 will surface it in a status bar.
+        """Handle a live client disconnect.
 
-        We deliberately do NOT auto-quit the app: leaving the last
-        state on screen lets the user scroll the history they were
-        reading before the core went away. Ctrl+Q is still the exit.
+        The `reason` string is sanitized before any terminal-bound
+        sink touches it — `SessionEnded` is carrier for core-supplied
+        handshake text (e.g. `ClientLoginReject.error_string`), and
+        an attacker-controlled reason could contain ANSI CSI / BEL /
+        other control bytes that would otherwise rewrite preceding
+        terminal output. The sanitized form is also what goes into
+        the exit banner on fatal failures.
+
+        Pre-session disconnects (no `SessionStarted` seen yet) are
+        treated as fatal: the app exits with return code 1 and the
+        sanitized reason as the exit banner, so the user sees an
+        explanation after Textual restores the real terminal. Mid-
+        session drops (after `SessionStarted`) are non-fatal — we
+        log the reason and leave the last state on screen so the
+        user can still scroll history; Ctrl+Q is still the exit.
         """
-        _log.warning("session ended: %s", event.reason)
+        safe_reason = sanitize_terminal(event.reason)
+        _log.warning("session ended: %s", safe_reason)
+        if self._client is not None and not self._session_opened:
+            self.exit(return_code=1, message=f"quasseltui: {safe_reason}")
 
 
 __all__ = [

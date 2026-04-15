@@ -62,6 +62,7 @@ from quasseltui.app.messages import (
     ActiveBufferUpdated,
     BufferListUpdated,
     SessionEnded,
+    SessionStarted,
 )
 from quasseltui.client.state import ClientState
 from quasseltui.protocol.usertypes import BufferId
@@ -159,16 +160,25 @@ class ClientBridge:
         Order matters inside this method: we always post the
         list-level update (`BufferListUpdated`) *before* any active-
         buffer update, so a handler that redraws the sidebar and then
-        the message log sees the new sidebar first. Unknown event
-        types (e.g. `IdentityAdded` in phase 7) are silently dropped.
+        the message log sees the new sidebar first. `SessionStarted`
+        comes even earlier — it's the "handshake succeeded" signal
+        the app uses to distinguish an early fatal failure from a
+        mid-session drop, so it must precede everything else the
+        session produces. Unknown event types (e.g. `IdentityAdded`
+        in phase 7) are silently dropped.
         """
         if isinstance(event, SessionOpened):
+            self._sink.post_message(SessionStarted())
             self._sink.post_message(BufferListUpdated())
             self._maybe_pick_default_active_buffer()
             return
-        if isinstance(event, BufferAdded | BufferRemoved | BufferRenamed):
+        if isinstance(event, BufferAdded | BufferRenamed):
             self._sink.post_message(BufferListUpdated())
             self._maybe_pick_default_active_buffer()
+            return
+        if isinstance(event, BufferRemoved):
+            self._sink.post_message(BufferListUpdated())
+            self._handle_buffer_removed(event)
             return
         if isinstance(event, NetworkAdded | NetworkRemoved | NetworkUpdated):
             self._sink.post_message(BufferListUpdated())
@@ -180,6 +190,33 @@ class ClientBridge:
             self._sink.post_message(SessionEnded(reason=event.reason))
             return
         # IdentityAdded and anything else — no UI effect in phase 7.
+
+    def _handle_buffer_removed(self, event: BufferRemoved) -> None:
+        """Repair `active_buffer_id` when the active buffer is removed.
+
+        The dispatcher deletes buffers from `ClientState` *before*
+        emitting the event, so by the time we get here
+        `state.buffers` no longer contains the removed id. If that
+        was the active buffer, `_maybe_pick_default_active_buffer`
+        will short-circuit (its early-return check is "already has
+        an active buffer") and leave the UI pointing at a dead id
+        with stale scrollback and no recovery path in phase 7
+        because there is no user-driven selection yet. Force a
+        re-pick from scratch here: clear the pointer, pick a fresh
+        default (or `None` if nothing remains), and emit
+        `ActiveBufferUpdated` so the message log clears its view.
+        """
+        if self._sink.active_buffer_id == event.buffer_id:
+            self._sink.active_buffer_id = None
+            new_id = _pick_default_buffer(self._state)
+            self._sink.active_buffer_id = new_id
+            self._sink.post_message(ActiveBufferUpdated(buffer_id=new_id))
+            return
+        # Inactive buffer removed — still try to pick a default in
+        # case `active_buffer_id` was never set (e.g. every buffer
+        # had been removed earlier and this removal left one
+        # behind that's now worth landing on).
+        self._maybe_pick_default_active_buffer()
 
     def _handle_message(self, event: MessageReceived) -> None:
         """Apply a `MessageReceived` — coalesce if active, ignore if not.

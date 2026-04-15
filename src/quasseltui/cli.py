@@ -368,8 +368,14 @@ def _ui(args: argparse.Namespace) -> int:
     # `on_unmount` closes the connection. We pass the client's own
     # `state` so widgets render from the same store the dispatcher is
     # writing to; a copy here would mean the UI silently lags behind.
-    QuasselApp(client.state, client=client).run()
-    return 0
+    app = QuasselApp(client.state, client=client)
+    app.run()
+    # Surface fatal exits (pre-session handshake failures) to the
+    # shell. Clean quits via Ctrl+Q have return_code=0 or None; early
+    # auth/TLS/handshake failures have return_code=1 via the app's
+    # `_on_session_ended` fatal branch. `App.exit(message=...)` has
+    # already printed the sanitized reason after teardown.
+    return app.return_code or 0
 
 
 async def _probe_only(args: argparse.Namespace) -> int:

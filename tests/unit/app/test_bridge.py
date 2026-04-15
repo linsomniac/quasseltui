@@ -132,7 +132,16 @@ def _types_of(messages: list[Message]) -> list[str]:
 
 
 class TestBridgeTranslation:
-    async def test_session_opened_posts_buffer_list_updated(self) -> None:
+    async def test_session_opened_posts_session_started_first(self) -> None:
+        """Order matters: `SessionStarted` must precede `BufferListUpdated`.
+
+        The app uses `SessionStarted` to latch its "has a live
+        session" flag; if a later `SessionEnded` arrives *before*
+        that flag is set, the app treats it as a fatal startup
+        failure. Posting `BufferListUpdated` first would give the
+        app a confusing "tree refresh with no session yet" signal
+        and would not change the fatal-vs-drop decision anyway.
+        """
         buf = _buffer_info(1)
         state = _state_with_buffers(buf)
         sink = _StubSink()
@@ -143,11 +152,13 @@ class TestBridgeTranslation:
             state=state,
         )
         await bridge.run()
-        # SessionOpened → BufferListUpdated and then a default-pick
-        # ActiveBufferUpdated. The sidebar update must come first so a
-        # handler that redraws the tree then the log sees the new
-        # buffer list before it reads the active pointer.
-        assert _types_of(sink.posted) == ["BufferListUpdated", "ActiveBufferUpdated"]
+        # Expected order: the session-handshake banner, then the
+        # sidebar refresh, then the default-pick active-buffer update.
+        assert _types_of(sink.posted) == [
+            "SessionStarted",
+            "BufferListUpdated",
+            "ActiveBufferUpdated",
+        ]
 
     async def test_buffer_added_posts_buffer_list_updated(self) -> None:
         buf = _buffer_info(1)
@@ -163,7 +174,14 @@ class TestBridgeTranslation:
         assert sink.active_buffer_id == BufferId(1)
 
     async def test_buffer_removed_posts_buffer_list_updated(self) -> None:
+        # Simulate the dispatcher's "delete from state before emitting"
+        # order: by the time the bridge sees the event, the buffer is
+        # already gone from `state.buffers`. Without this mirror, the
+        # default-pick code would still find the removed id and leave
+        # the active pointer dangling on stale scrollback.
         state = _state_with_buffers(_buffer_info(1))
+        del state.buffers[BufferId(1)]
+        state.messages.pop(BufferId(1), None)
         sink = _StubSink(active_buffer_id=BufferId(1))
         bridge = ClientBridge(
             events=_iter(BufferRemoved(buffer_id=BufferId(1))),
@@ -366,6 +384,68 @@ class TestDefaultActivePick:
         active_updates = [m for m in sink.posted if isinstance(m, ActiveBufferUpdated)]
         assert active_updates == []
         assert sink.active_buffer_id is None
+
+
+class TestBufferRemovedRepicksActive:
+    """Regression for codex review finding: a removed active buffer must
+    not leave `active_buffer_id` pointing at a dead id. Without the
+    special-case in `ClientBridge._handle_buffer_removed`, the
+    `_maybe_pick_default_active_buffer` short-circuit ("already has an
+    active buffer") preserves the stale pointer forever and the UI is
+    stuck on scrollback for a buffer the core has already deleted."""
+
+    async def test_active_buffer_removed_switches_to_remaining_buffer(self) -> None:
+        state = _state_with_buffers(_buffer_info(1), _buffer_info(2))
+        # Dispatcher deletes before emitting — mirror that.
+        del state.buffers[BufferId(1)]
+        state.messages.pop(BufferId(1), None)
+        sink = _StubSink(active_buffer_id=BufferId(1))
+        bridge = ClientBridge(
+            events=_iter(BufferRemoved(buffer_id=BufferId(1))),
+            sink=sink,
+            state=state,
+        )
+        await bridge.run()
+        assert sink.active_buffer_id == BufferId(2)
+        active_updates = [m for m in sink.posted if isinstance(m, ActiveBufferUpdated)]
+        assert len(active_updates) == 1
+        assert active_updates[0].buffer_id == BufferId(2)
+
+    async def test_active_buffer_removed_and_none_remain_clears_pointer(self) -> None:
+        state = _state_with_buffers(_buffer_info(1))
+        del state.buffers[BufferId(1)]
+        state.messages.pop(BufferId(1), None)
+        sink = _StubSink(active_buffer_id=BufferId(1))
+        bridge = ClientBridge(
+            events=_iter(BufferRemoved(buffer_id=BufferId(1))),
+            sink=sink,
+            state=state,
+        )
+        await bridge.run()
+        assert sink.active_buffer_id is None
+        # The explicit `None` update lets the app's handler call
+        # `log.clear()` — without it, the message log would keep
+        # rendering the removed buffer's scrollback.
+        active_updates = [m for m in sink.posted if isinstance(m, ActiveBufferUpdated)]
+        assert len(active_updates) == 1
+        assert active_updates[0].buffer_id is None
+
+    async def test_inactive_buffer_removed_does_not_affect_active(self) -> None:
+        state = _state_with_buffers(_buffer_info(1), _buffer_info(2))
+        del state.buffers[BufferId(2)]
+        state.messages.pop(BufferId(2), None)
+        sink = _StubSink(active_buffer_id=BufferId(1))
+        bridge = ClientBridge(
+            events=_iter(BufferRemoved(buffer_id=BufferId(2))),
+            sink=sink,
+            state=state,
+        )
+        await bridge.run()
+        # Unchanged — removing an inactive buffer must not retarget
+        # the selection or post a spurious ActiveBufferUpdated.
+        assert sink.active_buffer_id == BufferId(1)
+        active_updates = [m for m in sink.posted if isinstance(m, ActiveBufferUpdated)]
+        assert active_updates == []
 
 
 class TestPickDefaultBufferFreeFunction:

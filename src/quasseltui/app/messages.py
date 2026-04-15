@@ -24,6 +24,18 @@ from textual.message import Message
 from quasseltui.protocol.usertypes import BufferId
 
 
+class SessionStarted(Message):
+    """Fired once, when the bridge sees its first `SessionOpened`.
+
+    Lets the app distinguish an early fatal disconnect (no
+    `SessionStarted` before `SessionEnded`) from a mid-session drop
+    (one was seen first). Without this signal, a failed handshake or
+    auth rejection would leave the user staring at an empty Textual
+    screen with no in-app explanation and the process still exiting
+    cleanly on Ctrl+Q.
+    """
+
+
 class BufferListUpdated(Message):
     """The sidebar needs to re-read networks/buffers from state.
 
@@ -71,4 +83,5 @@ __all__ = [
     "ActiveBufferUpdated",
     "BufferListUpdated",
     "SessionEnded",
+    "SessionStarted",
 ]

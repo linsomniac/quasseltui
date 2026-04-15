@@ -8,21 +8,31 @@ desyncs here would manifest as confusing parser failures elsewhere.
 
 from __future__ import annotations
 
+import datetime as dt
 import struct
 
 import pytest
 
+from quasseltui.protocol.enums import (
+    FEATURE_LONG_TIME,
+    FEATURE_RICH_MESSAGES,
+    FEATURE_SENDER_PREFIXES,
+    MessageFlag,
+    MessageType,
+)
 from quasseltui.protocol.usertypes import (
     USER_TYPE_BUFFER_ID,
     USER_TYPE_BUFFER_INFO,
     USER_TYPE_IDENTITY,
     USER_TYPE_IDENTITY_ID,
+    USER_TYPE_MESSAGE,
     USER_TYPE_MSG_ID,
     USER_TYPE_NETWORK_ID,
     BufferId,
     BufferInfo,
     BufferType,
     IdentityId,
+    Message,
     MsgId,
     NetworkId,
 )
@@ -212,3 +222,136 @@ class TestUserTypeIntegrationWithVariantList:
 
         decoded = read_qvariantlist(reader)
         assert decoded == ids
+
+
+_MODERN_FEATURES = frozenset({FEATURE_LONG_TIME, FEATURE_SENDER_PREFIXES, FEATURE_RICH_MESSAGES})
+
+
+def _sample_message(**overrides: object) -> Message:
+    defaults: dict[str, object] = {
+        "msg_id": MsgId(42),
+        "timestamp": dt.datetime(2026, 4, 14, 12, 34, 56, tzinfo=dt.UTC),
+        "type": MessageType.Plain,
+        "flags": MessageFlag.NONE,
+        "buffer_info": BufferInfo(
+            buffer_id=BufferId(1),
+            network_id=NetworkId(1),
+            type=BufferType.Channel,
+            group_id=0,
+            name="#python",
+        ),
+        "sender": "sean!sean@example.org",
+        "sender_prefixes": "@",
+        "real_name": "Sean R.",
+        "avatar_url": "",
+        "contents": "hello world",
+        "peer_features": _MODERN_FEATURES,
+    }
+    defaults.update(overrides)
+    return Message(**defaults)  # type: ignore[arg-type]
+
+
+class TestMessageRoundtrip:
+    """The Message user-type's wire shape depends on which features were
+    negotiated at handshake time. Our reader/writer pull that frozenset
+    from the Reader/Writer's `peer_features` attribute, so these tests
+    construct the stream objects with explicit feature sets rather than
+    relying on a global default.
+    """
+
+    def test_modern_core_round_trip(self) -> None:
+        original = _sample_message()
+        writer = QDataStreamWriter(peer_features=_MODERN_FEATURES)
+        write_variant(writer, original, user_type_name=USER_TYPE_MESSAGE)
+        reader = QDataStreamReader(writer.to_bytes(), peer_features=_MODERN_FEATURES)
+        decoded = read_variant(reader)
+        assert isinstance(decoded, Message)
+        # peer_features is exercised separately; compare only the wire fields
+        # to avoid fragility from frozenset vs frozenset equality surprises.
+        assert decoded.msg_id == original.msg_id
+        assert decoded.timestamp == original.timestamp
+        assert decoded.type is original.type
+        assert decoded.flags == original.flags
+        assert decoded.buffer_info == original.buffer_info
+        assert decoded.sender == original.sender
+        assert decoded.sender_prefixes == original.sender_prefixes
+        assert decoded.real_name == original.real_name
+        assert decoded.avatar_url == original.avatar_url
+        assert decoded.contents == original.contents
+        assert reader.at_end()
+
+    def test_legacy_core_omits_conditional_fields(self) -> None:
+        """Without LongTime/SenderPrefixes/RichMessages the conditional
+        fields are skipped on both encode and decode."""
+        legacy_features: frozenset[str] = frozenset()
+        original = _sample_message(
+            sender_prefixes="",  # would be skipped by the encoder
+            real_name="",
+            avatar_url="",
+        )
+        writer = QDataStreamWriter(peer_features=legacy_features)
+        write_variant(writer, original, user_type_name=USER_TYPE_MESSAGE)
+        reader = QDataStreamReader(writer.to_bytes(), peer_features=legacy_features)
+        decoded = read_variant(reader)
+        assert isinstance(decoded, Message)
+        assert decoded.sender_prefixes == ""
+        assert decoded.real_name == ""
+        assert decoded.avatar_url == ""
+        assert decoded.contents == "hello world"
+        assert reader.at_end()
+
+    def test_legacy_timestamp_is_quint32_seconds(self) -> None:
+        """Without LongTime the timestamp narrows to quint32 sec-since-epoch."""
+        features: frozenset[str] = frozenset()
+        value = dt.datetime(2000, 1, 1, 0, 0, 0, tzinfo=dt.UTC)
+        msg = _sample_message(timestamp=value, peer_features=features)
+        writer = QDataStreamWriter(peer_features=features)
+        from quasseltui.protocol.usertypes import _write_message
+
+        _write_message(writer, msg)
+        blob = writer.to_bytes()
+        # msg_id qint64 (8) + timestamp quint32 (4) = first 12 bytes
+        # timestamp for 2000-01-01 UTC = 946684800
+        assert struct.unpack(">q", blob[:8])[0] == 42
+        assert struct.unpack(">I", blob[8:12])[0] == 946684800
+
+    def test_modern_timestamp_is_qint64_ms(self) -> None:
+        features = frozenset({FEATURE_LONG_TIME})
+        value = dt.datetime(2000, 1, 1, 0, 0, 0, tzinfo=dt.UTC)
+        msg = _sample_message(timestamp=value, peer_features=features)
+        writer = QDataStreamWriter(peer_features=features)
+        from quasseltui.protocol.usertypes import _write_message
+
+        _write_message(writer, msg)
+        blob = writer.to_bytes()
+        # msg_id qint64 (8) + timestamp qint64 ms (8) = first 16 bytes
+        assert struct.unpack(">q", blob[:8])[0] == 42
+        assert struct.unpack(">q", blob[8:16])[0] == 946684800 * 1000
+
+    def test_unknown_message_type_is_forward_compatible(self) -> None:
+        """If a future Quassel adds a new MessageType we haven't mapped, we
+        coerce to Plain rather than crashing the decode loop."""
+        features = _MODERN_FEATURES
+        # Encode a real message first, then patch its type field to a value
+        # that isn't in MessageType.
+        original = _sample_message(peer_features=features)
+        writer = QDataStreamWriter(peer_features=features)
+        from quasseltui.protocol.usertypes import _write_message
+
+        _write_message(writer, original)
+        blob = bytearray(writer.to_bytes())
+        # The type field is at offset: msg_id(8) + timestamp(8) = 16,
+        # and is a quint32. Patch to 0xFFFF (outside the enum).
+        blob[16:20] = struct.pack(">I", 0xFFFF)
+        reader = QDataStreamReader(bytes(blob), peer_features=features)
+        from quasseltui.protocol.usertypes import _read_message
+
+        decoded = _read_message(reader)
+        assert decoded.type is MessageType.Plain
+
+    def test_message_writer_rejects_wrong_type(self) -> None:
+        writer = QDataStreamWriter(peer_features=_MODERN_FEATURES)
+        from quasseltui.protocol.usertypes import _write_message
+
+        with pytest.raises(QDataStreamError, match="expected Message"):
+            _write_message(writer, "not a message")

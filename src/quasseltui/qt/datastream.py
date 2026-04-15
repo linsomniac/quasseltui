@@ -1,6 +1,7 @@
 """Pure-Python QDataStream reader/writer for Qt binary serialization.
 
-Wire format rules (matching Qt's QDataStream::Qt_5_0+ in big-endian mode):
+Wire format rules (matching Qt's QDataStream::Qt_4_2 in big-endian mode, the
+version Quassel pins both ends to):
 
 - All integers are big-endian.
 - Booleans are one byte (0 or 1).
@@ -10,9 +11,20 @@ Wire format rules (matching Qt's QDataStream::Qt_5_0+ in big-endian mode):
   pairing, so we use Python's `surrogatepass` error handler to round-trip lone
   surrogates rather than rejecting them as the strict UTF-16 codec would.
 - QByteArray uses the same shape but raw bytes; `0xFFFFFFFF` represents null.
+- QDateTime is the Qt 4 wire format: `quint32 julian_day`, `quint32
+  ms_since_midnight`, `bool is_utc` (9 bytes total). Modern Qt produces this
+  same shape under stream version `Qt_4_2`.
 
 Quassel always uses big-endian, version-stable wire format, so we hard-code that
 here rather than tracking QDataStream version negotiation.
+
+`peer_features` is the set of Quassel feature names that were negotiated during
+the handshake. The Message user-type's wire shape depends on which features
+both sides advertised (`LongTime` widens timestamps to qint64 ms, `RichMessages`
+adds `realName`/`avatarUrl`, `SenderPrefixes` adds the sender-mode field), so
+the reader/writer carry that frozenset and the Message codec consults it.
+Defaults to empty so unit tests that round-trip individual values still work
+without knowing about feature negotiation.
 
 The reader takes configurable size limits to bound attacker-controlled length
 prefixes — without them a malformed core message could ask us to allocate
@@ -23,11 +35,17 @@ larger.
 
 from __future__ import annotations
 
+import datetime as _dt
 import struct
 
 DEFAULT_MAX_STRING_BYTES = 16 * 1024 * 1024  # 16 MiB
 DEFAULT_MAX_BYTEARRAY_BYTES = 64 * 1024 * 1024  # 64 MiB
 DEFAULT_MAX_CONTAINER_ITEMS = 1_000_000
+
+# Julian Day Number for the proleptic Gregorian date 0001-01-01, which is
+# Python's `date.toordinal() == 1`. Used to convert between Python ordinals
+# and Qt's julian-day-based QDateTime wire format.
+_GREGORIAN_EPOCH_JDN = 1721425
 
 
 class QDataStreamError(ValueError):
@@ -46,6 +64,7 @@ class QDataStreamReader:
         "max_bytearray_bytes",
         "max_container_items",
         "max_string_bytes",
+        "peer_features",
     )
 
     def __init__(
@@ -55,12 +74,14 @@ class QDataStreamReader:
         max_string_bytes: int = DEFAULT_MAX_STRING_BYTES,
         max_bytearray_bytes: int = DEFAULT_MAX_BYTEARRAY_BYTES,
         max_container_items: int = DEFAULT_MAX_CONTAINER_ITEMS,
+        peer_features: frozenset[str] = frozenset(),
     ) -> None:
         self._data = data
         self._pos = 0
         self.max_string_bytes = max_string_bytes
         self.max_bytearray_bytes = max_bytearray_bytes
         self.max_container_items = max_container_items
+        self.peer_features = peer_features
 
     @property
     def position(self) -> int:
@@ -146,14 +167,54 @@ class QDataStreamReader:
             )
         return self.read_bytes(length)
 
+    def read_qdatetime(self) -> _dt.datetime:
+        """Decode a Qt 4 wire-format QDateTime into a tz-aware Python datetime.
+
+        Wire shape: `quint32 julian_day`, `quint32 ms_since_midnight`,
+        `bool is_utc`. The is-UTC flag is the only timezone information on
+        the wire — Qt 4 didn't carry an explicit offset. If the flag is set
+        we tag the returned datetime with `timezone.utc`; otherwise we leave
+        it naive (caller can interpret as local time if it cares). Out-of-
+        range julian days are coerced to the boundary date instead of
+        raising — Quassel emits 0/0/0 for "no timestamp" and we don't want
+        that to crash the message decode loop.
+        """
+        julian_day = self.read_uint32()
+        ms_since_midnight = self.read_uint32()
+        is_utc = self.read_bool()
+        ordinal = julian_day - _GREGORIAN_EPOCH_JDN
+        if ordinal < 1:
+            base_date = _dt.date.min
+        elif ordinal > _dt.date.max.toordinal():
+            base_date = _dt.date.max
+        else:
+            base_date = _dt.date.fromordinal(ordinal)
+        # Clamp ms-since-midnight; Quassel sometimes ships a 0 with no day.
+        ms_since_midnight = max(0, min(ms_since_midnight, 86_400_000 - 1))
+        seconds, micros = divmod(ms_since_midnight * 1000, 1_000_000)
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        tzinfo = _dt.UTC if is_utc else None
+        return _dt.datetime(
+            base_date.year,
+            base_date.month,
+            base_date.day,
+            h,
+            m,
+            s,
+            micros,
+            tzinfo=tzinfo,
+        )
+
 
 class QDataStreamWriter:
     """Sequential writer accumulating Qt-formatted big-endian bytes."""
 
-    __slots__ = ("_buf",)
+    __slots__ = ("_buf", "peer_features")
 
-    def __init__(self) -> None:
+    def __init__(self, *, peer_features: frozenset[str] = frozenset()) -> None:
         self._buf = bytearray()
+        self.peer_features = peer_features
 
     def __len__(self) -> int:
         return len(self._buf)
@@ -208,3 +269,29 @@ class QDataStreamWriter:
             return
         self.write_uint32(len(value))
         self._buf.extend(value)
+
+    def write_qdatetime(self, value: _dt.datetime) -> None:
+        """Encode a Python datetime as a Qt 4 wire-format QDateTime.
+
+        Naive datetimes are written with `is_utc=False` and the wall-clock
+        time as-is; tz-aware datetimes are converted to UTC first and
+        written with `is_utc=True`. This matches what Qt 4's
+        `operator<<(QDataStream&, const QDateTime&)` does and is what
+        modern Qt produces when the stream version is pinned to `Qt_4_2`.
+        """
+        if value.tzinfo is not None:
+            value_utc = value.astimezone(_dt.UTC)
+            is_utc = True
+        else:
+            value_utc = value
+            is_utc = False
+        julian_day = value_utc.date().toordinal() + _GREGORIAN_EPOCH_JDN
+        ms_since_midnight = (
+            value_utc.hour * 3_600_000
+            + value_utc.minute * 60_000
+            + value_utc.second * 1_000
+            + value_utc.microsecond // 1_000
+        )
+        self.write_uint32(julian_day)
+        self.write_uint32(ms_since_midnight)
+        self.write_bool(is_utc)

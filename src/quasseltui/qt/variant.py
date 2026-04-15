@@ -21,6 +21,7 @@ This file grows on demand. Phase 1 covered only the types needed for
 
 from __future__ import annotations
 
+import datetime as _dt
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -165,6 +166,24 @@ def _write_qbytearray(writer: QDataStreamWriter, value: Any) -> None:
         raise TypeError(f"cannot serialize {type(value).__name__} as QByteArray")
 
 
+def _read_int16(reader: QDataStreamReader) -> int:
+    return reader.read_int16()
+
+
+def _write_int16(writer: QDataStreamWriter, value: Any) -> None:
+    writer.write_int16(int(value))
+
+
+def _read_qdatetime(reader: QDataStreamReader) -> _dt.datetime:
+    return reader.read_qdatetime()
+
+
+def _write_qdatetime(writer: QDataStreamWriter, value: Any) -> None:
+    if not isinstance(value, _dt.datetime):
+        raise TypeError(f"cannot serialize {type(value).__name__} as QDateTime")
+    writer.write_qdatetime(value)
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -185,6 +204,8 @@ _READERS: dict[int, ReaderFn] = {
     QMetaType.QVariantMap: read_qvariantmap,
     QMetaType.QVariantList: read_qvariantlist,
     QMetaType.QStringList: read_qstringlist,
+    QMetaType.QDateTime: _read_qdatetime,
+    QMetaType.Short: _read_int16,
 }
 
 
@@ -199,6 +220,8 @@ _WRITERS: dict[int, WriterFn] = {
     QMetaType.QVariantMap: write_qvariantmap,
     QMetaType.QVariantList: write_qvariantlist,
     QMetaType.QStringList: write_qstringlist,
+    QMetaType.QDateTime: _write_qdatetime,
+    QMetaType.Short: _write_int16,
 }
 
 
@@ -330,6 +353,8 @@ def _infer_type_id(value: Any) -> int:
         return QMetaType.QString
     if isinstance(value, bytes | bytearray | memoryview):
         return QMetaType.QByteArray
+    if isinstance(value, _dt.datetime):
+        return QMetaType.QDateTime
     if isinstance(value, Mapping):
         return QMetaType.QVariantMap
     if isinstance(value, list | tuple):

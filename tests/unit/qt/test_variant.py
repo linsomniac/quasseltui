@@ -352,3 +352,63 @@ class TestUserTypeEnvelope:
                 type_id=QMetaType.QVariantList,
                 user_type_name=b"PairTest",
             )
+
+
+class TestShortAndQDateTime:
+    """Phase 4 added `Short = 130` and `QDateTime = 16` to the dispatch.
+
+    The Short ID is the one thing that would silently break SignalProxy
+    decoding if we got the number wrong — Quassel uses its own 130, NOT
+    Qt's QMetaType::Short = 33. Pin the ID in a byte-layout test so any
+    regression surfaces immediately.
+    """
+
+    def test_short_round_trip(self) -> None:
+        writer = QDataStreamWriter()
+        write_variant(writer, 42, type_id=QMetaType.Short)
+        reader = QDataStreamReader(writer.to_bytes())
+        assert read_variant(reader) == 42
+        assert reader.at_end()
+
+    def test_short_wire_type_id_is_130(self) -> None:
+        """The type-id header is Quassel's `Types::VariantType::Short = 130`."""
+        writer = QDataStreamWriter()
+        write_variant(writer, 1, type_id=QMetaType.Short)
+        blob = writer.to_bytes()
+        # 4-byte type id (big-endian 130) + 1-byte is_null + 2-byte value
+        assert blob[:4] == b"\x00\x00\x00\x82"
+        assert blob[4] == 0
+        assert blob[5:7] == b"\x00\x01"
+
+    def test_short_negative_roundtrip(self) -> None:
+        writer = QDataStreamWriter()
+        write_variant(writer, -1, type_id=QMetaType.Short)
+        reader = QDataStreamReader(writer.to_bytes())
+        assert read_variant(reader) == -1
+
+    def test_qdatetime_round_trip_utc(self) -> None:
+        import datetime as dt
+
+        value = dt.datetime(2026, 4, 14, 12, 34, 56, 789_000, tzinfo=dt.UTC)
+        writer = QDataStreamWriter()
+        write_variant(writer, value, type_id=QMetaType.QDateTime)
+        reader = QDataStreamReader(writer.to_bytes())
+        result = read_variant(reader)
+        assert result == value
+
+    def test_qdatetime_is_inferred_from_python_datetime(self) -> None:
+        import datetime as dt
+
+        value = dt.datetime(2026, 4, 14, 12, 0, 0, tzinfo=dt.UTC)
+        writer = QDataStreamWriter()
+        write_variant(writer, value)  # no explicit type_id
+        blob = writer.to_bytes()
+        # The type id should be 16 (QDateTime), not 0 (Invalid) or 1024.
+        assert blob[:4] == b"\x00\x00\x00\x10"
+        reader = QDataStreamReader(blob)
+        assert read_variant(reader) == value
+
+    def test_qdatetime_write_rejects_non_datetime(self) -> None:
+        writer = QDataStreamWriter()
+        with pytest.raises(TypeError, match="cannot serialize"):
+            write_variant(writer, "not a datetime", type_id=QMetaType.QDateTime)

@@ -1,6 +1,6 @@
 """Command-line entry point for quasseltui.
 
-Two diagnostic subcommands at the moment:
+Three diagnostic subcommands at the moment:
 
 - `probe-only` (phase 2) runs the probe handshake, optional TLS upgrade,
   `ClientInit` round-trip, and exits. Useful for sanity-checking that a
@@ -10,8 +10,13 @@ Two diagnostic subcommands at the moment:
   identities, networks, and buffers. This is the workhorse for capturing
   byte fixtures during phase development and the first command that needs
   actual credentials.
+- `stream-only` (phase 4) builds on `login-only` by then entering the
+  CONNECTED state and pretty-printing every `SignalProxy` event the core
+  sends until `--duration` seconds elapse. Useful for capturing a live
+  byte stream (e.g. to feed `tests/fixtures/connected_stream.bin`) and
+  sanity-checking the heartbeat reply path.
 
-Both modes are headless and exit when done — the Textual UI lands in
+All three modes are headless and exit when done — the Textual UI lands in
 phase 6+.
 """
 
@@ -20,12 +25,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import logging
 import os
 import sys
 from collections import defaultdict
 from collections.abc import Sequence
 
 from quasseltui import __version__
+from quasseltui.protocol.connection import (
+    Disconnected,
+    HeartBeatEvent,
+    InitDataEvent,
+    InitRequestEvent,
+    ProtocolEvent,
+    QuasselConnection,
+    RpcEvent,
+    SessionReady,
+    SyncEvent,
+)
 from quasseltui.protocol.errors import AuthError, QuasselError
 from quasseltui.protocol.handshake import (
     recv_handshake_message,
@@ -55,6 +72,74 @@ CLIENT_VERSION = f"quasseltui v{__version__}"
 BUILD_DATE = "2026-04-14"
 
 
+def _add_core_connect_args(
+    sub: argparse._ArgumentGroup | argparse.ArgumentParser,
+    *,
+    sends_credentials: bool,
+    include_allow_plaintext: bool,
+) -> None:
+    """Attach the host/port/TLS/timeout args every diagnostic mode shares.
+
+    `sends_credentials=True` makes the `--no-tls` warning blunter and is
+    documentation-only — the actual fail-closed policy is enforced in the
+    handler. `include_allow_plaintext=True` is only for `probe-only`, which
+    doesn't send credentials and thus doesn't need to fail-closed on TLS
+    downgrade.
+    """
+    sub.add_argument("--host", required=True, help="Quassel core hostname or IP")
+    sub.add_argument("--port", type=int, required=True, help="Quassel core port")
+    tls_help = (
+        "Do not offer encryption during the probe (plain TCP only). "
+        "WARNING: your password goes over the wire in plaintext. Use "
+        "only against trusted local cores."
+        if sends_credentials
+        else "Do not offer encryption during the probe (plain TCP only). "
+        "Implies --allow-plaintext. Use only against trusted local cores."
+    )
+    sub.add_argument("--no-tls", action="store_true", help=tls_help)
+    if include_allow_plaintext:
+        sub.add_argument(
+            "--allow-plaintext",
+            action="store_true",
+            help=(
+                "Allow the session to continue if the core does not enable TLS "
+                "even though we offered it. Without this flag we abort to "
+                "prevent a downgrade attack from leaking credentials."
+            ),
+        )
+    sub.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Skip TLS certificate verification (self-signed cores).",
+    )
+    sub.add_argument(
+        "--cafile",
+        help="Path to a PEM bundle of trust anchors to use during TLS verification.",
+    )
+    sub.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for the TCP connect (default: 10).",
+    )
+
+
+def _add_credential_args(sub: argparse.ArgumentParser) -> None:
+    """Attach `--user` / `--password` (login-only and stream-only share these)."""
+    sub.add_argument(
+        "--user",
+        help="Username (env: QUASSEL_USER; prompted if neither is set)",
+    )
+    sub.add_argument(
+        "--password",
+        help=(
+            "Password — discouraged on the command line because it shows up "
+            "in shell history and `ps`. Prefer the QUASSEL_PASSWORD env var "
+            "or be prompted interactively."
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="quasseltui",
@@ -68,39 +153,10 @@ def build_parser() -> argparse.ArgumentParser:
         "probe-only",
         help="Run the probe + ClientInit handshake against a core, print the reply, and exit.",
     )
-    probe_only.add_argument("--host", required=True, help="Quassel core hostname or IP")
-    probe_only.add_argument("--port", type=int, required=True, help="Quassel core port")
-    probe_only.add_argument(
-        "--no-tls",
-        action="store_true",
-        help=(
-            "Do not offer encryption during the probe (plain TCP only). "
-            "Implies --allow-plaintext. Use only against trusted local cores."
-        ),
-    )
-    probe_only.add_argument(
-        "--allow-plaintext",
-        action="store_true",
-        help=(
-            "Allow the session to continue if the core does not enable TLS "
-            "even though we offered it. Without this flag we abort to "
-            "prevent a downgrade attack from leaking credentials."
-        ),
-    )
-    probe_only.add_argument(
-        "--insecure",
-        action="store_true",
-        help="Skip TLS certificate verification (self-signed cores).",
-    )
-    probe_only.add_argument(
-        "--cafile",
-        help="Path to a PEM bundle of trust anchors to use during TLS verification.",
-    )
-    probe_only.add_argument(
-        "--connect-timeout",
-        type=float,
-        default=10.0,
-        help="Seconds to wait for the TCP connect (default: 10).",
+    _add_core_connect_args(
+        probe_only,
+        sends_credentials=False,
+        include_allow_plaintext=True,
     )
 
     login_only = sub.add_parser(
@@ -110,43 +166,43 @@ def build_parser() -> argparse.ArgumentParser:
             "against a core, print the SessionInit summary, and exit."
         ),
     )
-    login_only.add_argument("--host", required=True, help="Quassel core hostname or IP")
-    login_only.add_argument("--port", type=int, required=True, help="Quassel core port")
-    login_only.add_argument(
-        "--user",
-        help="Username (env: QUASSEL_USER; prompted if neither is set)",
+    _add_core_connect_args(
+        login_only,
+        sends_credentials=True,
+        include_allow_plaintext=False,
     )
-    login_only.add_argument(
-        "--password",
+    _add_credential_args(login_only)
+
+    stream_only = sub.add_parser(
+        "stream-only",
         help=(
-            "Password — discouraged on the command line because it shows up "
-            "in shell history and `ps`. Prefer the QUASSEL_PASSWORD env var "
-            "or be prompted interactively."
+            "Run the full handshake, then stream SignalProxy events from "
+            "the core for --duration seconds. Pretty-prints each event."
         ),
     )
-    login_only.add_argument(
-        "--no-tls",
-        action="store_true",
-        help=(
-            "Do not offer encryption during the probe (plain TCP only). "
-            "WARNING: your password goes over the wire in plaintext. Use "
-            "only against trusted local cores."
-        ),
+    _add_core_connect_args(
+        stream_only,
+        sends_credentials=True,
+        include_allow_plaintext=False,
     )
-    login_only.add_argument(
-        "--insecure",
-        action="store_true",
-        help="Skip TLS certificate verification (self-signed cores).",
-    )
-    login_only.add_argument(
-        "--cafile",
-        help="Path to a PEM bundle of trust anchors to use during TLS verification.",
-    )
-    login_only.add_argument(
-        "--connect-timeout",
+    _add_credential_args(stream_only)
+    stream_only.add_argument(
+        "--duration",
         type=float,
-        default=10.0,
-        help="Seconds to wait for the TCP connect (default: 10).",
+        default=60.0,
+        help="Seconds to stream events after handshake (default: 60).",
+    )
+    stream_only.add_argument(
+        "--max-events",
+        type=int,
+        default=None,
+        help="Optional cap on how many events to print before exiting.",
+    )
+    stream_only.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Print the raw params/init_data on each event (may be long).",
     )
 
     return parser
@@ -160,6 +216,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_probe_only(args))
     if args.mode == "login-only":
         return asyncio.run(_login_only(args))
+    if args.mode == "stream-only":
+        return asyncio.run(_stream_only(args))
 
     print(f"quasseltui {__version__} — under construction")
     return 0
@@ -416,3 +474,133 @@ def _buffer_type_label(t: BufferType) -> str:
         BufferType.Group: "group",
         BufferType.Invalid: "?",
     }.get(t, "?")
+
+
+async def _stream_only(args: argparse.Namespace) -> int:
+    """Run the full handshake and stream SignalProxy events to stdout.
+
+    Exit codes mirror `login-only` for the setup phase (0 clean, 1 bad args,
+    2 connect fail, 3 init reject, 4 protocol error, 5 TLS downgrade,
+    6 unconfigured core, 7 auth rejected). Code 0 also applies when the
+    duration elapses and we disconnect cleanly.
+    """
+    user = args.user or os.environ.get("QUASSEL_USER")
+    if not user:
+        print("stream-only: --user or QUASSEL_USER is required", file=sys.stderr)
+        return 1
+    password = args.password or os.environ.get("QUASSEL_PASSWORD")
+    if password is None:
+        try:
+            password = getpass.getpass(f"Password for {user}@{args.host}: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nstream-only: aborted at password prompt", file=sys.stderr)
+            return 1
+    if not password:
+        print("stream-only: empty password not allowed", file=sys.stderr)
+        return 1
+
+    # Turn on a minimal log handler so WARN from the connection bubbles up
+    # without drowning the pretty-printed event stream.
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    tls_options = TlsOptions(verify=not args.insecure, cafile=args.cafile)
+    conn = QuasselConnection(
+        host=args.host,
+        port=args.port,
+        user=user,
+        password=password,
+        tls=not args.no_tls,
+        tls_options=tls_options,
+        client_version=CLIENT_VERSION,
+        build_date=BUILD_DATE,
+        connect_timeout=args.connect_timeout,
+    )
+
+    max_events = args.max_events
+    event_count = 0
+    exit_code = 0
+
+    async def run() -> int:
+        nonlocal event_count
+        async for event in conn.events():
+            _print_stream_event(event, verbose=args.verbose)
+            if isinstance(event, Disconnected):
+                return _stream_disconnect_exit_code(event)
+            event_count += 1
+            if max_events is not None and event_count >= max_events:
+                print(f"[max-events={max_events} reached, stopping]")
+                return 0
+        return 0
+
+    try:
+        exit_code = await asyncio.wait_for(run(), timeout=args.duration)
+    except TimeoutError:
+        print(f"[duration={args.duration}s elapsed, stopping]")
+        exit_code = 0
+    finally:
+        await conn.close()
+
+    return exit_code
+
+
+def _stream_disconnect_exit_code(event: Disconnected) -> int:
+    """Map a terminal Disconnected event to a `login-only`-compatible code."""
+    err = event.error
+    if isinstance(err, AuthError):
+        return 7
+    if isinstance(err, TransportError):
+        return 2
+    reason = event.reason.lower()
+    if "tls" in reason and "plaintext" in reason:
+        return 5
+    if "not configured" in reason:
+        return 6
+    if "rejected clientinit" in reason:
+        return 3
+    return 4
+
+
+def _print_stream_event(event: ProtocolEvent, *, verbose: bool) -> None:
+    if isinstance(event, SessionReady):
+        _print_session_init(event.session)
+        feats = ", ".join(sorted(event.peer_features)) or "(none)"
+        print(f"negotiated features: {feats}")
+        print("[streaming events…]")
+        return
+    if isinstance(event, SyncEvent):
+        sync = event.message
+        suffix = f"  params={sync.params!r}" if verbose else ""
+        print(
+            f"Sync  {sync.class_name.decode('ascii', 'replace')}::"
+            f"{sync.object_name} {sync.slot_name.decode('ascii', 'replace')}"
+            f" ({len(sync.params)} params){suffix}"
+        )
+        return
+    if isinstance(event, RpcEvent):
+        rpc = event.message
+        suffix = f"  params={rpc.params!r}" if verbose else ""
+        print(
+            f"Rpc   {rpc.signal_name.decode('ascii', 'replace')} ({len(rpc.params)} params){suffix}"
+        )
+        return
+    if isinstance(event, InitDataEvent):
+        idm = event.message
+        suffix = f"  data={idm.init_data!r}" if verbose else ""
+        print(
+            f"Init  {idm.class_name.decode('ascii', 'replace')}::"
+            f"{idm.object_name} ({len(idm.init_data)} keys){suffix}"
+        )
+        return
+    if isinstance(event, InitRequestEvent):
+        req = event.message
+        print(f"IReq  {req.class_name.decode('ascii', 'replace')}::{req.object_name}")
+        return
+    if isinstance(event, HeartBeatEvent):
+        print(f"Heart ts={event.message.timestamp.isoformat()}")
+        return
+    if isinstance(event, Disconnected):
+        print(f"-- disconnected: {event.reason}")
+        return

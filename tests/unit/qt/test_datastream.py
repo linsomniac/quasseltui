@@ -8,6 +8,8 @@ bugs in Qt-binary-format clients.
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
 
 from quasseltui.qt.datastream import QDataStreamError, QDataStreamReader, QDataStreamWriter
@@ -232,3 +234,105 @@ class TestLengthLimits:
         bad = b"\x00\x00\x00\x10ab"  # says 16 bytes, only 2 available
         with pytest.raises(QDataStreamError, match="truncated"):
             QDataStreamReader(bad).read_qbytearray()
+
+
+class TestQDateTimeWireFormat:
+    """Pin the Qt 4 wire format for QDateTime: `quint32 jd, quint32 ms, bool`.
+
+    These 9 bytes are what Quassel sends for `HeartBeat::timestamp`. Qt 5/6
+    still produce this same shape under stream version `Qt_4_2`, which is
+    what Quassel pins both ends to. If our codec ever drifts from this
+    layout the HeartBeat reply path silently stops working — the core
+    would drop the connection after ~30 seconds with no useful error, so
+    we'd rather catch it here.
+    """
+
+    def test_known_blob_2026_04_14(self) -> None:
+        """Pin one exact datetime to its 9-byte wire representation."""
+        value = dt.datetime(2026, 4, 14, 12, 34, 56, 789_000, tzinfo=dt.UTC)
+        writer = QDataStreamWriter()
+        writer.write_qdatetime(value)
+        # julian_day = date(2026,4,14).toordinal() + 1721425 = 0x00258dd9
+        # ms = 12*3600000 + 34*60000 + 56*1000 + 789 = 0x02b32c95
+        # is_utc = 1
+        assert writer.to_bytes() == b"\x00\x25\x8d\xd9\x02\xb3\x2c\x95\x01"
+
+    def test_utc_roundtrip_preserves_tzinfo(self) -> None:
+        value = dt.datetime(2026, 4, 14, 12, 34, 56, 789_000, tzinfo=dt.UTC)
+        writer = QDataStreamWriter()
+        writer.write_qdatetime(value)
+        reader = QDataStreamReader(writer.to_bytes())
+        result = reader.read_qdatetime()
+        assert result == value
+        assert result.tzinfo is dt.UTC
+        assert reader.at_end()
+
+    def test_naive_roundtrip_stays_naive(self) -> None:
+        value = dt.datetime(2026, 1, 1, 0, 0, 0)
+        writer = QDataStreamWriter()
+        writer.write_qdatetime(value)
+        reader = QDataStreamReader(writer.to_bytes())
+        result = reader.read_qdatetime()
+        assert result.replace(tzinfo=None) == value
+        assert result.tzinfo is None
+
+    def test_zero_julian_day_does_not_crash(self) -> None:
+        """Quassel occasionally emits 0/0/0 for 'no timestamp'.
+
+        The Qt 4 format uses quint32 for julian day, so 0 is a valid on-wire
+        value even though it's far outside Python's `datetime` range. We
+        clamp to `date.min` rather than crashing the SignalProxy read loop.
+        """
+        blob = b"\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        reader = QDataStreamReader(blob)
+        result = reader.read_qdatetime()
+        assert result.year == 1
+        assert reader.at_end()
+
+    @pytest.mark.parametrize(
+        "moment",
+        [
+            dt.datetime(1970, 1, 1, 0, 0, 0, tzinfo=dt.UTC),
+            dt.datetime(2000, 2, 29, 12, 0, 0, tzinfo=dt.UTC),  # leap day
+            dt.datetime(2038, 1, 19, 3, 14, 7, tzinfo=dt.UTC),  # qint32 wrap
+            dt.datetime(2100, 12, 31, 23, 59, 59, 999_000, tzinfo=dt.UTC),
+        ],
+    )
+    def test_various_moments_roundtrip(self, moment: dt.datetime) -> None:
+        writer = QDataStreamWriter()
+        writer.write_qdatetime(moment)
+        reader = QDataStreamReader(writer.to_bytes())
+        assert reader.read_qdatetime() == moment
+
+    def test_tz_aware_non_utc_is_converted_to_utc(self) -> None:
+        """Tz-aware datetime in another zone should normalize to UTC on write."""
+        eastern = dt.timezone(dt.timedelta(hours=-5))
+        local = dt.datetime(2026, 4, 14, 7, 34, 56, 789_000, tzinfo=eastern)
+        expected_utc = local.astimezone(dt.UTC)
+        writer = QDataStreamWriter()
+        writer.write_qdatetime(local)
+        reader = QDataStreamReader(writer.to_bytes())
+        result = reader.read_qdatetime()
+        assert result == expected_utc
+
+
+class TestPeerFeaturesAttribute:
+    """The Message user-type codec keys off this attribute on both Reader
+    and Writer. Make sure the defaults don't surprise anyone and the
+    explicit value flows through unchanged."""
+
+    def test_reader_default_empty(self) -> None:
+        assert QDataStreamReader(b"").peer_features == frozenset()
+
+    def test_writer_default_empty(self) -> None:
+        assert QDataStreamWriter().peer_features == frozenset()
+
+    def test_reader_explicit_features(self) -> None:
+        features = frozenset({"LongTime", "RichMessages"})
+        reader = QDataStreamReader(b"", peer_features=features)
+        assert reader.peer_features == features
+
+    def test_writer_explicit_features(self) -> None:
+        features = frozenset({"SenderPrefixes"})
+        writer = QDataStreamWriter(peer_features=features)
+        assert writer.peer_features == features

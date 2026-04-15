@@ -1,6 +1,6 @@
 """Command-line entry point for quasseltui.
 
-Three diagnostic subcommands at the moment:
+Four diagnostic subcommands at the moment:
 
 - `probe-only` (phase 2) runs the probe handshake, optional TLS upgrade,
   `ClientInit` round-trip, and exits. Useful for sanity-checking that a
@@ -15,8 +15,12 @@ Three diagnostic subcommands at the moment:
   sends until `--duration` seconds elapse. Useful for capturing a live
   byte stream (e.g. to feed `tests/fixtures/connected_stream.bin`) and
   sanity-checking the heartbeat reply path.
+- `dump-state` (phase 5) runs the embeddable `QuasselClient` stack for
+  `--duration` seconds and prints the populated `ClientState` snapshot
+  when it's done. This validates the sync/dispatcher + state layers
+  end-to-end against a real core.
 
-All three modes are headless and exit when done — the Textual UI lands in
+All four modes are headless and exit when done — the Textual UI lands in
 phase 6+.
 """
 
@@ -32,6 +36,10 @@ from collections import defaultdict
 from collections.abc import Sequence
 
 from quasseltui import __version__
+from quasseltui.client import ClientState, QuasselClient
+from quasseltui.client.events import (
+    Disconnected as ClientDisconnected,
+)
 from quasseltui.protocol.connection import (
     Disconnected,
     HeartBeatEvent,
@@ -205,6 +213,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the raw params/init_data on each event (may be long).",
     )
 
+    dump_state = sub.add_parser(
+        "dump-state",
+        help=(
+            "Run the full handshake and QuasselClient stack for --duration "
+            "seconds, then print a snapshot of ClientState (networks, "
+            "buffers, messages, identities)."
+        ),
+    )
+    _add_core_connect_args(
+        dump_state,
+        sends_credentials=True,
+        include_allow_plaintext=False,
+    )
+    _add_credential_args(dump_state)
+    dump_state.add_argument(
+        "--duration",
+        type=float,
+        default=30.0,
+        help="Seconds to accumulate state before dumping (default: 30).",
+    )
+    dump_state.add_argument(
+        "--max-messages",
+        type=int,
+        default=5,
+        help="Maximum messages per buffer to print in the summary (default: 5).",
+    )
+
     return parser
 
 
@@ -218,6 +253,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_login_only(args))
     if args.mode == "stream-only":
         return asyncio.run(_stream_only(args))
+    if args.mode == "dump-state":
+        return asyncio.run(_dump_state(args))
 
     print(f"quasseltui {__version__} — under construction")
     return 0
@@ -611,3 +648,156 @@ def _print_stream_event(event: ProtocolEvent, *, verbose: bool) -> None:
     if isinstance(event, Disconnected):
         print(f"-- disconnected: {event.reason}")
         return
+
+
+async def _dump_state(args: argparse.Namespace) -> int:
+    """Run the full `QuasselClient` stack and print a ClientState snapshot.
+
+    Exit codes mirror `login-only` (0 clean, 1 bad args, 2 connect fail,
+    3 init reject, 4 protocol error, 5 TLS downgrade, 6 unconfigured core,
+    7 auth rejected). We succeed with 0 if the duration elapses normally
+    and we were able to print at least a partial snapshot.
+    """
+    user = args.user or os.environ.get("QUASSEL_USER")
+    if not user:
+        print("dump-state: --user or QUASSEL_USER is required", file=sys.stderr)
+        return 1
+    password = args.password or os.environ.get("QUASSEL_PASSWORD")
+    if password is None:
+        try:
+            password = getpass.getpass(f"Password for {user}@{args.host}: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\ndump-state: aborted at password prompt", file=sys.stderr)
+            return 1
+    if not password:
+        print("dump-state: empty password not allowed", file=sys.stderr)
+        return 1
+
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    tls_options = TlsOptions(verify=not args.insecure, cafile=args.cafile)
+    client = QuasselClient(
+        host=args.host,
+        port=args.port,
+        user=user,
+        password=password,
+        tls=not args.no_tls,
+        tls_options=tls_options,
+        client_version=CLIENT_VERSION,
+        build_date=BUILD_DATE,
+        connect_timeout=args.connect_timeout,
+    )
+
+    exit_code = 0
+    event_counts: dict[str, int] = defaultdict(int)
+    last_disconnect: ClientDisconnected | None = None
+
+    async def run() -> None:
+        nonlocal last_disconnect
+        async for event in client.events():
+            event_counts[type(event).__name__] += 1
+            if isinstance(event, ClientDisconnected):
+                last_disconnect = event
+                return
+            # Phase 5 "watch for a bit then snapshot" — we don't do per-
+            # event printing like stream-only; the whole point is to rely
+            # on the sync layer and dump the final state.
+
+    try:
+        await asyncio.wait_for(run(), timeout=args.duration)
+    except TimeoutError:
+        pass
+    finally:
+        await client.close()
+
+    if last_disconnect is not None:
+        exit_code = _dump_state_exit_code(last_disconnect)
+        print(f"-- disconnected before duration elapsed: {last_disconnect.reason}")
+
+    _print_state_snapshot(client.state, max_messages=args.max_messages, counts=event_counts)
+    return exit_code
+
+
+def _dump_state_exit_code(event: ClientDisconnected) -> int:
+    """Map a `ClientDisconnected` event to a `login-only`-compatible code.
+
+    Intentionally duplicates `_stream_disconnect_exit_code` rather than
+    sharing — the event types are different (protocol-layer vs client-
+    layer), and trying to generalize over both via structural typing would
+    cost more than the few lines saved.
+    """
+    err = event.error
+    if isinstance(err, AuthError):
+        return 7
+    if isinstance(err, TransportError):
+        return 2
+    reason = event.reason.lower()
+    if "tls" in reason and "plaintext" in reason:
+        return 5
+    if "not configured" in reason:
+        return 6
+    if "rejected clientinit" in reason:
+        return 3
+    return 4
+
+
+def _print_state_snapshot(
+    state: ClientState,
+    *,
+    max_messages: int,
+    counts: dict[str, int],
+) -> None:
+    """Pretty-print the canonical `ClientState` for dump-state and tests.
+
+    Groups buffers by network, shows per-network connection state + my
+    nick, and prints the last `max_messages` IrcMessages per buffer.
+    """
+    print()
+    print("=== ClientState snapshot ===")
+    feats = ", ".join(sorted(state.peer_features)) or "(none)"
+    print(f"peer_features: {feats}")
+    print(
+        f"counts: networks={len(state.networks)}, buffers={len(state.buffers)}, "
+        f"identities={len(state.identities)}, messages={state.total_message_count()}"
+    )
+    if counts:
+        print("event_counts:")
+        for name in sorted(counts):
+            print(f"  {name}: {counts[name]}")
+
+    if state.identities:
+        print("identities:")
+        for ident_id in sorted(state.identities, key=int):
+            identity = state.identities[ident_id]
+            nicks = ", ".join(identity.nicks) if identity.nicks else "(no nicks)"
+            print(f"  - [{int(ident_id)}] {identity.identity_name} ({nicks})")
+
+    if state.networks:
+        print("networks:")
+        for network_id in sorted(state.networks, key=int):
+            network = state.networks[network_id]
+            print(
+                f"  - [{int(network_id)}] {network.network_name or '(unnamed)'}  "
+                f"state={network.connection_state.name} nick={network.my_nick or '?'} "
+                f"server={network.current_server or '?'}"
+            )
+            buffers = [b for b in state.buffers.values() if int(b.network_id) == int(network_id)]
+            if not buffers:
+                continue
+            for buf in sorted(buffers, key=lambda b: (b.type.value, b.name.lower())):
+                messages = state.messages.get(buf.buffer_id, [])
+                kind = _buffer_type_label(buf.type)
+                print(
+                    f"      [{kind}] {buf.name or '(unnamed)'} "
+                    f"(buffer_id={int(buf.buffer_id)}, {len(messages)} msgs)"
+                )
+                if messages and max_messages > 0:
+                    for msg in messages[-max_messages:]:
+                        ts = msg.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                        prefix = msg.sender_prefixes or " "
+                        print(f"          {ts} {prefix}{msg.sender}: {msg.contents}")
+    else:
+        print("networks: (none)")

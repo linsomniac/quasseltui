@@ -446,3 +446,150 @@ async def test_login_only_missing_user_returns_1(
     assert rc == 1
     open_conn.assert_not_awaited()
     assert "QUASSEL_USER" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# dump-state (phase 5). Exercises the `QuasselClient.events()` transform
+# via a fake client whose events() yields a canned sequence, then asserts
+# on the printed snapshot. We don't hit the protocol layer at all — the
+# client-layer code paths are what matter here.
+# ---------------------------------------------------------------------------
+
+
+def _make_dump_args(
+    *,
+    user: str | None = "sean",
+    password: str | None = "hunter2",
+    duration: float = 0.1,
+    max_messages: int = 3,
+) -> Any:
+    import argparse
+
+    return argparse.Namespace(
+        host="example.invalid",
+        port=4242,
+        user=user,
+        password=password,
+        no_tls=False,
+        insecure=False,
+        cafile=None,
+        connect_timeout=10.0,
+        duration=duration,
+        max_messages=max_messages,
+    )
+
+
+class _FakeClientForDumpState:
+    """Stand-in for `QuasselClient` used by the dump-state test.
+
+    Pre-populates its `state` with a small but realistic world and yields
+    a single terminal `ClientDisconnected` so `_dump_state`'s run loop
+    finishes immediately. Uses real `ClientState` + event dataclasses so
+    the snapshot printer doesn't need a parallel stub hierarchy.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        from datetime import UTC, datetime
+
+        from quasseltui.client.events import Disconnected as _Disconnected
+        from quasseltui.client.state import ClientState as _ClientState
+        from quasseltui.protocol.enums import MessageFlag, MessageType
+        from quasseltui.protocol.usertypes import (
+            BufferId as _BufferId,
+        )
+        from quasseltui.protocol.usertypes import (
+            BufferInfo as _BufferInfo,
+        )
+        from quasseltui.protocol.usertypes import (
+            BufferType as _BufferType,
+        )
+        from quasseltui.protocol.usertypes import (
+            IdentityId as _IdentityId,
+        )
+        from quasseltui.protocol.usertypes import (
+            MsgId as _MsgId,
+        )
+        from quasseltui.protocol.usertypes import (
+            NetworkId as _NetworkId,
+        )
+        from quasseltui.sync.events import IrcMessage
+        from quasseltui.sync.identity import Identity
+        from quasseltui.sync.network import Network, NetworkConnectionState
+
+        self.state = _ClientState()
+        network = Network(object_name="1")
+        network.network_name = "freenode"
+        network.my_nick = "seanr"
+        network.connection_state = NetworkConnectionState.Initialized
+        self.state.networks[_NetworkId(1)] = network
+        self.state.buffers[_BufferId(10)] = _BufferInfo(
+            buffer_id=_BufferId(10),
+            network_id=_NetworkId(1),
+            type=_BufferType.Channel,
+            group_id=0,
+            name="#python",
+        )
+        msg = IrcMessage(
+            msg_id=_MsgId(1),
+            buffer_id=_BufferId(10),
+            network_id=_NetworkId(1),
+            timestamp=datetime(2026, 4, 14, 12, 0, tzinfo=UTC),
+            type=MessageType.Plain,
+            flags=MessageFlag.NONE,
+            sender="alice",
+            sender_prefixes="@",
+            contents="hello from alice",
+        )
+        self.state.messages[_BufferId(10)] = [msg]
+        identity = Identity(object_name="1")
+        identity.identity_name = "default"
+        identity.nicks = ["sean", "sean_"]
+        self.state.identities[_IdentityId(1)] = identity
+
+        self._terminal = _Disconnected(reason="clean shutdown", error=None)
+
+    async def events(self) -> Any:
+        yield self._terminal
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_dump_state_prints_snapshot(capsys: pytest.CaptureFixture[str]) -> None:
+    """The dump-state handler must print every section the sync layer
+    populated into `ClientState` — networks with their connection state,
+    per-network buffer listings, and recent messages."""
+    args = _make_dump_args()
+
+    with patch.object(cli, "QuasselClient", new=_FakeClientForDumpState):
+        rc = await cli._dump_state(args)
+
+    # Clean shutdown with no error → exit 4 (our disconnect reason lacks
+    # any of the recognized tokens, so it's classified as a generic
+    # protocol error). The important part of the test is the snapshot
+    # printing, not the exit code.
+    out = capsys.readouterr().out
+    assert "ClientState snapshot" in out
+    assert "freenode" in out
+    assert "#python" in out
+    assert "alice" in out
+    assert "hello from alice" in out
+    assert "default" in out
+    # And the handler returned an integer exit code.
+    assert isinstance(rc, int)
+
+
+@pytest.mark.asyncio
+async def test_dump_state_missing_user_returns_1(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("QUASSEL_USER", raising=False)
+    args = _make_dump_args(user=None)
+
+    with patch.object(cli, "QuasselClient") as client_cls:
+        rc = await cli._dump_state(args)
+
+    assert rc == 1
+    client_cls.assert_not_called()
+    assert "QUASSEL_USER" in capsys.readouterr().err

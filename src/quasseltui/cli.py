@@ -529,6 +529,13 @@ async def _stream_only(args: argparse.Namespace) -> int:
             _print_stream_event(event, verbose=args.verbose)
             if isinstance(event, Disconnected):
                 return _stream_disconnect_exit_code(event)
+            # SessionReady is the handshake banner, not one of the
+            # streamed SignalProxy events that --max-events bounds. With
+            # `--max-events=1` the user expects to see exactly one
+            # connected-state event, not to exit immediately after the
+            # banner prints.
+            if isinstance(event, SessionReady):
+                continue
             event_count += 1
             if max_events is not None and event_count >= max_events:
                 print(f"[max-events={max_events} reached, stopping]")

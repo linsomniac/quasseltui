@@ -416,6 +416,62 @@ class TestConnectedLoop:
         assert isinstance(events[3], Disconnected)
 
     @pytest.mark.asyncio
+    async def test_heartbeat_reply_failure_yields_disconnected(
+        self,
+        patched_transport,
+    ) -> None:
+        """Regression for a codex finding: if the HeartBeatReply write
+        fails (e.g. broken pipe), the connection MUST tear down and
+        yield a terminal Disconnected rather than swallow the error and
+        return a healthy HeartBeatEvent. A caller seeing a HeartBeatEvent
+        should be able to trust that the socket is still alive.
+        """
+        features = frozenset({FEATURE_LONG_TIME, FEATURE_RICH_MESSAGES})
+        ts = dt.datetime(2026, 4, 14, 12, 34, 56, tzinfo=dt.UTC)
+        inbound = _build_inbound(
+            init_ack=_base_init_ack(),
+            login_ack=_base_login_ack(),
+            session_init=_base_session_init(),
+            signalproxy_frames=[_framed_signalproxy(HeartBeat(timestamp=ts), features)],
+        )
+        patched_transport(inbound, tls_offered=False, tls_enabled=False)
+
+        conn = QuasselConnection(
+            host="core",
+            port=4242,
+            user="u",
+            password="p",
+            tls=False,
+        )
+
+        # Patch the writer to blow up on the HeartBeatReply write. The
+        # first two writes (ClientInit + ClientLogin) must go through
+        # so the handshake finishes; only the third (HeartBeatReply)
+        # fails, simulating a peer that closes the socket mid-session.
+        original_send = conn._send_signalproxy
+        send_calls = 0
+
+        async def flaky_send(message):  # type: ignore[no-untyped-def]
+            nonlocal send_calls
+            send_calls += 1
+            if send_calls == 1:
+                raise OSError("broken pipe")
+            return await original_send(message)
+
+        conn._send_signalproxy = flaky_send  # type: ignore[method-assign]
+
+        events = [e async for e in conn.events()]
+        # No HeartBeatEvent should be yielded — the loop must tear down
+        # before returning a "healthy" event.
+        assert not any(isinstance(e, HeartBeatEvent) for e in events)
+        # The last event is a Disconnected carrying the OSError.
+        last = events[-1]
+        assert isinstance(last, Disconnected)
+        assert isinstance(last.error, OSError)
+        assert "broken pipe" in last.reason
+        assert conn.state is ConnState.CLOSED
+
+    @pytest.mark.asyncio
     async def test_events_can_only_be_iterated_once(self, patched_transport) -> None:
         inbound = _build_inbound(
             init_ack=_base_init_ack(),

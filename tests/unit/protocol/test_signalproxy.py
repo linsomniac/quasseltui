@@ -246,6 +246,31 @@ class TestErrorPaths:
         with pytest.raises(SignalProxyError, match="InitRequest"):
             decode_signalproxy_payload(writer.to_bytes())
 
+    def test_trailing_garbage_after_valid_payload_raises(self) -> None:
+        """The decoder must reject bytes trailing the top-level QVariantList.
+
+        Framing keeps the next frame in sync so we wouldn't desynchronize
+        the whole stream, but trailing bytes mean the core sent something
+        we don't understand — and silently dropping the tail would hide
+        payload corruption. This is a regression test for a codex review
+        finding.
+        """
+        valid = encode_signalproxy_payload(
+            RpcCall(signal_name=b"test", params=[42]),
+        )
+        with pytest.raises(SignalProxyError, match="trailing"):
+            decode_signalproxy_payload(valid + b"JUNK")
+
+    def test_single_trailing_byte_after_valid_payload_raises(self) -> None:
+        """Even a single stray byte is rejected — a real Quassel core
+        never produces malformed payloads, so a lone trailing byte means
+        either a bug in our codec or a tampered frame."""
+        valid = encode_signalproxy_payload(
+            HeartBeat(timestamp=dt.datetime(2026, 4, 14, tzinfo=dt.UTC)),
+        )
+        with pytest.raises(SignalProxyError, match="trailing"):
+            decode_signalproxy_payload(valid + b"\x00")
+
 
 class TestSyncByteLayout:
     """A tight pin on a known Sync message: every byte of a

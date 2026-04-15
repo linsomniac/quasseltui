@@ -165,9 +165,20 @@ def decode_signalproxy_payload(
     QVariantList with no length prefix. `peer_features` is the negotiated
     feature set, which the Message user-type codec needs to know how to
     parse trailing fields.
+
+    The reader must be fully consumed by the time we return. Trailing bytes
+    after the top-level QVariantList are a protocol error — framing keeps
+    the next message in sync regardless, so we wouldn't desynchronize the
+    whole stream, but "extra bytes after a decoded payload" still means the
+    core sent something we don't understand and we'd rather fail loudly
+    than silently drop the tail.
     """
     reader = QDataStreamReader(payload, peer_features=peer_features)
     items = read_qvariantlist(reader)
+    if not reader.at_end():
+        raise SignalProxyError(
+            f"trailing {reader.remaining()} bytes after SignalProxy QVariantList"
+        )
     if not items:
         raise SignalProxyError("empty SignalProxy frame (zero-element QVariantList)")
 

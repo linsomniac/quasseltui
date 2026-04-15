@@ -433,7 +433,21 @@ class QuasselConnection:
                 await self._cleanup()
                 return
 
-            event = await self._handle_signalproxy(message)
+            # _handle_signalproxy may perform a write (HeartBeatReply).
+            # A write failure there means the socket is dead — tear down
+            # instead of swallowing the error and yielding a "healthy"
+            # event to the consumer. This mirrors the frame-read error
+            # handling above and satisfies the module's "on any error,
+            # yield terminal Disconnected" contract.
+            try:
+                event = await self._handle_signalproxy(message)
+            except (OSError, QuasselError) as exc:
+                yield Disconnected(
+                    reason=f"failed to process frame: {exc}",
+                    error=exc,
+                )
+                await self._cleanup()
+                return
             if event is not None:
                 yield event
 
@@ -447,12 +461,15 @@ class QuasselConnection:
         reply timing isn't gated on how fast the consumer iterates. Returns
         `None` for messages we consume internally (today: only HeartBeatReply,
         which we send and don't expect to receive).
+
+        Write failures from the HeartBeat reply path are NOT caught here —
+        they propagate to `_connected_loop` which converts them into a
+        terminal `Disconnected` event. Swallowing a broken pipe here would
+        mask a dead socket from the consumer (they'd see a healthy
+        `HeartBeatEvent` while the connection was actually gone).
         """
         if isinstance(message, HeartBeat):
-            try:
-                await self._send_signalproxy(HeartBeatReply(timestamp=message.timestamp))
-            except (OSError, QuasselError) as exc:
-                _log.warning("failed to send HeartBeatReply: %s", exc)
+            await self._send_signalproxy(HeartBeatReply(timestamp=message.timestamp))
             return HeartBeatEvent(message=message)
         if isinstance(message, HeartBeatReply):
             # We never *send* HeartBeats from the client side, so a

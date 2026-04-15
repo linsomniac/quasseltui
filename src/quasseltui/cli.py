@@ -292,8 +292,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.mode == "ui":
         return _ui(args)
 
-    print(f"quasseltui {__version__} — under construction")
-    return 0
+    parser.print_help(sys.stderr)
+    return 2
 
 
 def _ui_demo(_args: argparse.Namespace) -> int:

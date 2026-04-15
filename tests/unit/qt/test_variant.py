@@ -127,3 +127,119 @@ class TestQVariantMap:
         reader = QDataStreamReader(writer.to_bytes())
         assert read_qvariantmap(reader) == original
         assert reader.at_end()
+
+
+class TestTypedNullVariants:
+    """Qt's QVariant::save always writes the typed payload after the null flag,
+    even when is_null is set. If our decoder stops at the null flag, the next
+    field reads garbage. These tests pin the consume-payload behavior.
+    """
+
+    def test_typed_null_qstring_followed_by_int(self) -> None:
+        # Hand-built bytes:
+        #   QVariant<QString>(null) = type=10, is_null=1, payload=0xFFFFFFFF
+        #   QVariant<Int>(7)        = type=2,  is_null=0, payload=0x00000007
+        blob = (
+            b"\x00\x00\x00\x0a\x01\xff\xff\xff\xff"  # null QString variant
+            b"\x00\x00\x00\x02\x00\x00\x00\x00\x07"  # Int(7) variant
+        )
+        reader = QDataStreamReader(blob)
+        first = read_variant(reader)
+        second = read_variant(reader)
+        assert first is None
+        assert second == 7
+        assert reader.at_end()
+
+    def test_typed_null_int_followed_by_qstring(self) -> None:
+        # A null Int still has a 4-byte payload (the default-constructed value).
+        # The reader must consume it before moving on.
+        blob = (
+            b"\x00\x00\x00\x02\x01\x00\x00\x00\x00"  # null Int variant
+            b"\x00\x00\x00\x0a\x00\x00\x00\x00\x02\x00H"  # "H" QString variant
+        )
+        reader = QDataStreamReader(blob)
+        first = read_variant(reader)
+        second = read_variant(reader)
+        assert first is None
+        assert second == "H"
+        assert reader.at_end()
+
+    def test_typed_null_qbytearray_followed_by_bool(self) -> None:
+        blob = (
+            b"\x00\x00\x00\x0c\x01\xff\xff\xff\xff"  # null QByteArray variant
+            b"\x00\x00\x00\x01\x00\x01"  # Bool(True) variant
+        )
+        reader = QDataStreamReader(blob)
+        assert read_variant(reader) is None
+        assert read_variant(reader) is True
+        assert reader.at_end()
+
+    def test_invalid_variant_has_no_payload(self) -> None:
+        # Type Invalid (0) followed by null flag, no payload.
+        blob = b"\x00\x00\x00\x00\x01" + b"\x00\x00\x00\x02\x00\x00\x00\x00\x09"
+        reader = QDataStreamReader(blob)
+        assert read_variant(reader) is None
+        assert read_variant(reader) == 9
+        assert reader.at_end()
+
+    def test_write_typed_null_rejected(self) -> None:
+        writer = QDataStreamWriter()
+        with pytest.raises(QDataStreamError, match="typed-null QVariant writes are not supported"):
+            write_variant(writer, None, type_id=QMetaType.QString)
+
+    def test_write_invalid_variant_still_works(self) -> None:
+        writer = QDataStreamWriter()
+        write_variant(writer, None)
+        assert writer.to_bytes() == b"\x00\x00\x00\x00\x01"
+
+
+class TestContainerLimits:
+    """Container counts come from the wire and must be bounded so a malformed
+    core can't ask us to allocate millions of dict slots."""
+
+    def test_qvariantlist_count_above_limit_rejected(self) -> None:
+        # count = 100, limit = 5
+        blob = b"\x00\x00\x00\x64"
+        reader = QDataStreamReader(blob, max_container_items=5)
+        with pytest.raises(QDataStreamError, match=r"QVariantList count.*exceeds"):
+            from quasseltui.qt.variant import read_qvariantlist as _read
+
+            _read(reader)
+
+    def test_qvariantmap_count_above_limit_rejected(self) -> None:
+        blob = b"\x00\x00\x00\x64"
+        reader = QDataStreamReader(blob, max_container_items=5)
+        with pytest.raises(QDataStreamError, match=r"QVariantMap count.*exceeds"):
+            from quasseltui.qt.variant import read_qvariantmap as _read
+
+            _read(reader)
+
+    def test_qstringlist_count_above_limit_rejected(self) -> None:
+        blob = b"\x00\x00\x00\x64"
+        reader = QDataStreamReader(blob, max_container_items=5)
+        with pytest.raises(QDataStreamError, match=r"QStringList count.*exceeds"):
+            from quasseltui.qt.variant import read_qstringlist as _read
+
+            _read(reader)
+
+    def test_huge_count_rejected_before_alloc(self) -> None:
+        # ~4 billion items would happily try to allocate a 4-billion-element
+        # list before failing on truncation; the limit should reject first.
+        blob = b"\xff\xff\xff\x00"  # count = 0xFFFFFF00
+        reader = QDataStreamReader(blob)  # default 1M limit
+        with pytest.raises(QDataStreamError, match="exceeds max_container_items"):
+            from quasseltui.qt.variant import read_qvariantlist as _read
+
+            _read(reader)
+
+    def test_count_at_limit_succeeds(self) -> None:
+        # Build a list of exactly the limit, then read it back.
+        items = [1, 2, 3]
+        writer = QDataStreamWriter()
+        from quasseltui.qt.variant import write_qvariantlist as _write
+
+        _write(writer, items)
+        reader = QDataStreamReader(writer.to_bytes(), max_container_items=3)
+        from quasseltui.qt.variant import read_qvariantlist as _read
+
+        assert _read(reader) == items

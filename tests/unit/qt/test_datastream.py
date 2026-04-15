@@ -147,3 +147,88 @@ class TestReaderBoundaries:
         assert reader.remaining() == 5
         assert reader.read_bytes(5) == b"extra"
         assert reader.at_end()
+
+
+class TestQStringSurrogateAndNul:
+    """Qt's QString is a sequence of 16-bit code units, not strict UTF-16 — it
+    permits lone surrogates and embedded NULs. Our codec must round-trip both."""
+
+    def test_lone_high_surrogate_roundtrip(self) -> None:
+        # U+D83D alone is a lone high surrogate (no following low surrogate).
+        text = "before\ud83dafter"
+        writer = QDataStreamWriter()
+        writer.write_qstring(text)
+        reader = QDataStreamReader(writer.to_bytes())
+        assert reader.read_qstring() == text
+        assert reader.at_end()
+
+    def test_lone_low_surrogate_roundtrip(self) -> None:
+        text = "x\udce9y"  # U+DCE9 is a lone low surrogate
+        writer = QDataStreamWriter()
+        writer.write_qstring(text)
+        reader = QDataStreamReader(writer.to_bytes())
+        assert reader.read_qstring() == text
+
+    def test_embedded_nul_roundtrip(self) -> None:
+        text = "abc\x00def\x00\x00ghi"
+        writer = QDataStreamWriter()
+        writer.write_qstring(text)
+        encoded = writer.to_bytes()
+        # Length prefix should be 24 (12 BMP code units, 2 bytes each).
+        assert encoded[:4] == b"\x00\x00\x00\x18"
+        reader = QDataStreamReader(encoded)
+        assert reader.read_qstring() == text
+
+
+class TestLengthLimits:
+    """Bound attacker-controlled length prefixes so a malformed core can't ask
+    us to allocate gigabytes of memory."""
+
+    def test_qstring_length_above_limit_rejected(self) -> None:
+        # Length prefix says 1024 bytes, but the limit is 100.
+        bad = b"\x00\x00\x04\x00" + b"\x00" * 1024
+        reader = QDataStreamReader(bad, max_string_bytes=100)
+        with pytest.raises(QDataStreamError, match="exceeds max_string_bytes"):
+            reader.read_qstring()
+
+    def test_qstring_length_at_limit_succeeds(self) -> None:
+        # Exactly at the limit is fine.
+        text = "ab"  # 4 bytes
+        writer = QDataStreamWriter()
+        writer.write_qstring(text)
+        reader = QDataStreamReader(writer.to_bytes(), max_string_bytes=4)
+        assert reader.read_qstring() == text
+
+    def test_qstring_huge_length_rejected_before_alloc(self) -> None:
+        # 0x7fffffff (~2GB) length prefix in a tiny buffer — without the limit
+        # the decoder would call read_bytes(2GB) and only THEN notice it's
+        # truncated, but with the limit we reject before even calling
+        # read_bytes. Verify the error message names the limit, not truncation.
+        bad = b"\x7f\xff\xff\xfe"  # length = 2147483646 (even, so passes parity)
+        reader = QDataStreamReader(bad)  # default 16 MB limit
+        with pytest.raises(QDataStreamError, match="exceeds max_string_bytes"):
+            reader.read_qstring()
+
+    def test_qbytearray_length_above_limit_rejected(self) -> None:
+        bad = b"\x00\x00\x04\x00" + b"\x00" * 1024
+        reader = QDataStreamReader(bad, max_bytearray_bytes=100)
+        with pytest.raises(QDataStreamError, match="exceeds max_bytearray_bytes"):
+            reader.read_qbytearray()
+
+    def test_qbytearray_length_at_limit_succeeds(self) -> None:
+        payload = b"\x01\x02\x03\x04"
+        writer = QDataStreamWriter()
+        writer.write_qbytearray(payload)
+        reader = QDataStreamReader(writer.to_bytes(), max_bytearray_bytes=4)
+        assert reader.read_qbytearray() == payload
+
+    def test_truncated_qstring_payload_raises(self) -> None:
+        # Length prefix says 10 bytes but only 4 are available.
+        bad = b"\x00\x00\x00\x0a\x00H\x00e"
+        with pytest.raises(QDataStreamError, match="truncated"):
+            QDataStreamReader(bad).read_qstring()
+
+    def test_truncated_qbytearray_payload_raises(self) -> None:
+        bad = b"\x00\x00\x00\x10ab"  # says 16 bytes, only 2 available
+        with pytest.raises(QDataStreamError, match="truncated"):
+            QDataStreamReader(bad).read_qbytearray()

@@ -32,8 +32,16 @@ QVariantList = list[Any]
 # ---------------------------------------------------------------------------
 
 
+def _check_count(reader: QDataStreamReader, count: int, kind: str) -> None:
+    if count > reader.max_container_items:
+        raise QDataStreamError(
+            f"{kind} count {count} exceeds max_container_items {reader.max_container_items}"
+        )
+
+
 def read_qvariantlist(reader: QDataStreamReader) -> QVariantList:
     count = reader.read_uint32()
+    _check_count(reader, count, "QVariantList")
     return [read_variant(reader) for _ in range(count)]
 
 
@@ -45,6 +53,7 @@ def write_qvariantlist(writer: QDataStreamWriter, value: Sequence[Any]) -> None:
 
 def read_qvariantmap(reader: QDataStreamReader) -> QVariantMap:
     count = reader.read_uint32()
+    _check_count(reader, count, "QVariantMap")
     out: QVariantMap = {}
     for _ in range(count):
         key = reader.read_qstring()
@@ -63,6 +72,7 @@ def write_qvariantmap(writer: QDataStreamWriter, value: Mapping[str, Any]) -> No
 
 def read_qstringlist(reader: QDataStreamReader) -> list[str]:
     count = reader.read_uint32()
+    _check_count(reader, count, "QStringList")
     out: list[str] = []
     for _ in range(count):
         s = reader.read_qstring()
@@ -203,19 +213,27 @@ def register_type(
 
 
 def read_variant(reader: QDataStreamReader) -> Any:
-    """Decode a single QVariant envelope from the stream."""
+    """Decode a single QVariant envelope from the stream.
+
+    Qt's `QVariant::save` always writes the typed payload after the null flag,
+    even when `is_null` is set. We must mirror that — if we skipped the payload
+    on a typed-null variant we'd desynchronize the entire surrounding stream.
+    The payload is read and then the value is collapsed to `None` for the
+    caller.
+    """
     type_id = reader.read_uint32()
     is_null = reader.read_uint8()
     if type_id == QMetaType.Invalid:
-        return None
-    if is_null:
         return None
     fn = _READERS.get(type_id)
     if fn is None:
         raise QDataStreamError(
             f"unsupported QVariant type id {type_id} at offset {reader.position}"
         )
-    return fn(reader)
+    value = fn(reader)
+    if is_null:
+        return None
+    return value
 
 
 def write_variant(
@@ -229,19 +247,29 @@ def write_variant(
     explicit form when you need to force a particular wire type (e.g., serialize
     a Python `int` as a `QMetaType.UInt` or `LongLong` rather than the default
     `Int`).
+
+    Passing `value=None` with no `type_id` produces an Invalid variant. Passing
+    `value=None` with a `type_id` is rejected: writing a typed-null QVariant
+    would require synthesizing a default payload for the type, which we don't
+    need yet and which would silently produce wire bytes for a value Quassel
+    cannot distinguish from a real one. Callers that need this should add a
+    typed-null sentinel and explicit handling at that point.
     """
     if value is None and type_id is None:
         writer.write_uint32(QMetaType.Invalid)
         writer.write_uint8(1)
         return
 
+    if value is None:
+        raise QDataStreamError(
+            f"typed-null QVariant writes are not supported (type_id={type_id}); "
+            "use write_variant(writer, None) for an Invalid variant or pass a real value"
+        )
+
     if type_id is None:
         type_id = _infer_type_id(value)
 
     writer.write_uint32(type_id)
-    if value is None:
-        writer.write_uint8(1)
-        return
     writer.write_uint8(0)
 
     fn = _WRITERS.get(type_id)

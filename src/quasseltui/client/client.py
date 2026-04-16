@@ -228,7 +228,6 @@ class QuasselClient:
         """
         if buffer_id in self.state.backlog_requested:
             return
-        self.state.backlog_requested.add(buffer_id)
         sync = SyncMessage(
             class_name=b"BacklogManager",
             object_name="",
@@ -239,6 +238,7 @@ class QuasselClient:
             await self._connection.send(sync)
         except (OSError, ssl.SSLError) as exc:
             raise QuasselError(f"failed to request backlog: {exc}") from exc
+        self.state.backlog_requested.add(buffer_id)
 
     async def close(self) -> None:
         """Idempotent shutdown. Safe to call in a ``finally`` block."""

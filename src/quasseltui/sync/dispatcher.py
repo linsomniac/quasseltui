@@ -413,25 +413,40 @@ class Dispatcher:
         Called after the BacklogManager's `receiveBacklog` slot has
         stashed the raw Messages on `mgr.last_received`. We convert
         each to `IrcMessage`, deduplicate by `msg_id` against the
-        existing list, sort by `msg_id`, and emit `BacklogReceived`.
+        existing list *and* within the batch, sort by `msg_id`, and
+        emit `BacklogReceived`.
+
+        Uses the slot's authoritative `buffer_id` rather than trusting
+        payload contents. Messages whose `buffer_info.buffer_id`
+        doesn't match the slot's are dropped. If the target buffer has
+        been removed (no longer in `state.buffers`), the entire reply
+        is silently discarded — a late backlog reply must not resurrect
+        a buffer that the core already told us to remove.
         """
         raw_messages = mgr.last_received
         mgr.last_received = []
-        if not raw_messages:
+        # AIDEV-NOTE: buffer_id comes from the slot param, not from
+        # the payload messages — prevents a hostile/buggy core from
+        # corrupting per-buffer history by mixing buffer_ids.
+        buffer_id = BufferId(int(mgr.last_buffer_id)) if mgr.last_buffer_id is not None else None
+        mgr.last_buffer_id = None
+        if not raw_messages or buffer_id is None:
             return
-        first_raw = raw_messages[0]
-        buffer_id = first_raw.buffer_info.buffer_id
+        if buffer_id not in self._state.buffers:
+            _log.debug("dropping backlog for removed buffer %d", int(buffer_id))
+            return
         existing = self._state.messages.setdefault(buffer_id, [])
-        existing_ids = {m.msg_id for m in existing}
+        seen_ids = {m.msg_id for m in existing}
         new_messages: list[IrcMessage] = []
         for raw in raw_messages:
-            bid = raw.buffer_info.buffer_id
-            self._state.buffers.setdefault(bid, raw.buffer_info)
-            if raw.msg_id in existing_ids:
+            if raw.buffer_info.buffer_id != buffer_id:
                 continue
+            if raw.msg_id in seen_ids:
+                continue
+            seen_ids.add(raw.msg_id)
             narrow = IrcMessage(
                 msg_id=raw.msg_id,
-                buffer_id=bid,
+                buffer_id=buffer_id,
                 network_id=raw.buffer_info.network_id,
                 timestamp=raw.timestamp,
                 type=raw.type,

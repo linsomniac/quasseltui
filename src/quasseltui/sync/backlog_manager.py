@@ -32,6 +32,9 @@ class BacklogManager(SyncObject):
     def __init__(self, object_name: str = "") -> None:
         super().__init__(object_name)
         self.last_received: list[Message] = []
+        # AIDEV-NOTE: Authoritative buffer_id from the slot params, not
+        # from the payload messages. Used by _merge_backlog to validate.
+        self.last_buffer_id: Any = None
 
     # AIDEV-NOTE: The core sends receiveBacklog as a Sync message with
     # 6 params: (BufferId, MsgId first, MsgId last, int limit,
@@ -56,6 +59,7 @@ class BacklogManager(SyncObject):
                 type(messages).__name__,
             )
             return
+        self.last_buffer_id = buffer_id
         self.last_received = [m for m in messages if isinstance(m, Message)]
         _log.debug(
             "receiveBacklog for buffer %s: %d messages",

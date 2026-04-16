@@ -39,6 +39,7 @@ from quasseltui.protocol.usertypes import (
 from quasseltui.sync.buffer_syncer import BufferSyncer
 from quasseltui.sync.dispatcher import DISPLAY_MSG_SIGNAL, Dispatcher
 from quasseltui.sync.events import (
+    BacklogReceived,
     BufferAdded,
     BufferRemoved,
     BufferRenamed,
@@ -398,3 +399,136 @@ class TestBufferRemoval:
         # Every message still emitted a MessageReceived event — the cap
         # is purely a retention limit, not a delivery filter.
         assert len([e for e in events if isinstance(e, MessageReceived)]) == 5
+
+
+def _make_message(
+    msg_id: int,
+    buf: BufferInfo,
+    contents: str = "hello",
+) -> Message:
+    return Message(
+        msg_id=MsgId(msg_id),
+        timestamp=dt.datetime(2026, 4, 14, 12, 0, 0, tzinfo=dt.UTC),
+        type=MessageType.Plain,
+        flags=MessageFlag.NONE,
+        buffer_info=buf,
+        sender="nick",
+        sender_prefixes="",
+        real_name="",
+        avatar_url="",
+        contents=contents,
+        peer_features=frozenset({"LongTime"}),
+    )
+
+
+class TestMergeBacklog:
+    def _seed_with_buffer(
+        self,
+    ) -> tuple[ClientState, Dispatcher, list[ClientEvent], BufferInfo]:
+        state, dispatcher, events = _make_state_and_dispatcher()
+        buf = _buffer(10, 1, "#python")
+        dispatcher.seed_from_session(
+            _session(network_ids=[1], buffer_infos=[buf]),
+            frozenset({"LongTime"}),
+        )
+        events.clear()
+        return state, dispatcher, events, buf
+
+    def test_basic_backlog_merge(self) -> None:
+        state, dispatcher, events, buf = self._seed_with_buffer()
+        msgs = [_make_message(i, buf, f"line {i}") for i in range(1, 4)]
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"BacklogManager",
+                object_name="",
+                slot_name=b"receiveBacklog",
+                params=[BufferId(10), MsgId(-1), MsgId(-1), 100, 0, msgs],
+            )
+        )
+        assert len(state.messages[BufferId(10)]) == 3
+        bl = [e for e in events if isinstance(e, BacklogReceived)]
+        assert len(bl) == 1
+        assert bl[0].buffer_id == BufferId(10)
+        assert bl[0].count == 3
+
+    def test_backlog_for_removed_buffer_is_dropped(self) -> None:
+        """Late backlog reply for a buffer that was removed must not
+        resurrect the buffer in state."""
+        state, dispatcher, events, buf = self._seed_with_buffer()
+        # Remove the buffer via BufferSyncer
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"BufferSyncer",
+                object_name="",
+                slot_name=b"removeBuffer",
+                params=[10],
+            )
+        )
+        events.clear()
+        assert BufferId(10) not in state.buffers
+
+        msgs = [_make_message(1, buf, "late backlog")]
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"BacklogManager",
+                object_name="",
+                slot_name=b"receiveBacklog",
+                params=[BufferId(10), MsgId(-1), MsgId(-1), 100, 0, msgs],
+            )
+        )
+        assert BufferId(10) not in state.buffers
+        assert BufferId(10) not in state.messages
+        bl = [e for e in events if isinstance(e, BacklogReceived)]
+        assert len(bl) == 0
+
+    def test_backlog_dedupes_against_existing_and_within_batch(self) -> None:
+        """Messages already in state and duplicates within the backlog
+        batch itself must not create double entries."""
+        state, dispatcher, events, buf = self._seed_with_buffer()
+        # Pre-populate with msg_id=2
+        existing_msg = _make_message(2, buf, "existing")
+        dispatcher.handle_rpc(RpcCall(signal_name=DISPLAY_MSG_SIGNAL, params=[existing_msg]))
+        events.clear()
+        assert len(state.messages[BufferId(10)]) == 1
+
+        # Backlog: msg_id=1 (new), msg_id=2 (dup of existing),
+        # msg_id=3 (new), msg_id=3 (dup within batch)
+        batch = [
+            _make_message(1, buf, "backlog 1"),
+            _make_message(2, buf, "dup of existing"),
+            _make_message(3, buf, "backlog 3"),
+            _make_message(3, buf, "dup within batch"),
+        ]
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"BacklogManager",
+                object_name="",
+                slot_name=b"receiveBacklog",
+                params=[BufferId(10), MsgId(-1), MsgId(-1), 100, 0, batch],
+            )
+        )
+        msgs = state.messages[BufferId(10)]
+        assert len(msgs) == 3
+        assert [m.contents for m in msgs] == ["backlog 1", "existing", "backlog 3"]
+
+    def test_backlog_mixed_buffer_ids_are_filtered(self) -> None:
+        """Messages whose buffer_id doesn't match the slot's authoritative
+        buffer_id must be silently dropped."""
+        state, dispatcher, _events, buf = self._seed_with_buffer()
+        other_buf = _buffer(99, 1, "#other")
+        batch = [
+            _make_message(1, buf, "correct buffer"),
+            _make_message(2, other_buf, "wrong buffer"),
+            _make_message(3, buf, "also correct"),
+        ]
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"BacklogManager",
+                object_name="",
+                slot_name=b"receiveBacklog",
+                params=[BufferId(10), MsgId(-1), MsgId(-1), 100, 0, batch],
+            )
+        )
+        msgs = state.messages[BufferId(10)]
+        assert len(msgs) == 2
+        assert [m.contents for m in msgs] == ["correct buffer", "also correct"]

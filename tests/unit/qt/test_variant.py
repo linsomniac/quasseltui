@@ -473,3 +473,98 @@ class TestUserTypeAutoRouting:
         decoded = read_variant(reader)
         assert reader.at_end()
         assert decoded == bid
+
+
+class TestLegacyCoreCompat:
+    """Pin the protocol compatibility fixes introduced for older Quassel
+    cores — null QStrings in QStringLists, is_null on container variants,
+    and UShort support.
+    """
+
+    def test_null_qstring_in_qstringlist_coerced_to_empty(self) -> None:
+        """Some cores send null QStrings inside QStringLists (e.g. in
+        Network InitData). We must coerce to '' instead of raising."""
+        from quasseltui.qt.variant import read_qstringlist
+
+        writer = QDataStreamWriter()
+        writer.write_uint32(3)  # count = 3
+        writer.write_qstring("hello")
+        writer.write_qstring(None)  # null element
+        writer.write_qstring("world")
+        reader = QDataStreamReader(writer.to_bytes())
+        result = read_qstringlist(reader)
+        assert result == ["hello", "", "world"]
+        assert reader.at_end()
+
+    def test_null_qvariantlist_variant_preserves_content(self) -> None:
+        """Some cores set is_null=1 on QVariantList variants that contain
+        valid data (e.g. backlog message lists). The content must not be
+        discarded."""
+        writer = QDataStreamWriter()
+        # Build a QVariant<QVariantList> with is_null=1 but valid payload
+        writer.write_uint32(QMetaType.QVariantList)  # type
+        writer.write_uint8(1)  # is_null = TRUE
+        # Payload: a QVariantList with one Int element
+        writer.write_uint32(1)  # count = 1
+        write_variant(writer, 42, type_id=QMetaType.Int)
+
+        reader = QDataStreamReader(writer.to_bytes())
+        result = read_variant(reader)
+        assert result == [42]
+        assert reader.at_end()
+
+    def test_null_qvariantmap_variant_preserves_content(self) -> None:
+        """Same as above but for QVariantMap."""
+        writer = QDataStreamWriter()
+        writer.write_uint32(QMetaType.QVariantMap)
+        writer.write_uint8(1)  # is_null = TRUE
+        writer.write_uint32(1)  # count = 1
+        writer.write_qstring("key")
+        write_variant(writer, "val")
+
+        reader = QDataStreamReader(writer.to_bytes())
+        result = read_variant(reader)
+        assert result == {"key": "val"}
+        assert reader.at_end()
+
+    def test_scalar_null_still_returns_none(self) -> None:
+        """is_null on scalar types should still return None (regression
+        guard against the container-null fix being too broad)."""
+        writer = QDataStreamWriter()
+        writer.write_uint32(QMetaType.Int)  # type
+        writer.write_uint8(1)  # is_null = TRUE
+        writer.write_int32(0)  # payload
+
+        reader = QDataStreamReader(writer.to_bytes())
+        assert read_variant(reader) is None
+
+    def test_ushort_round_trip(self) -> None:
+        """UShort (type 133) is used by some cores in Network InitData."""
+        writer = QDataStreamWriter()
+        write_variant(writer, 443, type_id=QMetaType.UShort)
+        reader = QDataStreamReader(writer.to_bytes())
+        result = read_variant(reader)
+        assert result == 443
+        assert reader.at_end()
+
+    def test_ushort_wire_type_id_is_133(self) -> None:
+        writer = QDataStreamWriter()
+        write_variant(writer, 0, type_id=QMetaType.UShort)
+        blob = writer.to_bytes()
+        assert blob[:4] == b"\x00\x00\x00\x85"  # 133
+
+
+class TestNetworkServerUserType:
+    """Network::Server is a QVariantMap-based user type that older cores
+    include in Network InitData."""
+
+    def test_network_server_round_trip(self) -> None:
+        from quasseltui.protocol import usertypes as _usertypes  # noqa: F401
+
+        server = {"Host": "irc.example.com", "Port": 6697, "UseSSL": True}
+        writer = QDataStreamWriter()
+        write_variant(writer, server, user_type_name=b"Network::Server")
+        reader = QDataStreamReader(writer.to_bytes())
+        decoded = read_variant(reader)
+        assert decoded == server
+        assert reader.at_end()

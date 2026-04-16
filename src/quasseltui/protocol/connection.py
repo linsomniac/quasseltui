@@ -51,6 +51,7 @@ from quasseltui.protocol.enums import (
     bitmask_to_features,
     features_to_bitmask,
 )
+from quasseltui.qt.datastream import QDataStreamError
 from quasseltui.protocol.errors import (
     AuthError,
     HandshakeError,
@@ -382,23 +383,34 @@ class QuasselConnection:
         if not ack_msg.configured:
             raise HandshakeError("core is not configured (run quasselcore --setup first)")
 
-        # AIDEV-NOTE: Quassel feature negotiation is NOT a simple
-        # intersection. The core checks our FeatureList to decide what
-        # wire format to use (e.g. int64 timestamps if we advertise
-        # LongTime). A core with ExtendedFeatures (bit 15) processes
-        # our full FeatureList and enables any feature it also supports
-        # internally — even if it returns an empty FeatureList itself.
-        # So when the core has ExtendedFeatures, we must assume ALL
-        # our offered features are active, or we'll misread the wire.
-        if ack_msg.core_features & LEGACY_EXTENDED_FEATURES:
+        # AIDEV-NOTE: Quassel feature negotiation has three tiers:
+        #
+        # 1. Core returns a non-empty FeatureList → normal string
+        #    intersection (modern cores).
+        # 2. Core has ExtendedFeatures bit but empty FeatureList →
+        #    the core processes our FeatureList and enables what it
+        #    supports internally, but doesn't echo its own list back.
+        #    We must assume all our offered features are active, or
+        #    we'll misread the wire (e.g. int64 timestamps).
+        # 3. Truly legacy core (no ExtendedFeatures) → only binary
+        #    bitmask negotiation.
+        string_features = frozenset(self._offered_features) & frozenset(ack_msg.feature_list)
+        binary_features = frozenset(self._offered_features) & bitmask_to_features(
+            ack_msg.core_features
+        )
+        if ack_msg.feature_list:
+            # Tier 1: core advertises string features — trust the
+            # intersection, supplemented by any binary-only features.
+            self._peer_features = string_features | binary_features
+        elif ack_msg.core_features & LEGACY_EXTENDED_FEATURES:
+            # Tier 2: core understands string features but returned an
+            # empty list — it will honour our FeatureList for any
+            # feature it was compiled with. Assume all offered are
+            # active (safe because we only offer what we can decode).
             self._peer_features = frozenset(self._offered_features)
         else:
-            # Truly legacy core — only binary bitmask negotiation.
-            string_features = frozenset(self._offered_features) & frozenset(ack_msg.feature_list)
-            binary_features = frozenset(self._offered_features) & bitmask_to_features(
-                ack_msg.core_features
-            )
-            self._peer_features = string_features | binary_features
+            # Tier 3: purely binary negotiation.
+            self._peer_features = binary_features
 
         # ---- ClientLogin ----
         self._state = ConnState.HANDSHAKE_LOGIN
@@ -448,10 +460,10 @@ class QuasselConnection:
                 yield Disconnected(reason=f"signalproxy decode failed: {exc}", error=exc)
                 await self._cleanup()
                 return
-            except (QuasselError, ValueError) as exc:
-                # ValueError covers QDataStreamError (e.g. unsupported
-                # user types like Network::Server on older cores). Like
-                # SignalProxyError these desynchronize the frame stream.
+            except (QuasselError, QDataStreamError) as exc:
+                # QDataStreamError covers unsupported user types or
+                # type IDs from older cores. Like SignalProxyError
+                # these desynchronize the frame stream.
                 yield Disconnected(reason=f"signalproxy decode failed: {exc}", error=exc)
                 await self._cleanup()
                 return

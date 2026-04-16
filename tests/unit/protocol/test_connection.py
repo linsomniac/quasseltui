@@ -25,7 +25,13 @@ from quasseltui.protocol.connection import (
     SessionReady,
     SyncEvent,
 )
-from quasseltui.protocol.enums import FEATURE_LONG_TIME, FEATURE_RICH_MESSAGES
+from quasseltui.protocol.enums import (
+    FEATURE_LONG_TIME,
+    FEATURE_RICH_MESSAGES,
+    FEATURE_SENDER_PREFIXES,
+    LEGACY_EXTENDED_FEATURES,
+    LEGACY_SENDER_PREFIXES,
+)
 from quasseltui.protocol.framing import encode_frame
 from quasseltui.protocol.handshake import encode_handshake_payload
 from quasseltui.protocol.messages import (
@@ -262,6 +268,72 @@ class TestHandshakeSuccess:
         ready = events[0]
         assert isinstance(ready, SessionReady)
         assert ready.peer_features == frozenset({FEATURE_LONG_TIME})
+
+    @pytest.mark.asyncio
+    async def test_tier1_string_features_with_binary_supplement(self, patched_transport) -> None:
+        """Tier 1: core has a non-empty FeatureList → string intersection,
+        supplemented by binary-only features."""
+        ack = _base_init_ack()
+        ack["FeatureList"] = [FEATURE_LONG_TIME]
+        ack["CoreFeatures"] = LEGACY_SENDER_PREFIXES  # SenderPrefixes via binary only
+        inbound = _build_inbound(
+            init_ack=ack,
+            login_ack=_base_login_ack(),
+            session_init=_base_session_init(),
+        )
+        patched_transport(inbound, tls_offered=False, tls_enabled=False)
+
+        conn = QuasselConnection(host="core", port=4242, user="u", password="p", tls=False)
+        events = [e async for e in conn.events()]
+        ready = events[0]
+        assert isinstance(ready, SessionReady)
+        assert FEATURE_LONG_TIME in ready.peer_features
+        assert FEATURE_SENDER_PREFIXES in ready.peer_features
+
+    @pytest.mark.asyncio
+    async def test_tier2_extended_features_empty_list(self, patched_transport) -> None:
+        """Tier 2: core has ExtendedFeatures bit but empty FeatureList →
+        assume all our offered features are active."""
+        ack = _base_init_ack()
+        ack["FeatureList"] = []
+        ack["CoreFeatures"] = LEGACY_EXTENDED_FEATURES | LEGACY_SENDER_PREFIXES
+        inbound = _build_inbound(
+            init_ack=ack,
+            login_ack=_base_login_ack(),
+            session_init=_base_session_init(),
+        )
+        patched_transport(inbound, tls_offered=False, tls_enabled=False)
+
+        conn = QuasselConnection(host="core", port=4242, user="u", password="p", tls=False)
+        events = [e async for e in conn.events()]
+        ready = events[0]
+        assert isinstance(ready, SessionReady)
+        # All DEFAULT_CLIENT_FEATURES should be active
+        assert FEATURE_LONG_TIME in ready.peer_features
+        assert FEATURE_SENDER_PREFIXES in ready.peer_features
+        assert FEATURE_RICH_MESSAGES in ready.peer_features
+
+    @pytest.mark.asyncio
+    async def test_tier3_legacy_binary_only(self, patched_transport) -> None:
+        """Tier 3: no ExtendedFeatures, no FeatureList → binary bitmask
+        only."""
+        ack = _base_init_ack()
+        ack["FeatureList"] = []
+        ack["CoreFeatures"] = LEGACY_SENDER_PREFIXES  # no ExtendedFeatures
+        inbound = _build_inbound(
+            init_ack=ack,
+            login_ack=_base_login_ack(),
+            session_init=_base_session_init(),
+        )
+        patched_transport(inbound, tls_offered=False, tls_enabled=False)
+
+        conn = QuasselConnection(host="core", port=4242, user="u", password="p", tls=False)
+        events = [e async for e in conn.events()]
+        ready = events[0]
+        assert isinstance(ready, SessionReady)
+        assert FEATURE_SENDER_PREFIXES in ready.peer_features
+        # LongTime has no binary bit, should NOT be in features
+        assert FEATURE_LONG_TIME not in ready.peer_features
 
 
 class TestTlsDowngrade:

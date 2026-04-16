@@ -911,6 +911,54 @@ async def test_enter_on_message_row_places_marker_in_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tabbing_to_log_auto_highlights_last_message() -> None:
+    """Focus on the log with no prior cursor must snap to the last
+    message so Enter immediately places a marker.
+
+    Without this, the user Tabs into the log, sees the focus border
+    but no row cursor, presses Enter, and `OptionList.action_select`
+    silently returns (it requires `highlighted` to be non-None). The
+    user's perception is "I pressed Enter on a blank message and
+    nothing happened"; in fact they pressed it on nothing at all.
+    """
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [
+        _irc_message(11, msg_id=1, contents="oldest"),
+        _irc_message(11, msg_id=2, contents="middle"),
+        _irc_message(11, msg_id=3, contents="newest"),
+    ]
+
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        log = app.screen.query_one(MessageLog)
+        # Before focus: no highlight (set_active_buffer on a switch
+        # resets highlighted to None).
+        assert log.highlighted is None
+
+        log.focus()
+        await pilot.pause()
+
+        # After focus: highlighted snapped to the last message.
+        assert log.highlighted == 2
+        assert log.get_option_at_index(log.highlighted).id == "msg:3"
+
+        # And pressing Enter immediately fires the marker placement.
+        await pilot.press("enter")
+        await pilot.pause()
+        assert state.read_markers.get(buf.buffer_id) == MsgId(3)
+
+
+@pytest.mark.asyncio
 async def test_placing_new_marker_replaces_previous_one() -> None:
     """A second Enter on a different row moves the marker — it never
     leaves two marker rows in the same buffer. This is the "if any

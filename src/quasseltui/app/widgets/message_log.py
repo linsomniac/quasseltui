@@ -150,6 +150,26 @@ class MessageLog(OptionList):
         if not is_refresh or was_at_tail:
             self.scroll_end(animate=False, immediate=True)
 
+    def on_focus(self) -> None:
+        """Pre-select the latest message when focus arrives with no highlight.
+
+        Without this, Tabbing into the log leaves `OptionList.highlighted`
+        at `None` — the widget shows a focus border but no cursor row,
+        and `OptionList.action_select` on Enter silently returns because
+        it requires a highlighted option. The user's perception is that
+        they pressed Enter "on a blank message" and nothing happened.
+
+        We snap to the last non-disabled option (the newest message,
+        since the marker row is disabled) so the cursor is visible as
+        soon as focus lands and Enter immediately drops a marker on
+        the most recent line. If the user has already moved the cursor
+        on a prior visit we leave it where it was — preserving their
+        navigation state across Tab-in/Tab-out cycles is the whole
+        reason we don't reset `highlighted` on blur.
+        """
+        if self.highlighted is None:
+            self.highlighted = self._last_message_index()
+
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         """Handle Enter / click on an option row.
 
@@ -192,6 +212,20 @@ class MessageLog(OptionList):
                 options.append(_marker_option())
         if options:
             self.add_options(options)
+
+    def _last_message_index(self) -> int | None:
+        """Return the index of the last selectable (message) option.
+
+        Walks from the tail so we skip the marker row in the common
+        case where it's the very last option (user previously placed
+        a marker on the most recent message). Returns `None` if there
+        are no options, or if every option is disabled — either way,
+        there is nothing meaningful to land the cursor on.
+        """
+        for i in range(self.option_count - 1, -1, -1):
+            if not self.get_option_at_index(i).disabled:
+                return i
+        return None
 
     def _current_highlighted_id(self) -> str | None:
         """Return the id of the currently highlighted option, if any.

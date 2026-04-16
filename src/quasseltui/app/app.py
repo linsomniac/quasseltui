@@ -56,6 +56,7 @@ from quasseltui.app.messages import (
     BufferListUpdated,
     BufferSelected,
     LineSubmitted,
+    MarkerToLatestRequested,
     ReadMarkerPlaced,
     SessionEnded,
 )
@@ -248,6 +249,33 @@ class QuasselApp(App[None]):
         self._state.read_markers[event.buffer_id] = event.msg_id
         if event.buffer_id == self.active_buffer_id:
             self.post_message(ActiveBufferUpdated(buffer_id=event.buffer_id))
+
+    @on(MarkerToLatestRequested)
+    def _on_marker_to_latest_requested(self, event: MarkerToLatestRequested) -> None:
+        """Drop the read marker on the newest message in the active buffer.
+
+        Fired when the user presses Enter in an empty input bar. The
+        widget doesn't know about `MsgId`s; the app resolves "latest"
+        against `state.messages[active]` here. Two silent no-op branches:
+        no active buffer (the app is still settling after startup),
+        or an empty buffer (nothing to mark — and writing an unanchored
+        marker would render as a floating separator with no message
+        above it once the first message arrives).
+
+        We reuse `ActiveBufferUpdated` for the redraw so the rebuild
+        path is the same one `_on_read_marker_placed` uses; that keeps
+        a single rebuild route that picks up `state.read_markers` and
+        is exercised by both marker-entry tests.
+        """
+        del event
+        buffer_id = self.active_buffer_id
+        if buffer_id is None:
+            return
+        messages = self._state.messages.get(buffer_id)
+        if not messages:
+            return
+        self._state.read_markers[buffer_id] = messages[-1].msg_id
+        self.post_message(ActiveBufferUpdated(buffer_id=buffer_id))
 
     @on(LineSubmitted)
     async def _on_line_submitted(self, event: LineSubmitted) -> None:

@@ -1063,3 +1063,135 @@ async def test_marker_is_per_buffer_not_global() -> None:
 
         assert state.read_markers.get(buf_a.buffer_id) == MsgId(1)
         assert buf_b.buffer_id not in state.read_markers
+
+
+@pytest.mark.asyncio
+async def test_empty_enter_in_input_bar_places_marker_at_latest_message() -> None:
+    """Pressing Enter in the InputBar with no text drops the marker at
+    the newest message in the active buffer.
+
+    Complements `test_enter_on_message_row_places_marker_in_state`:
+    that one covers the Tab-into-log path, this one covers the
+    keyboard-only user who never leaves the input. The screen's
+    `AUTO_FOCUS = "InputBar"` means an untouched app has focus on the
+    input, so pressing Enter with an empty value routes through
+    `InputBar.on_input_submitted` → `MarkerToLatestRequested` →
+    `QuasselApp._on_marker_to_latest_requested`, which writes the last
+    message's id into `state.read_markers`.
+    """
+    from quasseltui.app.widgets.input_bar import InputBar
+    from quasseltui.app.widgets.message_log import _MARKER_OPTION_ID
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [
+        _irc_message(11, msg_id=1, contents="oldest"),
+        _irc_message(11, msg_id=2, contents="middle"),
+        _irc_message(11, msg_id=3, contents="newest"),
+    ]
+
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.active_buffer_id == buf.buffer_id
+
+        input_bar = app.screen.query_one(InputBar)
+        # Sanity: focus defaults to the InputBar and its value is empty.
+        assert app.focused is input_bar
+        assert input_bar.value == ""
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert state.read_markers.get(buf.buffer_id) == MsgId(3)
+
+        log = app.screen.query_one(MessageLog)
+        ids = _option_ids(log)
+        # Three messages plus the marker row, with the marker at the
+        # tail because it anchors on the newest message.
+        assert ids == ["msg:1", "msg:2", "msg:3", _MARKER_OPTION_ID]
+
+
+@pytest.mark.asyncio
+async def test_empty_enter_with_no_messages_is_a_noop() -> None:
+    """If the active buffer has no messages, empty Enter does nothing.
+
+    There's no MsgId to anchor on, and writing a marker whose message
+    has not yet arrived would render as a floating separator with no
+    line above it once the first message lands. The handler silently
+    skips instead.
+    """
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = []
+
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        # The default-picker requires non-empty messages, so the app
+        # stays with no active buffer here — exercising the "no active
+        # buffer" branch of the handler too.
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert state.read_markers == {}
+        log = app.screen.query_one(MessageLog)
+        assert log.option_count == 0
+
+
+@pytest.mark.asyncio
+async def test_non_empty_enter_does_not_place_marker() -> None:
+    """Enter with text still submits via `LineSubmitted` — no marker.
+
+    Guards against a regression where empty-Enter's new branch
+    accidentally falls through for non-empty input and drops a
+    phantom marker on every sent line.
+    """
+    from quasseltui.app.widgets.input_bar import InputBar
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1, contents="hi")]
+
+    sent: list[tuple[BufferId, str]] = []
+
+    class _SendingStubClient(_StubClient):
+        async def send_input(
+            self, buffer_id: BufferId, text: str
+        ) -> None:  # pragma: no cover - trivial
+            sent.append((buffer_id, text))
+
+    client = _SendingStubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.value = "hello"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        assert sent == [(buf.buffer_id, "hello")]
+        assert state.read_markers == {}
+        assert input_bar.value == ""

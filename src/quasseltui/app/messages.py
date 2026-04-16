@@ -111,6 +111,20 @@ class ReadMarkerPlaced(Message):
         self.msg_id = msg_id
 
 
+class MarkerToLatestRequested(Message):
+    """The user asked to drop a marker at the newest message in the active buffer.
+
+    Posted by `InputBar` when the user presses Enter with no text typed.
+    The app handler resolves "latest" against `state.messages[active]`
+    and writes `state.read_markers[active] = last.msg_id`, then triggers
+    a log redraw. No-op when there is no active buffer or the buffer is
+    empty. Complements `ReadMarkerPlaced` (which targets a specific
+    highlighted row inside `MessageLog`); this path exists so a user
+    who never Tabs into the log can still place a marker with the
+    keyboard alone.
+    """
+
+
 class SessionEnded(Message):
     """The live client disconnected.
 
@@ -138,6 +152,7 @@ __all__ = [
     "BufferListUpdated",
     "BufferSelected",
     "LineSubmitted",
+    "MarkerToLatestRequested",
     "ReadMarkerPlaced",
     "SessionEnded",
 ]

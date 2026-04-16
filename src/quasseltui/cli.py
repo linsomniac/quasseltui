@@ -29,6 +29,14 @@ Six subcommands at the moment:
 
 The first four modes are headless and exit when done; `ui-demo` and
 `ui` start an interactive Textual app and exit on `Ctrl+Q`.
+
+Connection settings (host, port, user, password, TLS knobs) can be
+loaded from `~/.config/quasseltui/config.ini` instead of repeated on
+every invocation — see `quasseltui.config`. Two shortcuts then become
+available: a bare `quasseltui` launches the UI against the config's
+`default_server`, and `quasseltui <NAME>` launches the UI against the
+named `[server:<NAME>]` section. Either form is just sugar for
+`quasseltui ui --server <NAME>`.
 """
 
 from __future__ import annotations
@@ -42,7 +50,7 @@ import sys
 from collections import defaultdict
 from collections.abc import Sequence
 
-from quasseltui import __version__
+from quasseltui import __version__, config
 from quasseltui.client import ClientState, QuasselClient
 from quasseltui.client.events import (
     Disconnected as ClientDisconnected,
@@ -87,6 +95,17 @@ from quasseltui.util.text import sanitize_terminal as _sanitize_terminal
 CLIENT_VERSION = f"quasseltui v{__version__}"
 BUILD_DATE = "2026-04-14"
 
+# Subcommands as seen by argparse. Used by `_normalize_argv` to decide
+# whether a bare positional argument is a subcommand name or a server
+# shortcut. The literal set is duplicated from `build_parser` for one
+# simple reason: we need it *before* argparse runs, so we can't extract
+# it by inspecting the built parser.
+_SUBCOMMANDS = frozenset({"probe-only", "login-only", "stream-only", "dump-state", "ui-demo", "ui"})
+
+# Default used when neither the CLI flag nor the config file sets a
+# connect timeout. Kept in sync with the `--connect-timeout` help text.
+_DEFAULT_CONNECT_TIMEOUT = 10.0
+
 
 def _add_core_connect_args(
     sub: argparse._ArgumentGroup | argparse.ArgumentParser,
@@ -101,9 +120,20 @@ def _add_core_connect_args(
     handler. `include_allow_plaintext=True` is only for `probe-only`, which
     doesn't send credentials and thus doesn't need to fail-closed on TLS
     downgrade.
+
+    `--host` / `--port` are not marked required here — the config file
+    can supply them, and the handler enforces presence after merging.
     """
-    sub.add_argument("--host", required=True, help="Quassel core hostname or IP")
-    sub.add_argument("--port", type=int, required=True, help="Quassel core port")
+    sub.add_argument(
+        "--server",
+        help=(
+            "Use connection settings from [server:NAME] in the config file. "
+            "Defaults to the config's default_server when omitted. Any "
+            "explicit flag below overrides the corresponding config value."
+        ),
+    )
+    sub.add_argument("--host", help="Quassel core hostname or IP")
+    sub.add_argument("--port", type=int, help="Quassel core port")
     tls_help = (
         "Do not offer encryption during the probe (plain TCP only). "
         "WARNING: your password goes over the wire in plaintext. Use "
@@ -132,10 +162,14 @@ def _add_core_connect_args(
         "--cafile",
         help="Path to a PEM bundle of trust anchors to use during TLS verification.",
     )
+    # Default is left None so the config resolver can distinguish "user
+    # explicitly set 10.0 on the CLI" from "user didn't set it and we
+    # should fall back to the server config's connect_timeout". The
+    # hard-coded 10.0 fallback is applied in `_resolve_connection_args`.
     sub.add_argument(
         "--connect-timeout",
         type=float,
-        default=10.0,
+        default=None,
         help="Seconds to wait for the TCP connect (default: 10).",
     )
 
@@ -144,16 +178,135 @@ def _add_credential_args(sub: argparse.ArgumentParser) -> None:
     """Attach `--user` / `--password` (login-only and stream-only share these)."""
     sub.add_argument(
         "--user",
-        help="Username (env: QUASSEL_USER; prompted if neither is set)",
+        help="Username (env: QUASSEL_USER; config: [server:*] user; prompted if unset)",
     )
     sub.add_argument(
         "--password",
         help=(
             "Password — discouraged on the command line because it shows up "
-            "in shell history and `ps`. Prefer the QUASSEL_PASSWORD env var "
-            "or be prompted interactively."
+            "in shell history and `ps`. Prefer the QUASSEL_PASSWORD env var, "
+            "a password in the config file (mode 0600), or the interactive "
+            "prompt."
         ),
     )
+
+
+def _resolve_connection_args(args: argparse.Namespace, command: str) -> bool:
+    """Fill missing connection fields on `args` from the config file.
+
+    Mutates `args` in place so that existing handler code paths can keep
+    reading `args.host`, `args.port`, etc. directly. Precedence is:
+
+        explicit CLI flag  >  [server:NAME] value  >  CLI default
+
+    The server is chosen by `--server NAME` if given, otherwise by the
+    config file's `default_server`. When neither the CLI nor the config
+    supplies a host/port the caller is told via a False return — the
+    handler should then exit non-zero. Prints a user-facing error to
+    stderr on any config-loading failure.
+
+    This helper is deliberately a no-op when CLI args already supply
+    both host and port and `--server` was not requested, which keeps the
+    existing mocked-namespace unit tests from needing to stub out any
+    filesystem access.
+    """
+    server_name = getattr(args, "server", None)
+    have_cli_endpoint = getattr(args, "host", None) and getattr(args, "port", None)
+    if server_name is None and have_cli_endpoint:
+        if getattr(args, "connect_timeout", None) is None:
+            args.connect_timeout = _DEFAULT_CONNECT_TIMEOUT
+        return True
+
+    try:
+        cfg = config.load()
+    except config.ConfigError as exc:
+        print(f"{command}: config: {exc}", file=sys.stderr)
+        return False
+
+    server: config.ServerConfig | None = None
+    if cfg is not None:
+        server = cfg.resolve_server(server_name)
+        if server_name is not None and server is None:
+            print(
+                f"{command}: no [server:{server_name}] section in {cfg.path}",
+                file=sys.stderr,
+            )
+            return False
+    elif server_name is not None:
+        print(
+            f"{command}: --server {server_name!r} given but no config file at "
+            f"{config.default_config_path()}",
+            file=sys.stderr,
+        )
+        return False
+
+    if server is not None:
+        if args.host is None:
+            args.host = server.host
+        if args.port is None:
+            args.port = server.port
+        if getattr(args, "user", None) is None and server.user is not None:
+            args.user = server.user
+        if getattr(args, "password", None) is None and server.password is not None:
+            args.password = server.password
+        # `--no-tls` is action="store_true" — there is no "user passed
+        # --tls" to detect, so config can only *disable* TLS, never
+        # re-enable it after a CLI --no-tls. That matches the rest of
+        # the precedence rules (explicit CLI wins).
+        if not args.no_tls and server.tls is False:
+            args.no_tls = True
+        if not args.insecure and server.insecure is True:
+            args.insecure = True
+        if args.cafile is None and server.cafile is not None:
+            args.cafile = server.cafile
+        if args.connect_timeout is None and server.connect_timeout is not None:
+            args.connect_timeout = server.connect_timeout
+
+    if args.connect_timeout is None:
+        args.connect_timeout = _DEFAULT_CONNECT_TIMEOUT
+
+    if not args.host:
+        print(
+            f"{command}: host is required (set --host or configure a server)",
+            file=sys.stderr,
+        )
+        return False
+    if not args.port:
+        print(
+            f"{command}: port is required (set --port or configure a server)",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _normalize_argv(argv: list[str]) -> list[str]:
+    """Rewrite argv so bare / server-shortcut invocations become `ui` mode.
+
+    - `[]`                  → `["ui"]`  (only when a default_server exists)
+    - `["name"]`            → `["ui", "--server", "name"]`
+    - `["name", "--flag"]`  → `["ui", "--server", "name", "--flag"]`
+    - `["ui", ...]`         → unchanged (explicit subcommand)
+    - `["--version"]`       → unchanged (argparse handles)
+
+    If the first positional argument is a known subcommand, nothing
+    happens. Otherwise it's treated as a server name and `ui` is
+    prepended. This lets the user type `quasseltui home` after dropping
+    a config file. The bare-invocation case only rewrites when the
+    config file actually specifies a default — otherwise we leave argv
+    empty so argparse prints the full help banner, preserving the
+    behavior users already expect.
+    """
+    if not argv:
+        cfg = config.load()
+        if cfg is None or cfg.default_server is None:
+            return argv
+        return ["ui"]
+
+    first = argv[0]
+    if first in _SUBCOMMANDS or first.startswith("-"):
+        return argv
+    return ["ui", "--server", first, *argv[1:]]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -276,8 +429,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    try:
+        normalized = _normalize_argv(raw)
+    except config.ConfigError as exc:
+        print(f"quasseltui: config: {exc}", file=sys.stderr)
+        return 1
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(normalized)
 
     if args.mode == "probe-only":
         return asyncio.run(_probe_only(args))
@@ -343,6 +502,8 @@ def _ui(args: argparse.Namespace) -> int:
     across every protocol-layer failure mode use `dump-state` or
     `stream-only`.
     """
+    if not _resolve_connection_args(args, "ui"):
+        return 1
     user = args.user or os.environ.get("QUASSEL_USER")
     if not user:
         print("ui: --user or QUASSEL_USER is required", file=sys.stderr)
@@ -395,6 +556,8 @@ def _ui(args: argparse.Namespace) -> int:
 
 async def _probe_only(args: argparse.Namespace) -> int:
     """Run a single probe+ClientInit round trip and print the reply."""
+    if not _resolve_connection_args(args, "probe-only"):
+        return 1
     try:
         reader, writer = await open_tcp_connection(
             args.host, args.port, connect_timeout=args.connect_timeout
@@ -495,6 +658,8 @@ async def _login_only(args: argparse.Namespace) -> int:
         6 — core not configured (would need CoreSetupData; not supported)
         7 — auth rejected (bad user/password)
     """
+    if not _resolve_connection_args(args, "login-only"):
+        return 1
     user = args.user or os.environ.get("QUASSEL_USER")
     if not user:
         print("login-only: --user or QUASSEL_USER is required", file=sys.stderr)
@@ -654,6 +819,8 @@ async def _stream_only(args: argparse.Namespace) -> int:
     6 unconfigured core, 7 auth rejected). Code 0 also applies when the
     duration elapses and we disconnect cleanly.
     """
+    if not _resolve_connection_args(args, "stream-only"):
+        return 1
     user = args.user or os.environ.get("QUASSEL_USER")
     if not user:
         print("stream-only: --user or QUASSEL_USER is required", file=sys.stderr)
@@ -791,6 +958,8 @@ async def _dump_state(args: argparse.Namespace) -> int:
     7 auth rejected). We succeed with 0 if the duration elapses normally
     and we were able to print at least a partial snapshot.
     """
+    if not _resolve_connection_args(args, "dump-state"):
+        return 1
     user = args.user or os.environ.get("QUASSEL_USER")
     if not user:
         print("dump-state: --user or QUASSEL_USER is required", file=sys.stderr)

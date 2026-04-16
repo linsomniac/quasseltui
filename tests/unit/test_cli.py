@@ -9,6 +9,7 @@ spinning up sockets.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -161,10 +162,16 @@ async def test_probe_only_uses_tls_when_negotiated() -> None:
 
 
 def _make_args(*, no_tls: bool, allow_plaintext: bool) -> Any:
-    """Build an argparse.Namespace shaped like the probe-only subcommand."""
+    """Build an argparse.Namespace shaped like the probe-only subcommand.
+
+    `server=None` plus populated host+port keeps `_resolve_connection_args`
+    from touching the filesystem — the helper short-circuits when the CLI
+    has already supplied an endpoint and no --server was requested.
+    """
     import argparse
 
     return argparse.Namespace(
+        server=None,
         host="example.invalid",
         port=4242,
         no_tls=no_tls,
@@ -187,6 +194,7 @@ def _make_login_args(
     import argparse
 
     return argparse.Namespace(
+        server=None,
         host="example.invalid",
         port=4242,
         user=user,
@@ -466,6 +474,7 @@ def _make_dump_args(
     import argparse
 
     return argparse.Namespace(
+        server=None,
         host="example.invalid",
         port=4242,
         user=user,
@@ -715,8 +724,250 @@ async def test_dump_state_sanitizes_malicious_irc_strings(
     assert "\\x08" in out
 
 
-def test_main_with_no_subcommand_prints_help_and_exits_2(
+# ---------------------------------------------------------------------------
+# Config-file integration (phase 11). The config layer itself is tested in
+# tests/unit/test_config.py; these tests pin the *integration* — that the
+# argv normalizer routes bare / server-shortcut invocations to `ui`, and
+# that the resolver merges config values into `args` with the right
+# precedence when --server is given.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_argv_bare_without_default_server_leaves_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.config, "load", lambda: None)
+    assert cli._normalize_argv([]) == []
+
+
+def test_normalize_argv_bare_with_default_server_injects_ui(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = cli.config.Config(
+        path=tmp_path / "config.ini",
+        default_server="home",
+        servers={"home": cli.config.ServerConfig(name="home")},
+    )
+    monkeypatch.setattr(cli.config, "load", lambda: fake)
+    assert cli._normalize_argv([]) == ["ui"]
+
+
+def test_normalize_argv_server_shortcut() -> None:
+    assert cli._normalize_argv(["home"]) == ["ui", "--server", "home"]
+    assert cli._normalize_argv(["home", "--insecure"]) == [
+        "ui",
+        "--server",
+        "home",
+        "--insecure",
+    ]
+
+
+def test_normalize_argv_known_subcommand_unchanged() -> None:
+    for cmd in ("probe-only", "login-only", "stream-only", "dump-state", "ui-demo", "ui"):
+        assert cli._normalize_argv([cmd, "--host", "x"]) == [cmd, "--host", "x"]
+
+
+def test_normalize_argv_leading_flag_unchanged() -> None:
+    """`--version` and friends must pass through to argparse untouched."""
+    assert cli._normalize_argv(["--version"]) == ["--version"]
+    assert cli._normalize_argv(["--help"]) == ["--help"]
+
+
+def test_resolve_connection_args_short_circuits_when_cli_complete() -> None:
+    """If the CLI already supplies both host and port and no --server is
+    set, the resolver MUST NOT load the config file. This is what lets
+    the existing mocked-namespace tests run without a config fixture."""
+    import argparse
+
+    args = argparse.Namespace(
+        server=None,
+        host="cli.example",
+        port=4242,
+        user=None,
+        password=None,
+        no_tls=False,
+        insecure=False,
+        cafile=None,
+        connect_timeout=None,
+    )
+    called = False
+
+    def _boom() -> None:
+        nonlocal called
+        called = True
+        raise AssertionError("config.load must not be called on the short-circuit path")
+
+    # Patch at the module level — if the resolver reaches config.load it blows up.
+    with patch.object(cli.config, "load", side_effect=_boom):
+        ok = cli._resolve_connection_args(args, "test")
+
+    assert ok is True
+    assert called is False
+    # The 10.0 fallback must still be applied even on the short-circuit path.
+    assert args.connect_timeout == 10.0
+
+
+def test_resolve_connection_args_fills_from_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import argparse
+
+    fake = cli.config.Config(
+        path=tmp_path / "config.ini",
+        default_server=None,
+        servers={
+            "home": cli.config.ServerConfig(
+                name="home",
+                host="irc.example.com",
+                port=4242,
+                user="sean",
+                password="hunter2",
+                tls=False,
+                insecure=True,
+                cafile="/etc/ssl/custom.pem",
+                connect_timeout=15.0,
+            )
+        },
+    )
+    monkeypatch.setattr(cli.config, "load", lambda: fake)
+
+    args = argparse.Namespace(
+        server="home",
+        host=None,
+        port=None,
+        user=None,
+        password=None,
+        no_tls=False,
+        insecure=False,
+        cafile=None,
+        connect_timeout=None,
+    )
+    assert cli._resolve_connection_args(args, "ui") is True
+    assert args.host == "irc.example.com"
+    assert args.port == 4242
+    assert args.user == "sean"
+    assert args.password == "hunter2"
+    assert args.no_tls is True
+    assert args.insecure is True
+    assert args.cafile == "/etc/ssl/custom.pem"
+    assert args.connect_timeout == 15.0
+
+
+def test_resolve_connection_args_cli_overrides_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Explicit CLI flags always win over config values."""
+    import argparse
+
+    fake = cli.config.Config(
+        path=tmp_path / "config.ini",
+        default_server=None,
+        servers={
+            "home": cli.config.ServerConfig(
+                name="home", host="config.example", port=9999, user="configuser"
+            )
+        },
+    )
+    monkeypatch.setattr(cli.config, "load", lambda: fake)
+
+    args = argparse.Namespace(
+        server="home",
+        host="cli.example",  # overrides config
+        port=1234,  # overrides config
+        user="cliuser",  # overrides config
+        password=None,
+        no_tls=False,
+        insecure=False,
+        cafile=None,
+        connect_timeout=None,
+    )
+    assert cli._resolve_connection_args(args, "ui") is True
+    assert args.host == "cli.example"
+    assert args.port == 1234
+    assert args.user == "cliuser"
+
+
+def test_resolve_connection_args_unknown_server_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+) -> None:
+    import argparse
+
+    fake = cli.config.Config(
+        path=tmp_path / "config.ini",
+        default_server=None,
+        servers={"home": cli.config.ServerConfig(name="home")},
+    )
+    monkeypatch.setattr(cli.config, "load", lambda: fake)
+
+    args = argparse.Namespace(
+        server="ghost",
+        host=None,
+        port=None,
+        user=None,
+        password=None,
+        no_tls=False,
+        insecure=False,
+        cafile=None,
+        connect_timeout=None,
+    )
+    assert cli._resolve_connection_args(args, "ui") is False
+    err = capsys.readouterr().err
+    assert "ghost" in err
+
+
+def test_resolve_connection_args_missing_everything_errors(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No CLI host/port, no config file, no --server → explicit error."""
+    import argparse
+
+    monkeypatch.setattr(cli.config, "load", lambda: None)
+    args = argparse.Namespace(
+        server=None,
+        host=None,
+        port=None,
+        user=None,
+        password=None,
+        no_tls=False,
+        insecure=False,
+        cafile=None,
+        connect_timeout=None,
+    )
+    assert cli._resolve_connection_args(args, "ui") is False
+    err = capsys.readouterr().err
+    assert "host is required" in err
+
+
+def test_resolve_connection_args_surfaces_config_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed config file must produce a user-facing error, not a
+    silent fall-through to the "host required" generic message."""
+    import argparse
+
+    def _boom() -> cli.config.Config:
+        raise cli.config.ConfigError("boom")
+
+    monkeypatch.setattr(cli.config, "load", _boom)
+    args = argparse.Namespace(
+        server="home",
+        host=None,
+        port=None,
+        user=None,
+        password=None,
+        no_tls=False,
+        insecure=False,
+        cafile=None,
+        connect_timeout=None,
+    )
+    assert cli._resolve_connection_args(args, "ui") is False
+    assert "boom" in capsys.readouterr().err
+
+
+def test_main_with_no_subcommand_prints_help_and_exits_2(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression for phase 7 follow-up: running `quasseltui` with no
     subcommand used to print a placeholder "under construction" banner
@@ -726,7 +977,14 @@ def test_main_with_no_subcommand_prints_help_and_exits_2(
     error (unknown flag, bad type, etc.) — it raises `SystemExit(2)`
     after printing the full help to stderr. This test pins that user-
     visible contract so a future refactor cannot silently drop it.
+
+    With config-file support added, bare invocation routes to `ui` when
+    a `default_server` is set. So this test force-loads a no-config
+    state via monkeypatch to pin the original fall-through behavior for
+    the "no config, no default" case.
     """
+    monkeypatch.setattr(cli.config, "load", lambda: None)
+
     with pytest.raises(SystemExit) as exc_info:
         cli.main([])
 

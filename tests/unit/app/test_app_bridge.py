@@ -945,8 +945,17 @@ async def test_tabbing_to_log_auto_highlights_last_message() -> None:
         # resets highlighted to None).
         assert log.highlighted is None
 
-        log.focus()
+        # Drive focus via a real keystroke, not `log.focus()` — the
+        # user only ever gets into the log by tabbing, so the test
+        # exercises the same path. The screen auto-focuses InputBar;
+        # shift+tab walks the focus chain backwards to MessageLog in
+        # one step (DOM order is BufferTree → MessageLog → InputBar,
+        # so shift+tab from InputBar lands on MessageLog).
+        await pilot.press("shift+tab")
         await pilot.pause()
+        assert app.focused is log, (
+            f"shift+tab did not focus MessageLog (got {type(app.focused).__name__})"
+        )
 
         # After focus: highlighted snapped to the last message.
         assert log.highlighted == 2

@@ -207,10 +207,9 @@ class QuasselApp(App[None]):
                 log.set_active_buffer(event.buffer_id)
             else:
                 log.clear()
-        if event.buffer_id is not None:
-            tree = self._find(BufferTree)
-            if tree is not None:
-                tree.set_active_buffer(event.buffer_id)
+        tree = self._find(BufferTree)
+        if tree is not None:
+            tree.set_active_buffer(event.buffer_id)
 
     @on(BufferSelected)
     def _on_buffer_selected(self, event: BufferSelected) -> None:
@@ -233,52 +232,44 @@ class QuasselApp(App[None]):
     async def _on_line_submitted(self, event: LineSubmitted) -> None:
         """Forward a typed line to the core via `QuasselClient.send_input`.
 
-        The widget drops empty lines before posting and does NOT
-        clear itself — we clear here only after a successful send so
-        a transient failure (socket just died, buffer vanished under
-        us) leaves the typed text in the box for the user to retry
-        instead of silently discarding it to a log line the alt-
-        screen may have hidden.
+        The widget clears itself eagerly when posting `LineSubmitted`
+        to close the duplicate-submit window (two rapid Enters
+        before the first `send_input` completes). If the send fails,
+        we restore the text so the user can retry.
 
-        Four branches:
+        Three branches:
 
-        1. No client (`ui-demo` mode) — nothing to send to, but we
-           still clear so the demo input doesn't get "stuck".
+        1. No client (`ui-demo` mode) — nothing to send to; the
+           widget already cleared itself.
         2. No active buffer — rare but possible (the user hit Enter
-           before anything landed on screen). Log and clear; nothing
-           to retry because we have no idea what buffer the line was
-           meant for.
-        3. Successful `send_input` — clear.
-        4. `QuasselError` from `send_input` — leave the text in the
-           box. Typical causes are a racey buffer removal and the
-           broken-pipe cases the client-layer now explicitly wraps
-           into `QuasselError` (see `QuasselClient.send_input`).
+           before anything landed on screen). Log; nothing to retry
+           because we have no idea what buffer the line was for.
+        3. `QuasselError` from `send_input` — restore the text into
+           the input bar. Typical causes are a racey buffer removal
+           and the broken-pipe cases the client-layer wraps into
+           `QuasselError` (see `QuasselClient.send_input`).
         """
         if self._client is None:
-            self._clear_input()
             return
         if self.active_buffer_id is None:
             _log.debug("dropping input line with no active buffer: %r", event.text)
-            self._clear_input()
             return
         try:
             await self._client.send_input(self.active_buffer_id, event.text)
         except QuasselError as exc:
             _log.warning("send_input failed: %s", exc)
-            return
-        self._clear_input()
+            self._restore_input(event.text)
 
-    def _clear_input(self) -> None:
-        """Reset the input bar to empty, if it is currently mounted.
+    def _restore_input(self, text: str) -> None:
+        """Put `text` back in the input bar after a failed send.
 
-        Extracted so the four `_on_line_submitted` branches share one
-        code path for the "clear the typed line" action. Silent no-op
-        if the input bar has not been mounted yet (transient startup
-        races) — there is nothing to clear.
+        Only restores if the input bar is still empty — if the user
+        has already started typing something new, we don't overwrite
+        their work. Silent no-op if the bar is not yet mounted.
         """
         input_bar = self._find(InputBar)
-        if input_bar is not None:
-            input_bar.value = ""
+        if input_bar is not None and not input_bar.value:
+            input_bar.value = text
 
     def action_prev_buffer(self) -> None:
         """Cycle backward through the tree's buffer ordering."""

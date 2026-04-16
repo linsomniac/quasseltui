@@ -40,6 +40,7 @@ from quasseltui.protocol.usertypes import (
 )
 from quasseltui.sync.events import (
     BufferAdded,
+    BufferRemoved,
     ClientDisconnected,
     ClientEvent,
     IrcMessage,
@@ -537,14 +538,12 @@ async def test_input_submit_calls_client_send_input() -> None:
 
 @pytest.mark.asyncio
 async def test_input_text_survives_send_failure() -> None:
-    """Regression for codex-review finding: failed sends used to
-    discard the user's typed line.
+    """Failed sends must restore the typed line in the input bar.
 
-    Before the fix the widget cleared `self.value` on every Enter
-    press, so if `send_input` raised a `QuasselError` (dead socket,
-    racey buffer removal) the text was gone with no retry path. The
-    fix moves the clear into the app's success branch; we assert
-    here that a failure leaves the original text in the input bar.
+    The widget clears eagerly on Enter (to prevent duplicate submits)
+    and the app restores the text when `send_input` raises a
+    `QuasselError`. Without the restore, a transient failure would
+    eat the user's text with no way to retry.
     """
     from quasseltui.app.widgets.input_bar import InputBar
     from quasseltui.protocol.errors import QuasselError
@@ -702,6 +701,94 @@ async def test_input_submit_is_noop_when_no_active_buffer() -> None:
         await pilot.pause()
 
     assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_rapid_double_enter_sends_only_once() -> None:
+    """Regression for codex-review finding: two rapid Enters could
+    enqueue the same line twice before the first ``send_input``
+    completed. The fix is to clear the widget eagerly on Enter so the
+    second press sees an empty value and is dropped by InputBar's
+    empty-line guard.
+    """
+    from quasseltui.app.widgets.input_bar import InputBar
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1)]
+
+    sent: list[tuple[BufferId, str]] = []
+
+    class _SendingStubClient(_StubClient):
+        async def send_input(
+            self, buffer_id: BufferId, text: str
+        ) -> None:  # pragma: no cover - trivial
+            sent.append((buffer_id, text))
+
+    client = _SendingStubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.value = "only once"
+        await pilot.press("enter")
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+    assert sent == [(buf.buffer_id, "only once")]
+
+
+@pytest.mark.asyncio
+async def test_last_buffer_removed_clears_tree_cursor() -> None:
+    """Regression for codex-review finding: when the last active
+    buffer is removed, the bridge emits ``ActiveBufferUpdated(None)``.
+    Without handling ``None`` in the tree, the sidebar retains stale
+    selection state while the message log has already cleared.
+    """
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1)]
+
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        assert app.active_buffer_id == buf.buffer_id
+        tree = app.screen.query_one(BufferTree)
+        assert tree.cursor_node is not None
+
+        # Simulate a buffer removal: the dispatcher removes it from
+        # state, then the bridge handles the event.
+        del state.buffers[buf.buffer_id]
+        del state.messages[buf.buffer_id]
+        client.push_event(BufferRemoved(buffer_id=buf.buffer_id))
+        await pilot.pause()
+        await pilot.pause()
+
+        assert app.active_buffer_id is None
+        # After all buffers are removed, the tree's _active_hint must
+        # be cleared. Textual's Tree may land the cursor on the
+        # network header (data=None) rather than nowhere, so we
+        # assert no buffer leaf is selected rather than cursor=None.
+        assert tree._active_hint is None
+        cursor = tree.cursor_node
+        if cursor is not None:
+            assert cursor.data is None
 
 
 @pytest.mark.asyncio

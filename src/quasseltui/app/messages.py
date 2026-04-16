@@ -72,11 +72,13 @@ class BufferSelected(Message):
 class LineSubmitted(Message):
     """The user pressed Enter in the input bar.
 
-    `InputBar` posts this with the current line contents (which it
-    then clears). The app handler is responsible for routing the
-    text to `QuasselClient.send_input` — the widget stays dumb and
-    has no client reference of its own. Phase 11 will slot /-command
-    parsing into the same handler without widening the message.
+    `InputBar` posts this with the current line contents and
+    immediately clears the widget. If the app's `send_input` fails,
+    the app restores the text so the user can retry. The app handler
+    is responsible for routing the text to `QuasselClient.send_input`
+    — the widget stays dumb and has no client reference of its own.
+    Phase 11 will slot /-command parsing into the same handler
+    without widening the message.
 
     Named `LineSubmitted` rather than `InputSubmitted` on purpose:
     Textual derives handler method names from the message class name

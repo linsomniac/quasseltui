@@ -83,17 +83,25 @@ class BufferTree(Tree[BufferInfo | None]):
         if self._active_hint is not None:
             self._select_leaf_for_buffer(self._active_hint)
 
-    def set_active_buffer(self, buffer_id: BufferId) -> None:
+    def set_active_buffer(self, buffer_id: BufferId | None) -> None:
         """Remember the app-side active buffer and move the cursor to it.
 
-        Called from `QuasselApp._set_active_buffer` after the alt+up /
-        alt+down cycle bindings flip `active_buffer_id`. Calling
-        `select_node` posts a `Tree.NodeSelected` that our own handler
-        forwards as `BufferSelected` — that round-trips back to the
-        app, which early-returns because `active_buffer_id` already
-        matches. One idempotent round-trip, not a loop.
+        Accepts `None` to clear the active state — this happens when
+        the bridge emits `ActiveBufferUpdated(None)` after the last
+        active buffer is removed. Without this the sidebar would
+        retain stale cursor state while the message log has already
+        cleared.
+
+        When given a real buffer id, calling `select_node` posts a
+        `Tree.NodeSelected` that our own handler forwards as
+        `BufferSelected` — that round-trips back to the app, which
+        early-returns because `active_buffer_id` already matches.
+        One idempotent round-trip, not a loop.
         """
         self._active_hint = buffer_id
+        if buffer_id is None:
+            self.select_node(None)
+            return
         self._select_leaf_for_buffer(buffer_id)
 
     def on_tree_node_selected(self, event: Tree.NodeSelected[BufferInfo | None]) -> None:

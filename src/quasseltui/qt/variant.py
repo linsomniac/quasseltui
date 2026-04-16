@@ -87,9 +87,11 @@ def read_qstringlist(reader: QDataStreamReader) -> list[str]:
     out: list[str] = []
     for _ in range(count):
         s = reader.read_qstring()
-        if s is None:
-            raise QDataStreamError("QStringList element is a null QString")
-        out.append(s)
+        # AIDEV-NOTE: Some Quassel cores send null QStrings inside
+        # QStringLists (e.g. in Network InitData for server lists).
+        # Qt treats null and empty QStrings equivalently in most
+        # contexts, so we coerce to "" rather than crashing.
+        out.append(s if s is not None else "")
     return out
 
 
@@ -175,6 +177,14 @@ def _write_int16(writer: QDataStreamWriter, value: Any) -> None:
     writer.write_int16(int(value))
 
 
+def _read_uint16(reader: QDataStreamReader) -> int:
+    return reader.read_uint16()
+
+
+def _write_uint16(writer: QDataStreamWriter, value: Any) -> None:
+    writer.write_uint16(int(value))
+
+
 def _read_qdatetime(reader: QDataStreamReader) -> _dt.datetime:
     return reader.read_qdatetime()
 
@@ -193,6 +203,13 @@ def _write_qdatetime(writer: QDataStreamWriter, value: Any) -> None:
 ReaderFn = Callable[[QDataStreamReader], Any]
 WriterFn = Callable[[QDataStreamWriter, Any], None]
 
+# Container types whose is_null flag should be ignored when reading.
+# Some Quassel cores set is_null=1 on QVariantList payloads that
+# contain valid data (e.g. backlog message lists).
+_CONTAINER_TYPE_IDS: frozenset[int] = frozenset(
+    {QMetaType.QVariantList, QMetaType.QVariantMap, QMetaType.QStringList}
+)
+
 
 _READERS: dict[int, ReaderFn] = {
     QMetaType.Bool: _read_bool,
@@ -207,6 +224,7 @@ _READERS: dict[int, ReaderFn] = {
     QMetaType.QStringList: read_qstringlist,
     QMetaType.QDateTime: _read_qdatetime,
     QMetaType.Short: _read_int16,
+    QMetaType.UShort: _read_uint16,
 }
 
 
@@ -223,6 +241,7 @@ _WRITERS: dict[int, WriterFn] = {
     QMetaType.QStringList: write_qstringlist,
     QMetaType.QDateTime: _write_qdatetime,
     QMetaType.Short: _write_int16,
+    QMetaType.UShort: _write_uint16,
 }
 
 
@@ -263,6 +282,13 @@ def read_variant(reader: QDataStreamReader) -> Any:
     is_null = reader.read_uint8()
     if type_id == QMetaType.Invalid:
         return None
+    # AIDEV-NOTE: The is_null flag is ignored for containers
+    # (QVariantList, QVariantMap, QStringList) and user types.
+    # Some Quassel cores set is_null=1 on QVariantList payloads
+    # (e.g. backlog message lists) that contain valid data —
+    # respecting the flag would silently discard the messages.
+    # For scalar types (Int, Bool, etc.), is_null is respected.
+    _ignore_null = type_id in _CONTAINER_TYPE_IDS
     if type_id == QMetaType.UserType:
         raw_name = reader.read_qbytearray()
         if raw_name is None:
@@ -278,7 +304,7 @@ def read_variant(reader: QDataStreamReader) -> Any:
             f"unsupported QVariant type id {type_id} at offset {reader.position}"
         )
     value = fn(reader)
-    if is_null:
+    if is_null and not _ignore_null:
         return None
     return value
 

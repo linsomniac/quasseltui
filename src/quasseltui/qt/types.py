@@ -42,4 +42,5 @@ class QMetaType(IntEnum):
     QDateTime = 16
     # Quassel-specific integer subtypes (NOT Qt's values).
     Short = 130
+    UShort = 133
     UserType = 127

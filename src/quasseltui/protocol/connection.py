@@ -45,7 +45,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, NoReturn
 
-from quasseltui.protocol.enums import DEFAULT_CLIENT_FEATURES
+from quasseltui.protocol.enums import (
+    DEFAULT_CLIENT_FEATURES,
+    LEGACY_EXTENDED_FEATURES,
+    bitmask_to_features,
+    features_to_bitmask,
+)
 from quasseltui.protocol.errors import (
     AuthError,
     HandshakeError,
@@ -361,7 +366,7 @@ class QuasselConnection:
         init_msg = ClientInit(
             client_version=self._client_version,
             build_date=self._build_date,
-            features=0,
+            features=features_to_bitmask(self._offered_features),
             feature_list=self._offered_features,
         )
         await write_frame(self._writer, encode_client_init(init_msg))
@@ -377,8 +382,23 @@ class QuasselConnection:
         if not ack_msg.configured:
             raise HandshakeError("core is not configured (run quasselcore --setup first)")
 
-        # Negotiate the feature intersection now that we've seen the core's list.
-        self._peer_features = frozenset(self._offered_features) & frozenset(ack_msg.feature_list)
+        # AIDEV-NOTE: Quassel feature negotiation is NOT a simple
+        # intersection. The core checks our FeatureList to decide what
+        # wire format to use (e.g. int64 timestamps if we advertise
+        # LongTime). A core with ExtendedFeatures (bit 15) processes
+        # our full FeatureList and enables any feature it also supports
+        # internally — even if it returns an empty FeatureList itself.
+        # So when the core has ExtendedFeatures, we must assume ALL
+        # our offered features are active, or we'll misread the wire.
+        if ack_msg.core_features & LEGACY_EXTENDED_FEATURES:
+            self._peer_features = frozenset(self._offered_features)
+        else:
+            # Truly legacy core — only binary bitmask negotiation.
+            string_features = frozenset(self._offered_features) & frozenset(ack_msg.feature_list)
+            binary_features = frozenset(self._offered_features) & bitmask_to_features(
+                ack_msg.core_features
+            )
+            self._peer_features = string_features | binary_features
 
         # ---- ClientLogin ----
         self._state = ConnState.HANDSHAKE_LOGIN
@@ -428,7 +448,10 @@ class QuasselConnection:
                 yield Disconnected(reason=f"signalproxy decode failed: {exc}", error=exc)
                 await self._cleanup()
                 return
-            except QuasselError as exc:
+            except (QuasselError, ValueError) as exc:
+                # ValueError covers QDataStreamError (e.g. unsupported
+                # user types like Network::Server on older cores). Like
+                # SignalProxyError these desynchronize the frame stream.
                 yield Disconnected(reason=f"signalproxy decode failed: {exc}", error=exc)
                 await self._cleanup()
                 return

@@ -347,3 +347,90 @@ class TestRpcCallByteLayout:
         assert decoded == msg
         # Sanity: first discriminator matches RpcCall id.
         assert REQUEST_RPC_CALL == 2
+
+
+class TestNullObjectName:
+    """Some Quassel cores encode singleton objectNames as null QByteArray
+    (length 0xFFFFFFFF) rather than empty QByteArray (length 0). This is
+    semantically equivalent in Qt — ``QString::fromUtf8(QByteArray())``
+    returns ``""`` — and must not crash the decoder.
+
+    We construct the raw bytes manually because ``write_variant`` rejects
+    typed-null writes.
+    """
+
+    @staticmethod
+    def _null_qbytearray_variant() -> bytes:
+        """QVariant<QByteArray(null)>: type=12, is_null=0, length=0xFFFFFFFF."""
+        import struct
+
+        return struct.pack(">IBi", 12, 0, -1)
+
+    @staticmethod
+    def _qbytearray_variant(data: bytes) -> bytes:
+        """QVariant<QByteArray(data)>."""
+        import struct
+
+        return struct.pack(">IBI", 12, 0, len(data)) + data
+
+    @staticmethod
+    def _short_variant(value: int) -> bytes:
+        """QVariant<Short>(value)."""
+        import struct
+
+        return struct.pack(">IBh", 130, 0, value)
+
+    def _build_sync_payload(self, object_name_bytes: bytes) -> bytes:
+        """Build a raw Sync payload with the given objectName variant bytes."""
+        import struct
+
+        items = 4  # disc + className + objectName + slotName
+        header = struct.pack(">I", items)
+        disc = self._short_variant(REQUEST_SYNC)
+        class_name = self._qbytearray_variant(b"BufferSyncer")
+        slot_name = self._qbytearray_variant(b"requestSetLastSeenMsg")
+        return header + disc + class_name + object_name_bytes + slot_name
+
+    def test_sync_null_object_name_decodes_as_empty_string(self) -> None:
+        payload = self._build_sync_payload(self._null_qbytearray_variant())
+        decoded = decode_signalproxy_payload(payload)
+        assert isinstance(decoded, SyncMessage)
+        assert decoded.class_name == b"BufferSyncer"
+        assert decoded.object_name == ""
+        assert decoded.slot_name == b"requestSetLastSeenMsg"
+
+    def test_sync_empty_object_name_still_works(self) -> None:
+        """Empty (non-null) objectName should still decode as before."""
+        payload = self._build_sync_payload(self._qbytearray_variant(b""))
+        decoded = decode_signalproxy_payload(payload)
+        assert isinstance(decoded, SyncMessage)
+        assert decoded.object_name == ""
+
+    def test_init_data_null_object_name(self) -> None:
+        import struct
+
+        items = 3  # disc + className + objectName (no key/value pairs)
+        header = struct.pack(">I", items)
+        disc = self._short_variant(REQUEST_INIT_DATA)
+        class_name = self._qbytearray_variant(b"BufferSyncer")
+        obj_name = self._null_qbytearray_variant()
+        payload = header + disc + class_name + obj_name
+        decoded = decode_signalproxy_payload(payload)
+        assert isinstance(decoded, InitData)
+        assert decoded.class_name == b"BufferSyncer"
+        assert decoded.object_name == ""
+        assert decoded.init_data == {}
+
+    def test_init_request_null_object_name(self) -> None:
+        import struct
+
+        items = 3  # disc + className + objectName
+        header = struct.pack(">I", items)
+        disc = self._short_variant(REQUEST_INIT_REQUEST)
+        class_name = self._qbytearray_variant(b"BufferSyncer")
+        obj_name = self._null_qbytearray_variant()
+        payload = header + disc + class_name + obj_name
+        decoded = decode_signalproxy_payload(payload)
+        assert isinstance(decoded, InitRequest)
+        assert decoded.class_name == b"BufferSyncer"
+        assert decoded.object_name == ""

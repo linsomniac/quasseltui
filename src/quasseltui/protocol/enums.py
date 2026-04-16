@@ -105,12 +105,73 @@ DEFAULT_CLIENT_FEATURES: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Legacy binary feature flags from `Quassel::Feature` (pre-string-list era).
+#
+# These correspond to the `Features` / `CoreFeatures` quint32 bitmask in
+# `ClientInit` / `ClientInitAck`. Older cores that predate string-based
+# negotiation (`FeatureList`) only check these bits to decide which
+# optional wire fields to include.
+#
+# Only features that affect the wire format we care about are mapped.
+# `LongTime`, `RichMessages`, and `LongMessageId` have no legacy bit —
+# they were introduced after the string-based system.
+# ---------------------------------------------------------------------------
+
+# AIDEV-NOTE: Bit positions from `enum class Feature` in
+# `src/common/quassel.h`. SenderPrefixes is the only one with both a
+# legacy bit and a string feature name that affects Message decoding.
+LEGACY_SENDER_PREFIXES = 1 << 13  # 0x2000
+LEGACY_EXTENDED_FEATURES = 1 << 15  # 0x8000 — signals string-based negotiation
+
+# Maps legacy bit → string feature name (only features we care about).
+_LEGACY_TO_STRING: dict[int, str] = {
+    LEGACY_SENDER_PREFIXES: FEATURE_SENDER_PREFIXES,
+}
+
+# Reverse map for bitmask → feature set conversion.
+_STRING_TO_LEGACY: dict[str, int] = {v: k for k, v in _LEGACY_TO_STRING.items()}
+
+
+def features_to_bitmask(features: tuple[str, ...] | frozenset[str]) -> int:
+    """Compute the legacy binary feature bitmask from string feature names.
+
+    Only features with a known legacy bit mapping are included.
+    ``ExtendedFeatures`` (bit 15) is deliberately NOT set — setting it
+    can cause some older cores to change their ``ClientInitAck`` format
+    in ways we don't handle. The string-based ``FeatureList`` in
+    ``ClientInit`` is sufficient for modern cores.
+    """
+    mask = 0
+    for name in features:
+        bit = _STRING_TO_LEGACY.get(name)
+        if bit is not None:
+            mask |= bit
+    return mask
+
+
+def bitmask_to_features(bitmask: int) -> frozenset[str]:
+    """Extract string feature names from a legacy binary bitmask.
+
+    Returns only the features that have a known string equivalent.
+    """
+    result: set[str] = set()
+    for bit, name in _LEGACY_TO_STRING.items():
+        if bitmask & bit:
+            result.add(name)
+    return frozenset(result)
+
+
 __all__ = [
     "DEFAULT_CLIENT_FEATURES",
     "FEATURE_LONG_MESSAGE_ID",
     "FEATURE_LONG_TIME",
     "FEATURE_RICH_MESSAGES",
     "FEATURE_SENDER_PREFIXES",
+    "LEGACY_EXTENDED_FEATURES",
+    "LEGACY_SENDER_PREFIXES",
     "MessageFlag",
     "MessageType",
+    "bitmask_to_features",
+    "features_to_bitmask",
 ]

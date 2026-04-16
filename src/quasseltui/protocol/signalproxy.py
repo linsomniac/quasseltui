@@ -220,7 +220,17 @@ def _bytes_to_object_name(value: Any, kind: str, field_name: str) -> str:
     so we do the same. Any malformed UTF-8 in an object name is much more
     likely a protocol confusion than a real Unicode oddity, so we use
     `errors="replace"` and let the surrounding code see the placeholder.
+
+    A null QByteArray (length sentinel 0xFFFFFFFF) is treated as the
+    empty string — `QString::fromUtf8(QByteArray())` returns `""` in
+    Qt, and some Quassel cores encode singleton object names (like
+    BufferSyncer's `""`) as null rather than empty on the wire.
     """
+    # AIDEV-NOTE: Null QByteArray handling — some Quassel cores send null
+    # instead of empty for singleton objectNames. Without this, the
+    # connection crashes on the first Sync message after SessionInit.
+    if value is None:
+        return ""
     raw = _expect_bytes(value, field_name, kind)
     return raw.decode("utf-8", errors="replace")
 

@@ -394,6 +394,25 @@ def _write_identity(writer: QDataStreamWriter, value: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Network::Server — `src/common/network.h`. Serialized as a QVariantMap
+# (Network::Server::toVariantMap()). We don't model individual fields;
+# the raw map is enough for the sync layer to pass it through.
+# ---------------------------------------------------------------------------
+
+
+def _read_network_server(reader: QDataStreamReader) -> dict[str, Any]:
+    return read_qvariantmap(reader)
+
+
+def _write_network_server(writer: QDataStreamWriter, value: Any) -> None:
+    if not isinstance(value, dict):
+        raise QDataStreamError(
+            f"Network::Server writer received {type(value).__name__}, expected dict"
+        )
+    write_qvariantmap(writer, value)
+
+
+# ---------------------------------------------------------------------------
 # Registry hookup. The names match `qRegisterMetaType<T>("...")` in the
 # Quassel source — these strings are what travels on the wire as the
 # QByteArray inside the QVariant<UserType> envelope.
@@ -412,15 +431,16 @@ USER_TYPE_MSG_ID = b"MsgId"
 USER_TYPE_BUFFER_INFO = b"BufferInfo"
 USER_TYPE_IDENTITY = b"Identity"
 USER_TYPE_MESSAGE = b"Message"
+USER_TYPE_NETWORK_SERVER = b"Network::Server"
 
 
 def _register_all() -> None:
     # `py_type=` populates the Python-type → user-type-name map in
     # `quasseltui.qt.usertypes` so `write_variant(writer, buf_info)`
-    # can auto-route through the UserType envelope. Identity is
-    # deliberately excluded — its Python representation is a plain
-    # `dict`, which would shadow `QVariantMap` handling and break
-    # every SignalProxy map parameter we pass through.
+    # can auto-route through the UserType envelope. Identity and
+    # Network::Server are deliberately excluded — their Python
+    # representation is a plain `dict`, which would shadow QVariantMap
+    # handling and break SignalProxy map parameters.
     register_user_type(USER_TYPE_BUFFER_ID, _read_buffer_id, _write_buffer_id, py_type=BufferId)
     register_user_type(USER_TYPE_NETWORK_ID, _read_network_id, _write_network_id, py_type=NetworkId)
     register_user_type(
@@ -434,6 +454,7 @@ def _register_all() -> None:
     )
     register_user_type(USER_TYPE_IDENTITY, _read_identity, _write_identity)
     register_user_type(USER_TYPE_MESSAGE, _read_message, _write_message, py_type=Message)
+    register_user_type(USER_TYPE_NETWORK_SERVER, _read_network_server, _write_network_server)
 
 
 _register_all()

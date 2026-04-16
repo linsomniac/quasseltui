@@ -51,7 +51,6 @@ from quasseltui.protocol.enums import (
     bitmask_to_features,
     features_to_bitmask,
 )
-from quasseltui.qt.datastream import QDataStreamError
 from quasseltui.protocol.errors import (
     AuthError,
     HandshakeError,
@@ -96,6 +95,7 @@ from quasseltui.protocol.transport import (
     open_tcp_connection,
     start_tls_on_writer,
 )
+from quasseltui.qt.datastream import QDataStreamError
 
 _log = logging.getLogger(__name__)
 

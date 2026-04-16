@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from quasseltui.protocol.messages import SessionInit
-from quasseltui.protocol.usertypes import BufferId, BufferInfo, IdentityId, NetworkId
+from quasseltui.protocol.usertypes import BufferId, BufferInfo, IdentityId, MsgId, NetworkId
 from quasseltui.sync.buffer_syncer import BufferSyncer
 from quasseltui.sync.events import IrcMessage
 from quasseltui.sync.identity import Identity
@@ -60,6 +60,16 @@ class ClientState:
     buffer_syncer: BufferSyncer | None = None
     backlog_requested: set[BufferId] = field(default_factory=set)
     max_messages_per_buffer: int = 5000
+    # Per-buffer "read up to here" markers, set by the user pressing
+    # Enter on a message row in the UI. Maps `BufferId` -> `MsgId`; the
+    # marker is rendered by the message log immediately after the
+    # message with that id. In-memory only — resets on every app run
+    # because persistence would require a durable local store which we
+    # deliberately don't have in phase 10. A marker whose referenced
+    # message has been trimmed from `messages[buffer_id]` is simply not
+    # drawn; the entry is retained so that if backlog later re-fills
+    # that id range the marker snaps back into view.
+    read_markers: dict[BufferId, MsgId] = field(default_factory=dict)
 
     def network_for_buffer(self, buffer_id: BufferId) -> Network | None:
         """Convenience: find the `Network` a buffer belongs to, or `None`.

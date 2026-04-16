@@ -74,9 +74,10 @@ async def test_message_log_renders_content_for_active_buffer() -> None:
     async with app.run_test() as pilot:
         await pilot.pause()
         log = app.screen.query_one(MessageLog)
-        # `RichLog.lines` is a `deque[Strip]` of rendered lines and is
-        # the stable public signal for "how many lines did we render".
-        assert len(log.lines) >= 1
+        # `OptionList.option_count` is the stable public signal for
+        # "how many rows did we render"; the default-picked buffer
+        # has at least one message in the demo state.
+        assert log.option_count >= 1
 
 
 @pytest.mark.asyncio
@@ -170,9 +171,13 @@ async def test_chat_screen_renders_hostile_state_without_escape_bytes() -> None:
                 assert "spoof" in leaf.label.plain
 
         log = app.screen.query_one(MessageLog)
-        # RichLog.lines is a deque of `Strip` objects; their `text`
-        # attribute is what the terminal would receive.
-        for strip in log.lines:
-            assert "\x1b" not in strip.text
-            assert "\x07" not in strip.text
-            assert "\n" not in strip.text
+        # Each option's prompt is what the terminal would receive for
+        # that row. Walk them and assert the sanitization held end-to-
+        # end: no ESC, BEL, or embedded newlines made it through
+        # `format_message` into the option prompt.
+        for i in range(log.option_count):
+            prompt = log.get_option_at_index(i).prompt
+            plain = prompt.plain if hasattr(prompt, "plain") else str(prompt)
+            assert "\x1b" not in plain
+            assert "\x07" not in plain
+            assert "\n" not in plain

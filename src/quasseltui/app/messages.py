@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from textual.message import Message
 
-from quasseltui.protocol.usertypes import BufferId
+from quasseltui.protocol.usertypes import BufferId, MsgId
 
 
 class BufferListUpdated(Message):
@@ -93,6 +93,24 @@ class LineSubmitted(Message):
         self.text = text
 
 
+class ReadMarkerPlaced(Message):
+    """The user asked to drop a "read up to here" marker on a message.
+
+    Posted by `MessageLog` when Enter fires on a highlighted message
+    row. The app handler writes `state.read_markers[buffer_id] = msg_id`
+    (replacing any existing marker for that buffer — there is only ever
+    one marker per buffer) and triggers a log rebuild so the new
+    position renders. Per-buffer, in-memory only: markers reset on app
+    restart, which is deliberate — persistence across restarts would
+    need a durable local store that phase 10 doesn't have.
+    """
+
+    def __init__(self, buffer_id: BufferId, msg_id: MsgId) -> None:
+        super().__init__()
+        self.buffer_id = buffer_id
+        self.msg_id = msg_id
+
+
 class SessionEnded(Message):
     """The live client disconnected.
 
@@ -120,5 +138,6 @@ __all__ = [
     "BufferListUpdated",
     "BufferSelected",
     "LineSubmitted",
+    "ReadMarkerPlaced",
     "SessionEnded",
 ]

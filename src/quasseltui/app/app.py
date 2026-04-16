@@ -56,6 +56,7 @@ from quasseltui.app.messages import (
     BufferListUpdated,
     BufferSelected,
     LineSubmitted,
+    ReadMarkerPlaced,
     SessionEnded,
 )
 from quasseltui.app.screens.chat import ChatScreen
@@ -229,6 +230,24 @@ class QuasselApp(App[None]):
         if event.buffer_id == self.active_buffer_id:
             return
         self._set_active_buffer(event.buffer_id)
+
+    @on(ReadMarkerPlaced)
+    def _on_read_marker_placed(self, event: ReadMarkerPlaced) -> None:
+        """Record a user-placed read marker and refresh the log.
+
+        Writing into `state.read_markers` replaces any prior marker
+        for that buffer (dict semantics), which is exactly the "only
+        one marker per buffer, always the most recent placement"
+        contract the feature asks for. We then re-post
+        `ActiveBufferUpdated` so `MessageLog.set_active_buffer`
+        rebuilds; because the buffer_id matches the current active
+        pointer, the refresh preserves the user's highlighted option
+        and scroll position so the cursor stays on the row they just
+        marked.
+        """
+        self._state.read_markers[event.buffer_id] = event.msg_id
+        if event.buffer_id == self.active_buffer_id:
+            self.post_message(ActiveBufferUpdated(buffer_id=event.buffer_id))
 
     @on(LineSubmitted)
     async def _on_line_submitted(self, event: LineSubmitted) -> None:

@@ -26,6 +26,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from quasseltui.app.app import QuasselApp
+from quasseltui.app.messages import BufferSelected
 from quasseltui.app.widgets.buffer_tree import BufferTree
 from quasseltui.app.widgets.message_log import MessageLog
 from quasseltui.client.state import ClientState
@@ -102,6 +103,18 @@ def _buffer(bid: int, name: str = "#python") -> BufferInfo:
         group_id=0,
         name=name,
     )
+
+
+def _option_text(log: MessageLog, index: int) -> str:
+    """Read the plain text of a `MessageLog` option at `index`.
+
+    Used by assertions that want to see "what did the user actually
+    get rendered in this row". `Option.prompt` is a Rich `Text` for
+    every row we build, so we lean on `.plain`; fall back to `str(...)`
+    defensively in case a future row kind uses a bare string.
+    """
+    prompt = log.get_option_at_index(index).prompt
+    return prompt.plain if hasattr(prompt, "plain") else str(prompt)
 
 
 def _irc_message(bid: int, *, msg_id: int, contents: str = "hi") -> IrcMessage:
@@ -206,7 +219,7 @@ async def test_message_received_for_default_active_buffer_shows_in_log() -> None
         await pilot.pause(0.1)
 
         log = app.screen.query_one(MessageLog)
-        rendered = " ".join(strip.text for strip in log.lines)
+        rendered = " ".join(_option_text(log, i) for i in range(log.option_count))
         assert "welcome" in rendered
         assert "glad to be here" in rendered
 
@@ -444,7 +457,7 @@ async def test_tree_node_selection_switches_active_buffer() -> None:
         assert app.active_buffer_id == target
 
         log = app.screen.query_one(MessageLog)
-        rendered = " ".join(strip.text for strip in log.lines)
+        rendered = " ".join(_option_text(log, i) for i in range(log.option_count))
         assert target_content in rendered
 
 
@@ -827,3 +840,169 @@ async def test_alt_up_cycles_to_previous_buffer() -> None:
         after = app.active_buffer_id
         assert after is not None
         assert after != before
+
+
+# ---------------------------------------------------------------------------
+# Read-up-to-here marker
+# ---------------------------------------------------------------------------
+
+
+def _option_ids(log: MessageLog) -> list[str | None]:
+    """Snapshot every option id in render order.
+
+    Used by the marker tests to assert "did a marker row appear in
+    the right place?" without depending on the exact option prompt
+    text or formatting.
+    """
+    return [log.get_option_at_index(i).id for i in range(log.option_count)]
+
+
+@pytest.mark.asyncio
+async def test_enter_on_message_row_places_marker_in_state() -> None:
+    """Pressing Enter while a message is highlighted writes to
+    `state.read_markers` and inserts a marker row after that message.
+
+    This is the core of the feature: the user Tabs into the message
+    log, walks to a row, hits Enter, and the marker anchors there so
+    they can recognise "everything above this line is old" on their
+    next glance at the channel.
+    """
+    from quasseltui.app.widgets.message_log import _MARKER_OPTION_ID
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [
+        _irc_message(11, msg_id=1, contents="first"),
+        _irc_message(11, msg_id=2, contents="second"),
+        _irc_message(11, msg_id=3, contents="third"),
+    ]
+
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.active_buffer_id == buf.buffer_id
+
+        log = app.screen.query_one(MessageLog)
+        # Focus the log and highlight the middle message (msg_id=2),
+        # then press Enter.
+        log.focus()
+        log.highlighted = 1
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert state.read_markers.get(buf.buffer_id) == MsgId(2)
+
+        ids = _option_ids(log)
+        # Three messages plus one marker = four rows. The marker row
+        # sits directly after the option whose id encodes msg_id=2.
+        assert len(ids) == 4
+        assert ids[0] == "msg:1"
+        assert ids[1] == "msg:2"
+        assert ids[2] == _MARKER_OPTION_ID
+        assert ids[3] == "msg:3"
+
+
+@pytest.mark.asyncio
+async def test_placing_new_marker_replaces_previous_one() -> None:
+    """A second Enter on a different row moves the marker — it never
+    leaves two marker rows in the same buffer. This is the "if any
+    previous 'read up to' marker is in the backlog remove it" half of
+    the feature.
+    """
+    from quasseltui.app.widgets.message_log import _MARKER_OPTION_ID
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [
+        _irc_message(11, msg_id=1, contents="one"),
+        _irc_message(11, msg_id=2, contents="two"),
+        _irc_message(11, msg_id=3, contents="three"),
+    ]
+
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        log = app.screen.query_one(MessageLog)
+        log.focus()
+        log.highlighted = 0
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        # First marker landed after msg_id=1.
+        assert state.read_markers[buf.buffer_id] == MsgId(1)
+        ids_first = _option_ids(log)
+        assert ids_first.count(_MARKER_OPTION_ID) == 1
+        assert ids_first.index(_MARKER_OPTION_ID) == 1
+
+        # Now move to the last message (OptionList shifted its indices
+        # by one to accommodate the marker row, so msg_id=3 is at 3).
+        log.highlighted = log.get_option_index("msg:3")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert state.read_markers[buf.buffer_id] == MsgId(3)
+        ids_second = _option_ids(log)
+        # Still exactly one marker — the old one was removed when we
+        # rebuilt the option list from state.read_markers.
+        assert ids_second.count(_MARKER_OPTION_ID) == 1
+        # And it now sits after msg_id=3.
+        marker_idx = ids_second.index(_MARKER_OPTION_ID)
+        assert ids_second[marker_idx - 1] == "msg:3"
+
+
+@pytest.mark.asyncio
+async def test_marker_is_per_buffer_not_global() -> None:
+    """Setting a marker in one buffer must NOT affect another buffer's
+    marker state. This is the "per-buffer" contract the user asked for.
+    """
+    state = _empty_state_with_one_network()
+    buf_a = _buffer(11, name="#alpha")
+    buf_b = _buffer(22, name="#beta")
+    state.buffers[buf_a.buffer_id] = buf_a
+    state.buffers[buf_b.buffer_id] = buf_b
+    state.messages[buf_a.buffer_id] = [_irc_message(11, msg_id=1, contents="a1")]
+    state.messages[buf_b.buffer_id] = [_irc_message(22, msg_id=7, contents="b1")]
+
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        # Ensure we start on #alpha, then drop a marker there.
+        app.post_message(BufferSelected(buffer_id=buf_a.buffer_id))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.active_buffer_id == buf_a.buffer_id
+
+        log = app.screen.query_one(MessageLog)
+        log.focus()
+        log.highlighted = 0
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert state.read_markers.get(buf_a.buffer_id) == MsgId(1)
+        assert buf_b.buffer_id not in state.read_markers

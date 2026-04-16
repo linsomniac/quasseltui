@@ -30,6 +30,20 @@ MessageLog {
     padding: 0 1;
 }
 
+/* The "read up to here" marker is a `disabled=True` OptionList option,
+ * so OptionList's DEFAULT_CSS colours it with `$text-disabled` (dim
+ * grey). That defeats the point — the marker is meant to stand out
+ * from the surrounding message lines so the user can spot it at a
+ * glance. Override `option-list--option-disabled` inside MessageLog so
+ * the marker row renders bold in the warning accent, while the option
+ * stays non-selectable (the Rich inline style on the Option's prompt
+ * and the `disabled=True` flag are both still in effect).
+ */
+MessageLog > .option-list--option-disabled {
+    color: $warning;
+    text-style: bold;
+}
+
 InputBar {
     dock: bottom;
     height: 3;

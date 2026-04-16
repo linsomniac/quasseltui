@@ -207,7 +207,7 @@ class QuasselApp(App[None]):
             if event.buffer_id is not None:
                 log.set_active_buffer(event.buffer_id)
             else:
-                log.clear()
+                log.clear_options()
         tree = self._find(BufferTree)
         if tree is not None:
             tree.set_active_buffer(event.buffer_id)

@@ -536,6 +536,141 @@ async def test_input_submit_calls_client_send_input() -> None:
 
 
 @pytest.mark.asyncio
+async def test_input_text_survives_send_failure() -> None:
+    """Regression for codex-review finding: failed sends used to
+    discard the user's typed line.
+
+    Before the fix the widget cleared `self.value` on every Enter
+    press, so if `send_input` raised a `QuasselError` (dead socket,
+    racey buffer removal) the text was gone with no retry path. The
+    fix moves the clear into the app's success branch; we assert
+    here that a failure leaves the original text in the input bar.
+    """
+    from quasseltui.app.widgets.input_bar import InputBar
+    from quasseltui.protocol.errors import QuasselError
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1)]
+
+    class _FailingSendClient(_StubClient):
+        async def send_input(
+            self, buffer_id: BufferId, text: str
+        ) -> None:  # pragma: no cover - trivial
+            raise QuasselError("simulated broken pipe")
+
+    client = _FailingSendClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.active_buffer_id == buf.buffer_id
+
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.value = "retry me"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        # Critical: the typed line must still be there so the user
+        # can hit Enter again after a reconnect instead of having to
+        # retype it from memory.
+        assert input_bar.value == "retry me"
+
+
+@pytest.mark.asyncio
+async def test_input_text_clears_on_successful_send() -> None:
+    """Complement to `test_input_text_survives_send_failure`: a
+    successful send MUST clear the input. Without this test a
+    regression where the clear was removed entirely (or moved to the
+    wrong branch) would silently ship — the failure-path test above
+    would still pass because nothing was ever cleared anywhere.
+    """
+    from quasseltui.app.widgets.input_bar import InputBar
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1)]
+
+    class _WorkingSendClient(_StubClient):
+        async def send_input(
+            self, buffer_id: BufferId, text: str
+        ) -> None:  # pragma: no cover - trivial
+            return None
+
+    client = _WorkingSendClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.value = "send me"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        assert input_bar.value == ""
+
+
+@pytest.mark.asyncio
+async def test_tree_cursor_follows_bridge_driven_default_pick() -> None:
+    """Regression for codex-review finding: the tree cursor used to
+    drift out of sync on bridge-driven active-buffer changes.
+
+    The bridge writes `active_buffer_id` directly during default-pick
+    (first event that populates state) and removal-recovery. Before
+    the fix only `_set_active_buffer` updated the tree, so the first
+    buffer the bridge landed on would leave the sidebar cursor on
+    the first leaf regardless of which buffer the message log was
+    showing. The fix folds tree-sync into `_on_active_buffer_updated`
+    so every `ActiveBufferUpdated` message — from any source — keeps
+    the sidebar visual consistent with the message log.
+    """
+    state = _empty_state_with_one_network()
+    # Two buffers; seed messages only on the second so the
+    # "prefer buffers with content" default-pick heuristic skips the
+    # first and lands on the second — that's the bit that would have
+    # left the tree cursor stuck on #alpha before the fix.
+    buffers = [
+        _buffer(11, name="#alpha"),
+        _buffer(22, name="#beta"),
+    ]
+    for buf in buffers:
+        state.buffers[buf.buffer_id] = buf
+        state.messages[buf.buffer_id] = []
+    state.messages[buffers[1].buffer_id] = [_irc_message(22, msg_id=1)]
+
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        assert app.active_buffer_id == buffers[1].buffer_id
+
+        tree = app.screen.query_one(BufferTree)
+        cursor = tree.cursor_node
+        assert cursor is not None
+        assert cursor.data is not None
+        assert cursor.data.buffer_id == buffers[1].buffer_id
+
+
+@pytest.mark.asyncio
 async def test_input_submit_is_noop_when_no_active_buffer() -> None:
     """A stray Enter before any buffer is picked must not crash.
 

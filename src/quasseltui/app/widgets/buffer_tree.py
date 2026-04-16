@@ -121,10 +121,34 @@ class BufferTree(Tree[BufferInfo | None]):
         would cause us to include the leaf. The next
         `refresh_from_state` will fix it via the `_active_hint`
         re-seek path.
+
+        Why we access `self._tree_lines` before `select_node`:
+        `Tree.select_node` calls `Tree.move_cursor`, which sets
+        `cursor_line = node._line` unconditionally. But `_line` is
+        `-1` until the tree runs its `_build()` pass and walks every
+        visible node to assign line numbers. `refresh_from_state()`
+        calls `clear()` which invalidates the line cache, so any
+        leaves added in the subsequent `_populate()` still have
+        `_line = -1` when we get here — the build hasn't run yet,
+        because it's triggered lazily on `_tree_lines` access during
+        the next render cycle. Accessing the `_tree_lines` property
+        here forces that build to run synchronously, populating
+        `leaf._line` so `select_node` can move the cursor to the
+        correct row. Without this, the bridge-driven default-pick
+        path would call us before any render, the line numbers
+        would be `-1`, and the cursor would land at line `-1`
+        (effectively no selection) instead of on the buffer leaf.
         """
         leaf = self._find_leaf_for_buffer(buffer_id)
-        if leaf is not None:
-            self.select_node(leaf)
+        if leaf is None:
+            return
+        # AIDEV-NOTE: see docstring. `_tree_lines` is a protected
+        # property on `Tree`, but the parent class's own methods access
+        # it the same way (see `_refresh_node`), so this is idiomatic
+        # within a Tree subclass even though the underscore lints as
+        # a protected member elsewhere.
+        _ = self._tree_lines
+        self.select_node(leaf)
 
     def _find_leaf_for_buffer(self, buffer_id: BufferId) -> TreeNode[BufferInfo | None] | None:
         for network_node in self.root.children:

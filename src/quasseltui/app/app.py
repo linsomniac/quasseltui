@@ -60,6 +60,7 @@ from quasseltui.app.messages import (
 )
 from quasseltui.app.screens.chat import ChatScreen
 from quasseltui.app.widgets.buffer_tree import BufferTree
+from quasseltui.app.widgets.input_bar import InputBar
 from quasseltui.app.widgets.message_log import MessageLog
 from quasseltui.client.state import ClientState
 from quasseltui.protocol.errors import QuasselError
@@ -184,13 +185,32 @@ class QuasselApp(App[None]):
 
     @on(ActiveBufferUpdated)
     def _on_active_buffer_updated(self, event: ActiveBufferUpdated) -> None:
+        """Redraw the message log AND sync the tree cursor.
+
+        This is the single "active buffer changed" reaction point —
+        both user-driven changes (`_set_active_buffer` via click, Enter,
+        alt+up/alt+down) and bridge-driven changes (the default-pick on
+        first session event, the removal-recovery re-pick when the
+        active buffer is deleted) funnel through `ActiveBufferUpdated`,
+        so syncing the tree cursor here keeps the sidebar visual
+        consistent with `active_buffer_id` no matter who flipped it.
+
+        Without the tree sync here, the bridge's direct writes to
+        `active_buffer_id` in `_maybe_pick_default_active_buffer` and
+        `_handle_buffer_removed` would leave the tree cursor pointing
+        at a different buffer than the message log is rendering —
+        codex-review finding, reliability class.
+        """
         log = self._find(MessageLog)
-        if log is None:
-            return
+        if log is not None:
+            if event.buffer_id is not None:
+                log.set_active_buffer(event.buffer_id)
+            else:
+                log.clear()
         if event.buffer_id is not None:
-            log.set_active_buffer(event.buffer_id)
-        else:
-            log.clear()
+            tree = self._find(BufferTree)
+            if tree is not None:
+                tree.set_active_buffer(event.buffer_id)
 
     @on(BufferSelected)
     def _on_buffer_selected(self, event: BufferSelected) -> None:
@@ -213,30 +233,52 @@ class QuasselApp(App[None]):
     async def _on_line_submitted(self, event: LineSubmitted) -> None:
         """Forward a typed line to the core via `QuasselClient.send_input`.
 
-        The widget drops empty lines before posting, so the handler
-        doesn't have to re-check. We still guard three other cases
-        that can all happen in practice:
+        The widget drops empty lines before posting and does NOT
+        clear itself — we clear here only after a successful send so
+        a transient failure (socket just died, buffer vanished under
+        us) leaves the typed text in the box for the user to retry
+        instead of silently discarding it to a log line the alt-
+        screen may have hidden.
 
-        1. No client (`ui-demo` mode) — silently drop; there's no
-           one to send to.
-        2. No active buffer — the user hit Enter before any buffer
-           landed on screen. Without the guard we'd raise into
-           Textual's bubbling machinery and corrupt the event loop.
-        3. `QuasselError` from `send_input` — typically "buffer
-           unknown" after a racey removal, or a socket write failure
-           when the connection is already gone. Logging is the right
-           response for phase 9; phase 11's status bar will make it
-           user-visible via a toast.
+        Four branches:
+
+        1. No client (`ui-demo` mode) — nothing to send to, but we
+           still clear so the demo input doesn't get "stuck".
+        2. No active buffer — rare but possible (the user hit Enter
+           before anything landed on screen). Log and clear; nothing
+           to retry because we have no idea what buffer the line was
+           meant for.
+        3. Successful `send_input` — clear.
+        4. `QuasselError` from `send_input` — leave the text in the
+           box. Typical causes are a racey buffer removal and the
+           broken-pipe cases the client-layer now explicitly wraps
+           into `QuasselError` (see `QuasselClient.send_input`).
         """
         if self._client is None:
+            self._clear_input()
             return
         if self.active_buffer_id is None:
             _log.debug("dropping input line with no active buffer: %r", event.text)
+            self._clear_input()
             return
         try:
             await self._client.send_input(self.active_buffer_id, event.text)
         except QuasselError as exc:
             _log.warning("send_input failed: %s", exc)
+            return
+        self._clear_input()
+
+    def _clear_input(self) -> None:
+        """Reset the input bar to empty, if it is currently mounted.
+
+        Extracted so the four `_on_line_submitted` branches share one
+        code path for the "clear the typed line" action. Silent no-op
+        if the input bar has not been mounted yet (transient startup
+        races) — there is nothing to clear.
+        """
+        input_bar = self._find(InputBar)
+        if input_bar is not None:
+            input_bar.value = ""
 
     def action_prev_buffer(self) -> None:
         """Cycle backward through the tree's buffer ordering."""
@@ -267,21 +309,18 @@ class QuasselApp(App[None]):
         self._set_active_buffer(target)
 
     def _set_active_buffer(self, buffer_id: BufferId) -> None:
-        """Single code path for flipping the active buffer.
+        """Flip `active_buffer_id` and post an `ActiveBufferUpdated`.
 
-        Called by `_on_buffer_selected` and by the cycle actions.
-        Updates `active_buffer_id`, posts `ActiveBufferUpdated` so
-        the message log redraws, and asks the tree to move its
-        cursor so the sidebar visual stays consistent with the
-        active pointer. All three steps are guarded against a
-        no-op flip at the caller level, so calling this with the
-        current id is cheap but also unexpected.
+        Used by `_on_buffer_selected` and by the alt+up/alt+down cycle
+        actions. The tree and log sync both happen in the
+        `_on_active_buffer_updated` handler, so this method is now the
+        single place that writes `active_buffer_id` from the user-
+        driven path. The bridge still writes the pointer directly for
+        its default-pick and removal-recovery paths, but those also
+        post `ActiveBufferUpdated`, so the same handler covers them.
         """
         self.active_buffer_id = buffer_id
         self.post_message(ActiveBufferUpdated(buffer_id=buffer_id))
-        tree = self._find(BufferTree)
-        if tree is not None:
-            tree.set_active_buffer(buffer_id)
 
     def _find(self, widget_type: type[_WidgetT]) -> _WidgetT | None:
         """Query the current screen for a widget, returning None if absent.

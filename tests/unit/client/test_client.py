@@ -376,3 +376,39 @@ class TestSendInput:
 
         with pytest.raises(_QuasselError):
             await client.send_input(BufferId(9999), "ghost")
+
+    async def test_send_input_wraps_oserror_as_quassel_error(self) -> None:
+        """Regression for codex-review finding: a broken-pipe `OSError`
+        from `writer.drain()` used to leak straight into the UI handler,
+        which only catches `QuasselError`. The client now wraps any
+        `OSError` / `ssl.SSLError` into a `QuasselError` at the public
+        boundary, so the app's `LineSubmitted` handler can surface it
+        as a non-fatal warning instead of dumping a raw traceback into
+        Textual's message machinery.
+        """
+        import pytest
+
+        from quasseltui.protocol.errors import QuasselError as _QuasselError
+
+        class _DeadSocketConnection(FakeConnection):
+            async def send(self, message: SignalProxyMessage) -> None:
+                raise BrokenPipeError("peer hung up")
+
+        buf = _buffer(10, 1, "#python")
+        session = _session(network_ids=[1], buffer_infos=[buf])
+        script: list[ProtocolEvent] = [_session_ready(session, frozenset())]
+        client = QuasselClient(
+            host="localhost",
+            port=4242,
+            user="t",
+            password="t",
+            tls=False,
+        )
+        client._connection = _DeadSocketConnection(script)  # type: ignore[assignment]
+        await _drain(client)  # populate state.buffers
+
+        with pytest.raises(_QuasselError) as excinfo:
+            await client.send_input(buf.buffer_id, "hello")
+        # The original OSError is chained so the log message has enough
+        # context to debug which system call actually failed.
+        assert isinstance(excinfo.value.__cause__, BrokenPipeError)

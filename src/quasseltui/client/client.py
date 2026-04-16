@@ -29,6 +29,7 @@ the fan-out.
 
 from __future__ import annotations
 
+import ssl
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -183,13 +184,17 @@ class QuasselClient:
         hand us one — the UI already knows the buffer id and should
         not have to reach into `ClientState` on every keystroke.
 
-        Raises `QuasselError` if the buffer is unknown (e.g. the user
-        hit Enter on a stale active pointer from a racey buffer
-        removal), if we're not in the CONNECTED state, or if the
-        underlying socket write fails. Callers — the app's
-        `InputSubmitted` handler in particular — should catch
-        `QuasselError` and surface a non-fatal status line instead of
-        killing the whole session.
+        Raises `QuasselError` for every failure mode a UI caller needs
+        to handle: unknown buffer (racey removal), wrong connection
+        state (socket gone before `send_input` ran), or a raw socket
+        write error from `writer.drain()` on an already-dead peer. The
+        last case is the one that matters here: `QuasselConnection.send`
+        does not convert `OSError` / `ssl.SSLError` from the framing
+        layer, so we wrap them here before they can leak into the UI
+        handler. Without this wrap, hitting Enter during a disconnect
+        would escape the app's `QuasselError`-only `except` clause and
+        raise into Textual's message machinery — an ugly traceback on
+        top of a state the user has no way to recover from.
         """
         buffer_info = self.state.buffers.get(buffer_id)
         if buffer_info is None:
@@ -198,7 +203,10 @@ class QuasselClient:
             signal_name=_SEND_INPUT_SIGNAL,
             params=[buffer_info, text],
         )
-        await self._connection.send(rpc)
+        try:
+            await self._connection.send(rpc)
+        except (OSError, ssl.SSLError) as exc:
+            raise QuasselError(f"failed to send input: {exc}") from exc
 
     async def close(self) -> None:
         """Idempotent shutdown. Safe to call in a ``finally`` block."""

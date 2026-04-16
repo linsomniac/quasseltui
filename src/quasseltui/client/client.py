@@ -49,9 +49,9 @@ from quasseltui.protocol.connection import (
 )
 from quasseltui.protocol.enums import DEFAULT_CLIENT_FEATURES
 from quasseltui.protocol.errors import QuasselError
-from quasseltui.protocol.signalproxy import InitRequest, RpcCall
+from quasseltui.protocol.signalproxy import InitRequest, RpcCall, SyncMessage
 from quasseltui.protocol.transport import TlsOptions
-from quasseltui.protocol.usertypes import BufferId
+from quasseltui.protocol.usertypes import BufferId, MsgId
 from quasseltui.sync.buffer_syncer import BufferSyncer
 from quasseltui.sync.dispatcher import Dispatcher
 from quasseltui.sync.events import ClientDisconnected, ClientEvent
@@ -207,6 +207,38 @@ class QuasselClient:
             await self._connection.send(rpc)
         except (OSError, ssl.SSLError) as exc:
             raise QuasselError(f"failed to send input: {exc}") from exc
+
+    async def request_backlog(
+        self,
+        buffer_id: BufferId,
+        limit: int = 100,
+    ) -> None:
+        """Request historical messages for `buffer_id` from the core.
+
+        Sends a `requestBacklog` Sync call to the core's
+        `BacklogManager`. The core responds asynchronously with a
+        `receiveBacklog` Sync call containing the messages, which the
+        dispatcher's `_merge_backlog` hook merges into state and emits
+        a `BacklogReceived` event.
+
+        Idempotent per session: records the buffer_id in
+        `state.backlog_requested` so the caller can skip re-requesting
+        on repeated buffer switches. A second call for the same
+        buffer is a no-op.
+        """
+        if buffer_id in self.state.backlog_requested:
+            return
+        self.state.backlog_requested.add(buffer_id)
+        sync = SyncMessage(
+            class_name=b"BacklogManager",
+            object_name="",
+            slot_name=b"requestBacklog",
+            params=[buffer_id, MsgId(-1), MsgId(-1), limit, 0],
+        )
+        try:
+            await self._connection.send(sync)
+        except (OSError, ssl.SSLError) as exc:
+            raise QuasselError(f"failed to request backlog: {exc}") from exc
 
     async def close(self) -> None:
         """Idempotent shutdown. Safe to call in a ``finally`` block."""

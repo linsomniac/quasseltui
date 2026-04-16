@@ -66,6 +66,7 @@ from quasseltui.app.messages import (
 from quasseltui.client.state import ClientState
 from quasseltui.protocol.usertypes import BufferId
 from quasseltui.sync.events import (
+    BacklogReceived,
     BufferAdded,
     BufferRemoved,
     BufferRenamed,
@@ -194,6 +195,10 @@ class ClientBridge:
             return
         if isinstance(event, MessageReceived):
             self._handle_message(event)
+            return
+        if isinstance(event, BacklogReceived):
+            if event.buffer_id == self._sink.active_buffer_id and event.count > 0:
+                self._sink.post_message(ActiveBufferUpdated(buffer_id=self._sink.active_buffer_id))
             return
         if isinstance(event, ClientDisconnected):
             self._sink.post_message(

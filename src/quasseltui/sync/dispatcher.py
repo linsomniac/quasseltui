@@ -37,9 +37,11 @@ from typing import Any
 from quasseltui.protocol.messages import SessionInit
 from quasseltui.protocol.signalproxy import InitData, RpcCall, SyncMessage
 from quasseltui.protocol.usertypes import BufferId, BufferInfo, IdentityId, Message, NetworkId
+from quasseltui.sync.backlog_manager import BacklogManager
 from quasseltui.sync.base import SyncObject
 from quasseltui.sync.buffer_syncer import BufferSyncer
 from quasseltui.sync.events import (
+    BacklogReceived,
     BufferAdded,
     BufferRemoved,
     BufferRenamed,
@@ -108,6 +110,7 @@ class Dispatcher:
             IrcUser.CLASS_NAME: IrcUser,
             Identity.CLASS_NAME: Identity,
             BufferSyncer.CLASS_NAME: BufferSyncer,
+            BacklogManager.CLASS_NAME: BacklogManager,
         }
 
     # -- public introspection ------------------------------------------------
@@ -177,6 +180,10 @@ class Dispatcher:
         buffer_syncer = BufferSyncer(object_name="")
         self._register(buffer_syncer)
         self._state.buffer_syncer = buffer_syncer
+
+        # BacklogManager singleton — receives backlog responses
+        backlog_mgr = BacklogManager(object_name="")
+        self._register(backlog_mgr)
 
     # -- Sync dispatch -------------------------------------------------------
 
@@ -355,6 +362,10 @@ class Dispatcher:
         if class_name == BufferSyncer.CLASS_NAME:
             assert isinstance(obj, BufferSyncer)
             self._drain_buffer_syncer_pending(obj)
+            return
+        if class_name == BacklogManager.CLASS_NAME and slot_name == b"receiveBacklog":
+            assert isinstance(obj, BacklogManager)
+            self._merge_backlog(obj)
 
     def _drain_buffer_syncer_pending(self, syncer: BufferSyncer) -> None:
         """Emit BufferRemoved / BufferRenamed for pending BufferSyncer ops.
@@ -395,6 +406,48 @@ class Dispatcher:
                     self._state.buffers[buffer_id] = renamed
                 self._emit(BufferRenamed(buffer_id=buffer_id, name=new_name))
             syncer.renamed_buffers.clear()
+
+    def _merge_backlog(self, mgr: BacklogManager) -> None:
+        """Convert raw backlog Messages and prepend to state, deduped.
+
+        Called after the BacklogManager's `receiveBacklog` slot has
+        stashed the raw Messages on `mgr.last_received`. We convert
+        each to `IrcMessage`, deduplicate by `msg_id` against the
+        existing list, sort by `msg_id`, and emit `BacklogReceived`.
+        """
+        raw_messages = mgr.last_received
+        mgr.last_received = []
+        if not raw_messages:
+            return
+        first_raw = raw_messages[0]
+        buffer_id = first_raw.buffer_info.buffer_id
+        existing = self._state.messages.setdefault(buffer_id, [])
+        existing_ids = {m.msg_id for m in existing}
+        new_messages: list[IrcMessage] = []
+        for raw in raw_messages:
+            bid = raw.buffer_info.buffer_id
+            self._state.buffers.setdefault(bid, raw.buffer_info)
+            if raw.msg_id in existing_ids:
+                continue
+            narrow = IrcMessage(
+                msg_id=raw.msg_id,
+                buffer_id=bid,
+                network_id=raw.buffer_info.network_id,
+                timestamp=raw.timestamp,
+                type=raw.type,
+                flags=raw.flags,
+                sender=raw.sender,
+                sender_prefixes=raw.sender_prefixes,
+                contents=raw.contents,
+            )
+            new_messages.append(narrow)
+        if new_messages:
+            existing.extend(new_messages)
+            existing.sort(key=lambda m: int(m.msg_id))
+        cap = self._state.max_messages_per_buffer
+        if cap > 0 and len(existing) > cap:
+            del existing[: len(existing) - cap]
+        self._emit(BacklogReceived(buffer_id=buffer_id, count=len(new_messages)))
 
     def _store_and_emit_message(self, raw: Message) -> None:
         """Append a decoded `Message` to `state.messages` and emit the event.

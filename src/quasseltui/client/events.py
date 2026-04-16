@@ -13,6 +13,7 @@ Aliases:
 """
 
 from quasseltui.sync.events import (
+    BacklogReceived,
     BufferAdded,
     BufferRemoved,
     BufferRenamed,
@@ -30,6 +31,7 @@ from quasseltui.sync.events import (
 )
 
 __all__ = [
+    "BacklogReceived",
     "BufferAdded",
     "BufferRemoved",
     "BufferRenamed",

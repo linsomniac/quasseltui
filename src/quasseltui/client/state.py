@@ -58,6 +58,7 @@ class ClientState:
     messages: dict[BufferId, list[IrcMessage]] = field(default_factory=dict)
     identities: dict[IdentityId, Identity] = field(default_factory=dict)
     buffer_syncer: BufferSyncer | None = None
+    backlog_requested: set[BufferId] = field(default_factory=set)
     max_messages_per_buffer: int = 5000
 
     def network_for_buffer(self, buffer_id: BufferId) -> Network | None:

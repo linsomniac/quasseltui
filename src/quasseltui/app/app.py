@@ -210,6 +210,8 @@ class QuasselApp(App[None]):
         tree = self._find(BufferTree)
         if tree is not None:
             tree.set_active_buffer(event.buffer_id)
+        if event.buffer_id is not None and self._client is not None:
+            self.run_worker(self._request_backlog(event.buffer_id), exclusive=False)
 
     @on(BufferSelected)
     def _on_buffer_selected(self, event: BufferSelected) -> None:
@@ -312,6 +314,15 @@ class QuasselApp(App[None]):
         """
         self.active_buffer_id = buffer_id
         self.post_message(ActiveBufferUpdated(buffer_id=buffer_id))
+
+    async def _request_backlog(self, buffer_id: BufferId) -> None:
+        """Fire-and-forget backlog request. Errors are logged, not raised."""
+        if self._client is None:
+            return
+        try:
+            await self._client.request_backlog(buffer_id)
+        except QuasselError as exc:
+            _log.warning("backlog request failed for buffer %d: %s", int(buffer_id), exc)
 
     def _find(self, widget_type: type[_WidgetT]) -> _WidgetT | None:
         """Query the current screen for a widget, returning None if absent.

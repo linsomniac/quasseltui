@@ -127,6 +127,19 @@ class MessageReceived:
 
 
 @dataclass(frozen=True, slots=True)
+class BacklogReceived:
+    """The core replied to a `requestBacklog` with historical messages.
+
+    `count` is the number of messages that were merged into state. The
+    bridge uses this to trigger a message-log refresh when backlog
+    arrives for the active buffer.
+    """
+
+    buffer_id: BufferId
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
 class IdentityAdded:
     identity_id: IdentityId
     name: str
@@ -156,12 +169,14 @@ ClientEvent = (
     | BufferRenamed
     | BufferRemoved
     | MessageReceived
+    | BacklogReceived
     | IdentityAdded
     | ClientDisconnected
 )
 
 
 __all__ = [
+    "BacklogReceived",
     "BufferAdded",
     "BufferRemoved",
     "BufferRenamed",

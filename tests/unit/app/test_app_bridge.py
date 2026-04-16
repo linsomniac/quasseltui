@@ -75,6 +75,11 @@ class _StubClient:
         while True:
             yield await self._queue.get()
 
+    async def request_backlog(
+        self, buffer_id: BufferId, limit: int = 100
+    ) -> None:  # pragma: no cover - stub
+        pass
+
     async def close(self) -> None:
         self.closed = True
 

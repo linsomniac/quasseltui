@@ -1,0 +1,64 @@
+name: Publish to PyPI
+
+# Publishes `quasseltui` to PyPI whenever a GitHub release is published.
+# Uses PyPI trusted publishing (OIDC) — no API token required. Configure once at:
+#   https://pypi.org/manage/project/quasseltui/settings/publishing/
+# with:
+#   - Owner:          linsomniac
+#   - Repository:     quasseltui
+#   - Workflow name:  release.yml
+#   - Environment:    pypi
+#
+# The release flow is: bump version in pyproject.toml + src/quasseltui/__init__.py,
+# commit, `git tag vX.Y.Z`, `git push --tags`, then create a GitHub release for
+# that tag — publication starts on release-published.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/quasseltui
+    permissions:
+      id-token: write  # required for trusted publishing
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

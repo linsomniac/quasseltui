@@ -4,6 +4,8 @@ Terminal client for [Quassel IRC](https://www.quassel-irc.org/) cores. Connects
 to your existing `quasselcore` and gives you a Textual-based TUI as an
 alternative to `quasselclient` (the Qt GUI) or Quasseldroid.
 
+![quasseltui in action](docs/screenshot.png)
+
 **Status: under construction.** See `/home/sean/.claude/plans/prancy-plotting-lovelace.md`
 for the build plan.
 

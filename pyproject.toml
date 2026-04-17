@@ -3,12 +3,44 @@ name = "quasseltui"
 version = "0.0.0"
 description = "Terminal client for Quassel IRC cores"
 readme = "README.md"
+license = "CC0-1.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Sean Reifschneider", email = "jafo00@gmail.com" }]
-license = { text = "MIT" }
+keywords = [
+    "quassel",
+    "irc",
+    "tui",
+    "terminal",
+    "textual",
+    "chat",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: Console :: Curses",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat :: Internet Relay Chat",
+    "Topic :: Terminals",
+]
 dependencies = [
     "textual>=0.60",
 ]
+
+[project.urls]
+Homepage = "https://github.com/linsomniac/quasseltui"
+Repository = "https://github.com/linsomniac/quasseltui"
+Issues = "https://github.com/linsomniac/quasseltui/issues"
+Changelog = "https://github.com/linsomniac/quasseltui/releases"
 
 [project.scripts]
 quasseltui = "quasseltui.cli:main"

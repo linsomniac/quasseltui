@@ -6,17 +6,25 @@ alternative to `quasselclient` (the Qt GUI) or Quasseldroid.
 
 ![quasseltui in action](docs/screenshot.png)
 
-**Status: under construction.** See `/home/sean/.claude/plans/prancy-plotting-lovelace.md`
-for the build plan.
-
 ## Quick start
 
+Run via UVX without downloading/installing:
+
 ```sh
+uvx --from git+https://github.com/linsomniac/quasseltui@main quasseltui
+```
+
+Run via UV:
+
+```sh
+#  clone this repo, then:
 uv sync
 uv run python -m quasseltui --help
 ```
 
 ## Config file
+
+Instead of using command-line arguments (`quasseltui --help` for more information), you can use a config file.
 
 Connection settings can be loaded from `~/.config/quasseltui/config.ini`
 (or `$XDG_CONFIG_HOME/quasseltui/config.ini`) so that `--host`, `--port`,
@@ -31,7 +39,7 @@ default_server = home
 [server:home]
 host = irc.example.com
 port = 4242
-user = sean
+user = linsomniac
 password = hunter2
 # tls = true              (default; set to false for plain TCP)
 # insecure = false        (skip cert verification; self-signed cores)
@@ -41,7 +49,7 @@ password = hunter2
 [server:work]
 host = irc.work.example
 port = 4242
-user = sreifschneider
+user = linsomniac
 ```
 
 Because the file stores the password, make sure it's readable only by

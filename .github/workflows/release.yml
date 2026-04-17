@@ -1,6 +1,10 @@
 name: Publish to PyPI
 
 # Publishes `quasseltui` to PyPI whenever a GitHub release is published.
+# The release tag (e.g. `v1.2.3`) is stamped into pyproject.toml and
+# `src/quasseltui/__init__.py` just before building, so the sdist, wheel,
+# and the assets attached to the GitHub release all carry that version.
+#
 # Uses PyPI trusted publishing (OIDC) — no API token required. Configure once at:
 #   https://pypi.org/manage/project/quasseltui/settings/publishing/
 # with:
@@ -9,14 +13,19 @@ name: Publish to PyPI
 #   - Workflow name:  release.yml
 #   - Environment:    pypi
 #
-# The release flow is: bump version in pyproject.toml + src/quasseltui/__init__.py,
-# commit, `git tag vX.Y.Z`, `git push --tags`, then create a GitHub release for
-# that tag — publication starts on release-published.
+# Release flow: `git tag vX.Y.Z && git push --tags`, then create a GitHub
+# release for that tag. Publication and asset attachment happen on
+# release-published — no manual version bump in the tree is needed.
 
 on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp (e.g. 1.2.3). Leave blank to build the committed version."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -25,6 +34,8 @@ jobs:
   build:
     name: Build distribution
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # required to attach assets to the GitHub release
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -34,15 +45,46 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Resolve version
+        id: version
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$TAG_NAME" ]; then
+            raw="$TAG_NAME"
+          else
+            raw="$INPUT_VERSION"
+          fi
+          version="${raw#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${version:-<none — keeping committed version>}"
+
+      - name: Stamp version into sources
+        if: steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i -E 's/^version = ".*"/version = "'"$VERSION"'"/' pyproject.toml
+          sed -i -E 's/^__version__ = ".*"/__version__ = "'"$VERSION"'"/' src/quasseltui/__init__.py
+          grep -E '^(version|__version__) = ' pyproject.toml src/quasseltui/__init__.py
+
       - name: Build sdist and wheel
         run: uv build
 
-      - name: Upload distributions
+      - name: Upload distributions (workflow artifact)
         uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
           if-no-files-found: error
+
+      - name: Attach distributions to GitHub release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG_NAME" dist/* --clobber
 
   publish:
     name: Publish to PyPI

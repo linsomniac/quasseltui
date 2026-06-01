@@ -42,7 +42,7 @@ a reconnect supervisor.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, ClassVar, TypeVar
+from typing import TYPE_CHECKING, ClassVar, Literal, TypeVar
 
 from textual import on
 from textual.app import App
@@ -143,6 +143,16 @@ class QuasselApp(App[None]):
         # driven explicitly by the bridge and read by the message
         # handlers below.
         self.active_buffer_id: BufferId | None = None
+        # Set once a mid-session disconnect lands. The live UI has no
+        # reconnect path yet, so this latches for the rest of the
+        # session and gates the disconnected-state surface (disabled
+        # input + placeholder). Read by tests and a future status bar.
+        self.connection_lost: bool = False
+        # In-app notice history. A full-screen TUI hides `logging`
+        # output, so user-facing warnings (failed sends, lost
+        # connection) are recorded here AND surfaced as a toast via
+        # `_notify_user`. A future status/log pane can render these.
+        self.notices: list[str] = []
 
     def on_mount(self) -> None:
         self.push_screen(ChatScreen(self._state))
@@ -308,6 +318,10 @@ class QuasselApp(App[None]):
         except QuasselError as exc:
             _log.warning("send_input failed: %s", exc)
             self._restore_input(event.text)
+            # Tell the user the line didn't go out — without this the
+            # restored text just silently reappears, which reads as "I
+            # pressed Enter and nothing happened".
+            self._notify_user(f"Message not sent: {exc}", severity="warning")
 
     def _restore_input(self, text: str) -> None:
         """Put `text` back in the input bar after a failed send.
@@ -370,6 +384,7 @@ class QuasselApp(App[None]):
             await self._client.request_backlog(buffer_id)
         except QuasselError as exc:
             _log.warning("backlog request failed for buffer %d: %s", int(buffer_id), exc)
+            self._notify_user(f"Could not load history: {exc}", severity="warning")
 
     def _find(self, widget_type: type[_WidgetT]) -> _WidgetT | None:
         """Query the current screen for a widget, returning None if absent.
@@ -413,6 +428,48 @@ class QuasselApp(App[None]):
         _log.warning("session ended: %s", safe_reason)
         if self._client is not None and event.fatal:
             self.exit(return_code=1, message=f"quasseltui: {safe_reason}")
+            return
+        # Non-fatal mid-session drop: keep the last state on screen so
+        # the user can still scroll history, but make the loss VISIBLE.
+        # Before this, the drop only hit the (hidden) warning log, so the
+        # app silently went quiet and kept swallowing typed lines — the
+        # 2026-06 review's strongest "feels flaky" finding.
+        if self._client is not None:
+            self._enter_disconnected_state(safe_reason)
+
+    def _enter_disconnected_state(self, reason: str) -> None:
+        """Latch the disconnected state and surface it to the user.
+
+        Idempotent — a second `SessionEnded` (or a redraw) won't stack
+        notices or re-disable an already-disabled bar. Disabling the
+        input bar is the honest signal here: with no reconnect path yet,
+        a typed line has nowhere to go, so we stop pretending it can be
+        sent and explain why in the placeholder.
+        """
+        if self.connection_lost:
+            return
+        self.connection_lost = True
+        self._notify_user(f"Disconnected: {reason}", severity="error")
+        input_bar = self._find(InputBar)
+        if input_bar is not None:
+            input_bar.disabled = True
+            input_bar.placeholder = f"Disconnected: {reason} — press Ctrl+Q to quit"
+
+    def _notify_user(
+        self,
+        message: str,
+        *,
+        severity: Literal["information", "warning", "error"] = "information",
+    ) -> None:
+        """Record a user-facing notice and show it as a toast.
+
+        The record in `self.notices` is the durable half (a TUI hides
+        `logging`, and toasts auto-dismiss); the toast is the immediate
+        half. Both go through here so every user-facing notice has one
+        code path.
+        """
+        self.notices.append(message)
+        self.notify(message, severity=severity)
 
 
 def _ordered_buffer_ids(state: ClientState) -> list[BufferId]:

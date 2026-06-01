@@ -313,6 +313,92 @@ async def test_disconnect_after_session_opened_does_not_exit_fatally() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mid_session_disconnect_is_visible_and_disables_input() -> None:
+    """Regression for the 2026-06 review's top "feels flaky" finding.
+
+    A mid-session drop used to only `_log.warning`, which the alternate
+    screen hides — the UI went quiet with no explanation and the input
+    bar kept silently swallowing lines. Now the app records the loss in
+    `connection_lost`, disables the input bar with a placeholder that
+    names the reason, and pushes a user notice, so the user can SEE that
+    the connection is gone instead of typing into the void.
+    """
+    from quasseltui.app.widgets.input_bar import InputBar
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = []
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+
+        input_bar = app.screen.query_one(InputBar)
+        assert app.connection_lost is False
+        assert input_bar.disabled is False
+
+        client.push_event(ClientDisconnected(reason="core went away", error=None))
+        await pilot.pause()
+        await pilot.pause()
+
+        assert app.connection_lost is True
+        assert input_bar.disabled is True
+        assert "core went away" in input_bar.placeholder
+        assert any("core went away" in notice for notice in app.notices)
+        # Mid-session drop must NOT exit the app — the user keeps their
+        # scrollback and quits on their own terms.
+        assert app.return_code in (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_send_failure_notifies_user() -> None:
+    """A failed send must tell the user, not just silently bounce back.
+
+    Complements `test_input_text_survives_send_failure`: that pins the
+    text-restore; this pins the *feedback*. Without a notice, a racey
+    send failure looks exactly like "I pressed Enter and nothing
+    happened" — a direct contributor to the flaky feeling.
+    """
+    from quasseltui.app.widgets.input_bar import InputBar
+    from quasseltui.protocol.errors import QuasselError
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1)]
+
+    class _FailingSendClient(_StubClient):
+        async def send_input(
+            self, buffer_id: BufferId, text: str
+        ) -> None:  # pragma: no cover - trivial
+            raise QuasselError("simulated broken pipe")
+
+    client = _FailingSendClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.value = "retry me"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        assert input_bar.value == "retry me"
+        assert any("not sent" in notice.lower() for notice in app.notices)
+
+
+@pytest.mark.asyncio
 async def test_fatal_exit_reason_is_truncated_if_long(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -388,6 +474,168 @@ async def test_fatal_exit_message_is_sanitized(
     # of the user-visible-failure contract. Without the exit the
     # user would stay in a blank Textual screen.
     assert app.return_code == 1
+
+
+# ---------------------------------------------------------------------------
+# Scroll anchoring (2026-06 review items 3 & 4)
+# ---------------------------------------------------------------------------
+
+
+def _lines(bid: int, ids: range) -> list[IrcMessage]:
+    """Build a contiguous run of single-line messages for scroll tests."""
+    return [_irc_message(bid, msg_id=i, contents=f"line {i}") for i in ids]
+
+
+def _top_visible_id(log: MessageLog) -> str | None:
+    """The option id at the top of the viewport.
+
+    Messages render one line each, so the option at the top of the
+    viewport is the one whose index equals the (rounded) vertical scroll
+    offset. This mirrors how `MessageLog` itself computes its anchor.
+    """
+    idx = round(log.scroll_y)
+    idx = max(0, min(log.option_count - 1, idx))
+    return log.get_option_at_index(idx).id
+
+
+async def _open_buffer(pilot: object, app: QuasselApp, client: _StubClient) -> MessageLog:
+    await pilot.pause()  # type: ignore[attr-defined]
+    session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+    client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+    await pilot.pause()  # type: ignore[attr-defined]
+    await pilot.pause()  # type: ignore[attr-defined]
+    return app.screen.query_one(MessageLog)
+
+
+@pytest.mark.asyncio
+async def test_live_message_keeps_scrolled_up_reader_anchored() -> None:
+    """A live message must not yank a scrolled-up reader to the top.
+
+    The dominant "feels flaky" symptom: reading history on a busy
+    channel while new lines arrive, the ~50ms refresh rebuilds the log
+    and `clear_options` resets the scroll to the top every time. The fix
+    anchors the viewport on the message that was at the top so an append
+    below the fold leaves the reader exactly where they were.
+    """
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = _lines(11, range(1, 101))
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        log = await _open_buffer(pilot, app, client)
+        assert app.active_buffer_id == buf.buffer_id
+
+        log.scroll_to(y=20, animate=False, immediate=True)
+        await pilot.pause()
+        assert not log.is_vertical_scroll_end
+        top_before = _top_visible_id(log)
+
+        # A live message arrives for the active buffer — same refresh
+        # path the bridge's debounced ActiveBufferUpdated drives.
+        state.messages[buf.buffer_id].append(_irc_message(11, msg_id=101, contents="newest"))
+        log.set_active_buffer(buf.buffer_id)
+        await pilot.pause()
+
+        assert _top_visible_id(log) == top_before
+        assert not log.is_vertical_scroll_end
+
+
+@pytest.mark.asyncio
+async def test_backlog_prepend_keeps_reader_anchored() -> None:
+    """Backlog merge prepends older rows; the reader must stay on content.
+
+    Opening a channel fires a backlog request whose reply inserts N
+    older messages ABOVE the current view. Resetting scroll to the top
+    dumps the reader into ancient history. The same top-anchor keeps the
+    previously-top message in place, with the fetched history added above
+    it.
+    """
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = _lines(11, range(51, 101))
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        log = await _open_buffer(pilot, app, client)
+
+        log.scroll_to(y=5, animate=False, immediate=True)
+        await pilot.pause()
+        assert not log.is_vertical_scroll_end
+        top_before = _top_visible_id(log)
+
+        older = [_irc_message(11, msg_id=i, contents=f"old {i}") for i in range(1, 51)]
+        state.messages[buf.buffer_id] = older + state.messages[buf.buffer_id]
+        log.set_active_buffer(buf.buffer_id)
+        await pilot.pause()
+
+        assert _top_visible_id(log) == top_before
+
+
+@pytest.mark.asyncio
+async def test_focus_while_scrolled_up_does_not_jump_to_tail() -> None:
+    """Tabbing into the log while scrolled up must not snap to newest.
+
+    `on_focus` used to always highlight the last message, which scrolls
+    to the tail and rips the reader away from the history they were
+    looking at. When scrolled up we instead land the cursor on the
+    top-visible message — still selectable for a marker, but no jump.
+    """
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = _lines(11, range(1, 101))
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        log = await _open_buffer(pilot, app, client)
+
+        log.scroll_to(y=20, animate=False, immediate=True)
+        await pilot.pause()
+        assert not log.is_vertical_scroll_end
+
+        await pilot.press("shift+tab")
+        await pilot.pause()
+        assert app.focused is log
+
+        # The view stayed put (no snap to the bottom) and a visible row
+        # is highlighted so Enter still places a marker.
+        assert not log.is_vertical_scroll_end
+        assert log.highlighted is not None
+        assert log.highlighted < 40
+
+
+@pytest.mark.asyncio
+async def test_live_message_at_tail_still_follows() -> None:
+    """Regression guard: a reader sitting at the tail keeps following.
+
+    The anchor logic must NOT break the common case — when you're at the
+    bottom of a live channel, new messages should still scroll into view.
+    """
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = _lines(11, range(1, 101))
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        log = await _open_buffer(pilot, app, client)
+
+        log.scroll_end(animate=False, immediate=True)
+        await pilot.pause()
+        assert log.is_vertical_scroll_end
+
+        state.messages[buf.buffer_id].append(_irc_message(11, msg_id=101, contents="newest"))
+        log.set_active_buffer(buf.buffer_id)
+        await pilot.pause()
+
+        assert log.is_vertical_scroll_end
 
 
 # ---------------------------------------------------------------------------

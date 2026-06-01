@@ -467,6 +467,68 @@ class TestBufferRemovedRepicksActive:
         assert active_updates == []
 
 
+class TestActiveBufferHijack:
+    """Regression for the 2026-06 review's "active-buffer hijack".
+
+    The cold-start default-pick used to call `_pick_default_buffer`,
+    which returns the *first buffer in dict order that has any content*.
+    So a live message arriving for one buffer could land the user on a
+    different one purely because of insertion order, and a stray late
+    message could re-derive the "default" after the user was already
+    established. Both feed the "it randomly jumps me to another channel"
+    flaky feeling.
+    """
+
+    async def test_cold_start_message_lands_on_its_own_buffer(self) -> None:
+        """The first live message picks the buffer it arrived in.
+
+        `#first` is inserted into `state.messages` before `#second`, so
+        the old "first buffer with content" heuristic would land on
+        `#first`. The activity is in `#second`, so that's where the user
+        should land — and the choice must not depend on dict order.
+        """
+        state = ClientState()
+        first = _buffer_info(1, name="#first")
+        second = _buffer_info(2, name="#second")
+        state.buffers[first.buffer_id] = first
+        state.buffers[second.buffer_id] = second
+        state.messages[first.buffer_id] = [_irc_message(1, msg_id=10)]
+        state.messages[second.buffer_id] = [_irc_message(2, msg_id=20)]
+        sink = _StubSink()
+        bridge = ClientBridge(
+            events=_iter(MessageReceived(_irc_message(2, msg_id=21))),
+            sink=sink,
+            state=state,
+            debounce_seconds=0.005,
+        )
+        await bridge.run()
+        assert sink.active_buffer_id == BufferId(2)
+
+    def test_stray_message_does_not_repick_after_established(self) -> None:
+        """Once established, a stray message must not auto-switch buffers.
+
+        Simulates "the user was established on a buffer, the pointer
+        later went to `None`". A `MessageReceived` for some other buffer
+        that happens to hold content must NOT silently re-pick an active
+        buffer — that is the hijack. Driven through the synchronous
+        `_handle` so no debounce/async is involved.
+        """
+        state = ClientState()
+        a = _buffer_info(1, name="#a")
+        b = _buffer_info(2, name="#b")
+        state.buffers[a.buffer_id] = a
+        state.buffers[b.buffer_id] = b
+        state.messages[a.buffer_id] = [_irc_message(1, msg_id=1)]
+        state.messages[b.buffer_id] = [_irc_message(2, msg_id=2)]
+        sink = _StubSink()
+        bridge = ClientBridge(events=_iter(), sink=sink, state=state)
+        bridge._ever_active = True
+        sink.active_buffer_id = None
+        bridge._handle(MessageReceived(_irc_message(2, msg_id=3)))
+        assert sink.active_buffer_id is None
+        assert [m for m in sink.posted if isinstance(m, ActiveBufferUpdated)] == []
+
+
 class TestPickDefaultBufferFreeFunction:
     def test_returns_none_for_empty_state(self) -> None:
         assert _pick_default_buffer(ClientState()) is None

@@ -129,6 +129,14 @@ class ClientBridge:
             debounce_seconds if debounce_seconds is not None else self.DEBOUNCE_SECONDS
         )
         self._debounce_task: asyncio.Task[None] | None = None
+        # Tracks whether an active buffer has ever been established (by
+        # the cold-start default-pick, a user selection reflected back
+        # through the sink, or the first live message). Once true, the
+        # message path stops auto-picking, so a stray late message can't
+        # silently re-derive a "default" and hijack the user onto an
+        # arbitrary buffer — the 2026-06 review's active-buffer-hijack
+        # finding. Set once, never reset within a session.
+        self._ever_active: bool = False
         # Tracks whether we've seen a `SessionOpened` yet. Used to
         # stamp a `fatal` flag on `SessionEnded` so the app doesn't
         # have to infer fatal-vs-mid-session-drop from message
@@ -237,14 +245,20 @@ class ClientBridge:
     def _handle_message(self, event: MessageReceived) -> None:
         """Apply a `MessageReceived` — coalesce if active, ignore if not.
 
-        Calls `_maybe_pick_default_active_buffer` first to cover the
-        cold-start case where the very first message precedes any
-        explicit buffer pick (the dispatcher appends to
-        `state.messages` before emitting, so a default pick at this
-        point will see the new content).
+        Cold start only: if no buffer has ever been active, land on the
+        buffer this message arrived in. That's where the activity is, and
+        unlike the old `_pick_default_buffer` call here it doesn't depend
+        on dict insertion order — two buffers with content used to make
+        the landing spot arbitrary. Once `_ever_active` is set, a later
+        message never re-picks the active buffer, so a stray line can't
+        hijack the user onto another channel (2026-06 review finding).
         """
-        self._maybe_pick_default_active_buffer()
-        if event.message.buffer_id != self._sink.active_buffer_id:
+        buffer_id = event.message.buffer_id
+        if self._sink.active_buffer_id is None and not self._ever_active:
+            self._sink.active_buffer_id = buffer_id
+            self._ever_active = True
+            self._sink.post_message(ActiveBufferUpdated(buffer_id=buffer_id))
+        if buffer_id != self._sink.active_buffer_id:
             return
         self._schedule_active_refresh()
 
@@ -278,11 +292,16 @@ class ClientBridge:
         no-op until phase 8 wires explicit user selection.
         """
         if self._sink.active_buffer_id is not None:
+            # Already established — by a prior pick or a user selection
+            # reflected back through the shared sink. Remember that so
+            # the message path won't auto-pick again.
+            self._ever_active = True
             return
         new_id = _pick_default_buffer(self._state)
         if new_id is None:
             return
         self._sink.active_buffer_id = new_id
+        self._ever_active = True
         self._sink.post_message(ActiveBufferUpdated(buffer_id=new_id))
 
 

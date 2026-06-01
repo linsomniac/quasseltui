@@ -132,23 +132,36 @@ class MessageLog(OptionList):
         The distinction is made by comparing `buffer_id` to
         `self._active_buffer` before the rebuild. We also remember
         whether the scroll was at the tail: if it was, new messages
-        should still push the view forward; if the user had scrolled
-        up to read history, we leave them there.
+        should still push the view forward; if the user had scrolled up
+        to read history, we anchor on the message that was at the top of
+        the viewport so the rebuild doesn't yank them away — `_rebuild`'s
+        `clear_options` resets the scroll to the top, and both live
+        appends (below the fold) and backlog prepends (above the fold)
+        would otherwise dump the reader somewhere they didn't ask to be.
         """
         is_refresh = buffer_id == self._active_buffer
         preserved_id: str | None = None
         was_at_tail = True
+        anchor_id: str | None = None
         if is_refresh:
             preserved_id = self._current_highlighted_id()
             was_at_tail = self.is_vertical_scroll_end
+            if not was_at_tail:
+                anchor_id = self._top_visible_option_id()
         self._active_buffer = buffer_id
         self._rebuild()
         if is_refresh and preserved_id is not None:
             self._restore_highlight(preserved_id)
         else:
             self.highlighted = None
+        # Exactly one scroll decision so the highlight restore and the
+        # scroll restore can't fight each other: a fresh switch or an
+        # at-tail refresh follows the newest message; a scrolled-up
+        # refresh re-pins the previously-top message in place.
         if not is_refresh or was_at_tail:
             self.scroll_end(animate=False, immediate=True)
+        elif anchor_id is not None:
+            self._restore_top_anchor(anchor_id)
 
     def on_focus(self) -> None:
         """Pre-select the latest message when focus arrives with no highlight.
@@ -159,16 +172,23 @@ class MessageLog(OptionList):
         it requires a highlighted option. The user's perception is that
         they pressed Enter "on a blank message" and nothing happened.
 
-        We snap to the last non-disabled option (the newest message,
-        since the marker row is disabled) so the cursor is visible as
-        soon as focus lands and Enter immediately drops a marker on
-        the most recent line. If the user has already moved the cursor
-        on a prior visit we leave it where it was — preserving their
-        navigation state across Tab-in/Tab-out cycles is the whole
+        When the user is at the tail we snap to the last non-disabled
+        option (the newest message) so Enter immediately drops a marker
+        on the most recent line. When they've scrolled up to read
+        history we instead land on the top-visible message: still a
+        selectable cursor, but it doesn't scroll the view — snapping to
+        the tail here would rip the reader off the history they were
+        looking at (2026-06 review). If the user has already moved the
+        cursor on a prior visit we leave it where it was — preserving
+        their navigation state across Tab-in/Tab-out cycles is the whole
         reason we don't reset `highlighted` on blur.
         """
-        if self.highlighted is None:
+        if self.highlighted is not None:
+            return
+        if self.is_vertical_scroll_end:
             self.highlighted = self._last_message_index()
+        else:
+            self.highlighted = self._top_visible_message_index()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         """Handle Enter / click on an option row.
@@ -247,6 +267,14 @@ class MessageLog(OptionList):
     def _restore_highlight(self, option_id: str) -> None:
         """Put the cursor back on the option with `option_id`, if it still exists.
 
+        Uses `set_reactive` rather than a plain assignment so restoring
+        the highlight does NOT trigger OptionList's scroll-to-highlight
+        watcher — otherwise it would fight the explicit scroll decision
+        in `set_active_buffer` (the cursor would tug the viewport one
+        way while the anchor/tail logic pulls it the other, a visible
+        jitter). The list was just fully rebuilt, so the new highlight
+        value is picked up on the next render regardless.
+
         Silently no-ops when the option is gone (e.g. the message it
         pointed at was trimmed by the retention cap during the rebuild
         window). The `get_option_index` API raises `OptionDoesNotExist`
@@ -255,9 +283,74 @@ class MessageLog(OptionList):
         list after a buffer switch" behaviour.
         """
         try:
-            self.highlighted = self.get_option_index(option_id)
+            self.set_reactive(OptionList.highlighted, self.get_option_index(option_id))
         except Exception:
-            self.highlighted = None
+            self.set_reactive(OptionList.highlighted, None)
+
+    def _top_visible_index(self) -> int | None:
+        """Index of the option at the top of the viewport, or None if empty.
+
+        Messages render one line each, so the option whose index equals
+        the rounded vertical scroll offset is the one resting at the top
+        of the viewport. Clamped into range so a stale `scroll_y` during
+        a rebuild can't point past the ends.
+
+        AIDEV-NOTE: the whole scroll-anchor scheme (`_top_visible_index`,
+        `_restore_top_anchor`) assumes one rendered line per option — it
+        maps option-index ⇄ scroll-line directly. `format_message`
+        guarantees this today (it sanitizes newlines and renders a single
+        `Text` line per message). If messages ever wrap or grow to
+        multiple lines, this mapping breaks and the anchor will drift;
+        switch to a real per-option y lookup at that point.
+        """
+        if self.option_count == 0:
+            return None
+        idx = round(self.scroll_y)
+        return max(0, min(self.option_count - 1, idx))
+
+    def _top_visible_option_id(self) -> str | None:
+        """The id of the top-visible option — the scroll anchor."""
+        idx = self._top_visible_index()
+        if idx is None:
+            return None
+        try:
+            return self.get_option_at_index(idx).id
+        except Exception:
+            return None
+
+    def _top_visible_message_index(self) -> int | None:
+        """First selectable (message) option at or below the top of the view.
+
+        Used by `on_focus` to land the cursor on a visible row without
+        scrolling. Skips the disabled marker row, falling back upward if
+        the only options below the fold are non-selectable.
+        """
+        top = self._top_visible_index()
+        if top is None:
+            return None
+        for i in range(top, self.option_count):
+            if not self.get_option_at_index(i).disabled:
+                return i
+        for i in range(top - 1, -1, -1):
+            if not self.get_option_at_index(i).disabled:
+                return i
+        return None
+
+    def _restore_top_anchor(self, option_id: str) -> None:
+        """Scroll so the anchored option sits back at the top of the viewport.
+
+        Because each option is one line, the option's new index is its
+        new top-of-viewport scroll offset. Live appends leave the index
+        unchanged (so the reader doesn't move); backlog prepends push it
+        down by the number of fetched rows (so the same content stays in
+        view with history added above). No-op if the anchor was evicted
+        by the retention cap during the rebuild.
+        """
+        try:
+            idx = self.get_option_index(option_id)
+        except Exception:
+            return
+        self.scroll_to(y=idx, animate=False, immediate=True)
 
     def _pick_initial_buffer(self) -> BufferId | None:
         """Default-select the first buffer that has any history.

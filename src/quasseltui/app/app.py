@@ -222,7 +222,11 @@ class QuasselApp(App[None]):
         tree = self._find(BufferTree)
         if tree is not None:
             tree.set_active_buffer(event.buffer_id)
-        if event.buffer_id is not None and self._client is not None:
+        if event.buffer_id is not None and self._client is not None and not self.connection_lost:
+            # Don't chase backlog once the socket is gone — a post-drop
+            # buffer switch (alt+up/down still fire) would otherwise spawn
+            # requests that fail against the closed client and spam the
+            # "Could not load history" notice.
             self.run_worker(self._request_backlog(event.buffer_id), exclusive=False)
 
     @on(BufferSelected)
@@ -467,9 +471,17 @@ class QuasselApp(App[None]):
         `logging`, and toasts auto-dismiss); the toast is the immediate
         half. Both go through here so every user-facing notice has one
         code path.
+
+        The message is sanitized and length-bounded because some notices
+        embed untrusted core text (disconnect reasons, exception strings
+        wrapping core errors): control bytes are escaped so they can't
+        reach the terminal, and `markup=False` stops bracketed text like
+        `[Errno 104]` from being parsed as Rich markup (which would
+        restyle the toast or raise on a malformed tag).
         """
-        self.notices.append(message)
-        self.notify(message, severity=severity)
+        safe = _sanitize_and_truncate_reason(message)
+        self.notices.append(safe)
+        self.notify(safe, severity=severity, markup=False)
 
 
 def _ordered_buffer_ids(state: ClientState) -> list[BufferId]:

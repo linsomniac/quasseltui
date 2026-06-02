@@ -142,12 +142,12 @@ class MessageLog(OptionList):
         is_refresh = buffer_id == self._active_buffer
         preserved_id: str | None = None
         was_at_tail = True
-        anchor_id: str | None = None
+        anchor: tuple[str, int] | None = None
         if is_refresh:
             preserved_id = self._current_highlighted_id()
             was_at_tail = self.is_vertical_scroll_end
             if not was_at_tail:
-                anchor_id = self._top_visible_option_id()
+                anchor = self._capture_scroll_anchor()
         self._active_buffer = buffer_id
         self._rebuild()
         if is_refresh and preserved_id is not None:
@@ -160,8 +160,8 @@ class MessageLog(OptionList):
         # refresh re-pins the previously-top message in place.
         if not is_refresh or was_at_tail:
             self.scroll_end(animate=False, immediate=True)
-        elif anchor_id is not None:
-            self._restore_top_anchor(anchor_id)
+        elif anchor is not None:
+            self._restore_scroll_anchor(anchor)
 
     def on_focus(self) -> None:
         """Pre-select the latest message when focus arrives with no highlight.
@@ -287,70 +287,115 @@ class MessageLog(OptionList):
         except Exception:
             self.set_reactive(OptionList.highlighted, None)
 
-    def _top_visible_index(self) -> int | None:
-        """Index of the option at the top of the viewport, or None if empty.
+    # AIDEV-NOTE: the scroll-anchor scheme leans on two private Textual
+    # OptionList caches — `_lines` (a per-rendered-line list of
+    # `(option_index, line_within_option)`) and `_index_to_line` (an
+    # option_index -> first-rendered-line map). We need them because IRC
+    # lines wrap: one option can span several scroll lines, so
+    # `scroll_y` is NOT an option index. These are private APIs; every
+    # access goes through the guarded helpers below and degrades to "no
+    # anchor" (rather than crashing) if a future Textual renames them.
+    # `_index_to_line` is refreshed synchronously by `add_options`, so
+    # the post-rebuild restore reads correct line numbers.
 
-        Messages render one line each, so the option whose index equals
-        the rounded vertical scroll offset is the one resting at the top
-        of the viewport. Clamped into range so a stale `scroll_y` during
-        a rebuild can't point past the ends.
+    def _scroll_line_to_option(self, line: int) -> int | None:
+        """Option index occupying rendered scroll `line`, or None.
 
-        AIDEV-NOTE: the whole scroll-anchor scheme (`_top_visible_index`,
-        `_restore_top_anchor`) assumes one rendered line per option — it
-        maps option-index ⇄ scroll-line directly. `format_message`
-        guarantees this today (it sanitizes newlines and renders a single
-        `Text` line per message). If messages ever wrap or grow to
-        multiple lines, this mapping breaks and the anchor will drift;
-        switch to a real per-option y lookup at that point.
+        Reads Textual's `_lines` cache so wrapped multi-line options map
+        correctly. Clamps `line` into range so a stale `scroll_y` during
+        a rebuild can't index past the ends.
         """
-        if self.option_count == 0:
+        lines = getattr(self, "_lines", None)
+        if not lines:
             return None
-        idx = round(self.scroll_y)
-        return max(0, min(self.option_count - 1, idx))
-
-    def _top_visible_option_id(self) -> str | None:
-        """The id of the top-visible option — the scroll anchor."""
-        idx = self._top_visible_index()
-        if idx is None:
-            return None
+        line = max(0, min(len(lines) - 1, line))
         try:
-            return self.get_option_at_index(idx).id
-        except Exception:
+            return int(lines[line][0])
+        except (IndexError, TypeError, ValueError):
             return None
 
-    def _top_visible_message_index(self) -> int | None:
-        """First selectable (message) option at or below the top of the view.
+    def _option_first_line(self, index: int) -> int | None:
+        """First rendered scroll line of an option, via `_index_to_line`."""
+        mapping = getattr(self, "_index_to_line", None)
+        if mapping is None:
+            return None
+        value = mapping.get(index)
+        return int(value) if value is not None else None
 
-        Used by `on_focus` to land the cursor on a visible row without
-        scrolling. Skips the disabled marker row, falling back upward if
-        the only options below the fold are non-selectable.
+    def _first_message_index_from(self, start: int) -> int | None:
+        """First selectable (message) option at or below `start`.
+
+        Skips the disabled marker row so the anchor is always a stable
+        message id — anchoring on the marker would let a marker move drag
+        the viewport. Falls back upward if everything below is disabled.
         """
-        top = self._top_visible_index()
-        if top is None:
-            return None
-        for i in range(top, self.option_count):
+        start = max(0, min(self.option_count - 1, start))
+        for i in range(start, self.option_count):
             if not self.get_option_at_index(i).disabled:
                 return i
-        for i in range(top - 1, -1, -1):
+        for i in range(start - 1, -1, -1):
             if not self.get_option_at_index(i).disabled:
                 return i
         return None
 
-    def _restore_top_anchor(self, option_id: str) -> None:
-        """Scroll so the anchored option sits back at the top of the viewport.
+    def _capture_scroll_anchor(self) -> tuple[str, int] | None:
+        """Snapshot the viewport: a stable message id + line offset from its top.
 
-        Because each option is one line, the option's new index is its
-        new top-of-viewport scroll offset. Live appends leave the index
-        unchanged (so the reader doesn't move); backlog prepends push it
-        down by the number of fetched rows (so the same content stays in
-        view with history added above). No-op if the anchor was evicted
-        by the retention cap during the rebuild.
+        Anchors on the first *message* option intersecting the top of the
+        view (skipping the marker row) and records how many rendered lines
+        the viewport top sits below that option's first line, so the
+        restore can reproduce the exact position even when rows wrap.
+        Returns None when there's nothing to anchor on.
         """
+        if self.option_count == 0:
+            return None
+        top_line = round(self.scroll_y)
+        top_index = self._scroll_line_to_option(top_line)
+        if top_index is None:
+            return None
+        anchor_index = self._first_message_index_from(top_index)
+        if anchor_index is None:
+            return None
+        option_id = self.get_option_at_index(anchor_index).id
+        if option_id is None:
+            return None
+        first_line = self._option_first_line(anchor_index)
+        if first_line is None:
+            return None
+        return (option_id, top_line - first_line)
+
+    def _restore_scroll_anchor(self, anchor: tuple[str, int]) -> None:
+        """Scroll the anchored message back to its captured viewport position.
+
+        Live appends leave the message's first line unchanged (reader
+        doesn't move); backlog prepends push it down by the fetched rows'
+        height (same content stays in view with history added above).
+        No-op if the anchor was evicted by the retention cap during the
+        rebuild or the line cache is unavailable.
+        """
+        option_id, delta = anchor
         try:
-            idx = self.get_option_index(option_id)
+            index = self.get_option_index(option_id)
         except Exception:
             return
-        self.scroll_to(y=idx, animate=False, immediate=True)
+        first_line = self._option_first_line(index)
+        if first_line is None:
+            return
+        self.scroll_to(y=max(0, first_line + delta), animate=False, immediate=True)
+
+    def _top_visible_message_index(self) -> int | None:
+        """First selectable message option at the top of the view.
+
+        Used by `on_focus` to land the cursor on a visible row without
+        scrolling. Goes through the line cache so it's correct when rows
+        wrap.
+        """
+        if self.option_count == 0:
+            return None
+        top_index = self._scroll_line_to_option(round(self.scroll_y))
+        if top_index is None:
+            return None
+        return self._first_message_index_from(top_index)
 
     def _pick_initial_buffer(self) -> BufferId | None:
         """Default-select the first buffer that has any history.

@@ -487,15 +487,17 @@ def _lines(bid: int, ids: range) -> list[IrcMessage]:
 
 
 def _top_visible_id(log: MessageLog) -> str | None:
-    """The option id at the top of the viewport.
+    """The option id genuinely at the top of the viewport.
 
-    Messages render one line each, so the option at the top of the
-    viewport is the one whose index equals the (rounded) vertical scroll
-    offset. This mirrors how `MessageLog` itself computes its anchor.
+    Goes through Textual's line cache (`_lines` maps each rendered scroll
+    line to its option index) rather than assuming one line per option —
+    long IRC lines wrap, so `round(scroll_y)` is NOT the option index.
     """
-    idx = round(log.scroll_y)
-    idx = max(0, min(log.option_count - 1, idx))
-    return log.get_option_at_index(idx).id
+    lines = log._lines
+    if not lines:
+        return None
+    y = max(0, min(len(lines) - 1, round(log.scroll_y)))
+    return log.get_option_at_index(lines[y][0]).id
 
 
 async def _open_buffer(pilot: object, app: QuasselApp, client: _StubClient) -> MessageLog:
@@ -608,6 +610,186 @@ async def test_focus_while_scrolled_up_does_not_jump_to_tail() -> None:
         assert not log.is_vertical_scroll_end
         assert log.highlighted is not None
         assert log.highlighted < 40
+
+
+@pytest.mark.asyncio
+async def test_wrapped_backlog_prepend_keeps_reader_anchored() -> None:
+    """Codex finding 1: the anchor must survive wrapped multi-line rows.
+
+    Long IRC lines wrap, so one option spans several rendered scroll
+    lines and `round(scroll_y)` is not the option index. The first
+    anchor implementation assumed one line per option and restored to the
+    wrong content after a backlog prepend. The line-cache anchor keeps
+    the reader on the same message even when rows wrap.
+    """
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+
+    def long(i: int) -> str:
+        return f"{i}:" + "x" * 220
+
+    state.messages[buf.buffer_id] = [
+        _irc_message(11, msg_id=i, contents=long(i)) for i in range(51, 101)
+    ]
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        log = await _open_buffer(pilot, app, client)
+
+        log.scroll_to(y=20, animate=False, immediate=True)
+        await pilot.pause()
+        assert not log.is_vertical_scroll_end
+        top_before = _top_visible_id(log)
+
+        older = [_irc_message(11, msg_id=i, contents=long(i)) for i in range(1, 51)]
+        state.messages[buf.buffer_id] = older + state.messages[buf.buffer_id]
+        log.set_active_buffer(buf.buffer_id)
+        await pilot.pause()
+
+        assert _top_visible_id(log) == top_before
+
+
+@pytest.mark.asyncio
+async def test_anchor_skips_marker_row_so_marker_move_doesnt_yank() -> None:
+    """Codex finding 2: never anchor on the synthetic marker row.
+
+    The "read up to here" marker is a movable row with a fixed id. If the
+    anchor is the marker and the marker then moves (empty-Enter advances
+    it to the latest message), restoring "the same id" scrolls the
+    viewport to wherever the marker went. The anchor must pin a stable
+    *message* instead.
+    """
+    from quasseltui.app.widgets.message_log import _MARKER_OPTION_ID
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = _lines(11, range(1, 101))
+    # Marker on an early message → its row sits near the top.
+    state.read_markers[buf.buffer_id] = MsgId(5)
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        log = await _open_buffer(pilot, app, client)
+
+        # Render order is msg1..msg5, MARKER, msg6..msg100 — so the marker
+        # row is at index 5. Scroll it to the very top of the viewport.
+        log.scroll_to(y=5, animate=False, immediate=True)
+        await pilot.pause()
+        assert log.get_option_at_index(round(log.scroll_y)).id == _MARKER_OPTION_ID
+        assert not log.is_vertical_scroll_end
+
+        # Move the marker to the latest message and refresh (the path
+        # empty-Enter / MarkerToLatestRequested drives).
+        state.read_markers[buf.buffer_id] = MsgId(100)
+        log.set_active_buffer(buf.buffer_id)
+        await pilot.pause()
+
+        # The viewport must NOT have chased the marker to the bottom.
+        assert not log.is_vertical_scroll_end
+        top_id = _top_visible_id(log)
+        assert top_id is not None and top_id.startswith("msg:")
+        assert int(top_id.split(":")[1]) <= 12
+
+
+@pytest.mark.asyncio
+async def test_send_failure_notice_is_sanitized() -> None:
+    """Codex finding 3: notice text is sanitized and not parsed as markup.
+
+    Send/backlog failure text comes from exceptions that can carry core
+    strings with control bytes or Rich-markup brackets. `_notify_user`
+    must strip control bytes (so they can't reach the terminal) and pass
+    `markup=False` (so bracketed text can't crash or restyle the toast).
+    """
+    from quasseltui.app.widgets.input_bar import InputBar
+    from quasseltui.protocol.errors import QuasselError
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1)]
+
+    class _FailingSendClient(_StubClient):
+        async def send_input(
+            self, buffer_id: BufferId, text: str
+        ) -> None:  # pragma: no cover - trivial
+            raise QuasselError("pipe \x1b[31mboom\x07")
+
+    client = _FailingSendClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.value = "hi"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        assert app.notices
+        notice = app.notices[-1]
+        assert "\x1b" not in notice
+        assert "\x07" not in notice
+        assert "\\x1b" in notice  # escaped form is preserved for debugging
+        assert app.return_code in (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_no_backlog_request_after_disconnect() -> None:
+    """Codex finding 4: stop requesting backlog once disconnected.
+
+    After a mid-session drop the client is dead, but buffer switches
+    (alt+up/down still work) would keep spawning backlog requests that
+    fail against the closed socket and spam "Could not load history".
+    Backlog requests must be gated on the live connection.
+    """
+    state = _empty_state_with_one_network()
+    a = _buffer(11, name="#a")
+    b = _buffer(22, name="#b")
+    state.buffers[a.buffer_id] = a
+    state.buffers[b.buffer_id] = b
+    state.messages[a.buffer_id] = [_irc_message(11, msg_id=1)]
+    state.messages[b.buffer_id] = [_irc_message(22, msg_id=2)]
+
+    requested: list[BufferId] = []
+
+    class _BacklogClient(_StubClient):
+        async def request_backlog(
+            self, buffer_id: BufferId, limit: int = 100
+        ) -> None:  # pragma: no cover - trivial
+            requested.append(buffer_id)
+
+    client = _BacklogClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        client.push_event(ClientDisconnected(reason="gone", error=None))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.connection_lost is True
+
+        before = len(requested)
+        other = b.buffer_id if app.active_buffer_id == a.buffer_id else a.buffer_id
+        app.post_message(BufferSelected(buffer_id=other))
+        await pilot.pause()
+        await pilot.pause()
+
+        assert app.active_buffer_id == other
+        assert len(requested) == before
 
 
 @pytest.mark.asyncio

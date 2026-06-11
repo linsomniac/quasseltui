@@ -68,6 +68,26 @@ With a config in place, three shortcuts become available:
 
 Any command-line flag still overrides the corresponding config value.
 
+## Keys
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+Q` | Quit |
+| `Ctrl+R` | Reconnect after a disconnect (history is kept; the gap is re-fetched) |
+| `Alt+Up` / `Alt+Down` | Previous / next buffer |
+| `Up` / `Down` (in the input bar) | Recall previously sent lines |
+| `Enter` (empty input bar) | Move the read marker to the newest message |
+| `Tab` into the log, then `Enter` on a row | Place the read marker on that message |
+
+Buffers with unseen activity are bold in the sidebar; highlights and
+private messages are bold yellow. Read state and markers sync through
+the core, so reading here marks things read in your other Quassel
+clients (and vice versa on the next run).
+
+Set `QUASSELTUI_LOG=/path/to/file` to capture runtime log output for
+debugging — by default the TUI swallows it so it can't corrupt the
+screen.
+
 ## Development
 
 ```sh

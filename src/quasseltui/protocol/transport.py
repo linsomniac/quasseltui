@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import socket
 import ssl
 from dataclasses import dataclass
@@ -50,7 +51,13 @@ class TlsOptions:
     server_hostname: str | None = None
 
     def build_context(self) -> ssl.SSLContext:
-        ctx = ssl.create_default_context(cafile=self.cafile, capath=self.capath)
+        # expanduser: cafile/capath commonly come from the config file
+        # (`cafile = ~/quassel-core.pem`), where no shell ever expands
+        # the tilde. ssl would otherwise fail with a bare ENOENT on the
+        # literal "~/..." path.
+        cafile = os.path.expanduser(self.cafile) if self.cafile else None
+        capath = os.path.expanduser(self.capath) if self.capath else None
+        ctx = ssl.create_default_context(cafile=cafile, capath=capath)
         if not self.verify:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -103,10 +110,31 @@ async def start_tls_on_writer(
     ClientHello. The paired StreamReader stays valid; asyncio rewires its
     transport to the TLS one under the hood.
     """
-    ctx = options.build_context()
+    try:
+        ctx = options.build_context()
+    except (OSError, ssl.SSLError) as exc:
+        # Bad cafile path / malformed PEM. Without the wrap this escaped
+        # as a bare "[Errno 2] No such file or directory" with no hint
+        # of WHICH file or knob was involved.
+        expanded = os.path.expanduser(options.cafile) if options.cafile else None
+        raise TransportError(
+            f"failed to load TLS trust anchors "
+            f"(cafile={expanded!r}, capath={options.capath!r}): {exc}"
+        ) from exc
     server_hostname = options.server_hostname or host
     try:
         await writer.start_tls(ctx, server_hostname=server_hostname)
+    except ssl.SSLCertVerificationError as exc:
+        # The most common real-world deployment is a self-signed
+        # quasselcore certificate — tell the first-time user what to do
+        # about it instead of leaving them with a raw OpenSSL error.
+        raise TransportError(
+            f"TLS certificate verification for {host} failed: {exc}. "
+            f"The core's certificate is not trusted by the system store — "
+            f"for a self-signed core, pass --cafile <core-cert.pem> to "
+            f"trust it explicitly, or --insecure to skip verification "
+            f"(or set cafile/insecure in the server config)."
+        ) from exc
     except (ssl.SSLError, OSError) as exc:
         raise TransportError(f"TLS upgrade to {host} failed: {exc}") from exc
 

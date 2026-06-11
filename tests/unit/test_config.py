@@ -194,3 +194,22 @@ def test_default_config_path_falls_back_to_home(
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     assert config.default_config_path() == tmp_path / ".config" / "quasseltui" / "config.ini"
+
+
+def test_percent_sign_in_values_is_literal(tmp_path: Path) -> None:
+    """Passwords (and any value) containing % must parse literally.
+
+    ConfigParser's default BasicInterpolation raised an unhandled
+    InterpolationSyntaxError traceback lazily at get() time — outside
+    the ConfigError wrapping — for something as ordinary as a password
+    containing a percent sign.
+    """
+    body = """
+    [server:home]
+    host = irc.example.com
+    port = 4242
+    password = sup%r,s3cret%
+    """
+    cfg = config.load(_write(tmp_path / "config.ini", body))
+    assert cfg is not None
+    assert cfg.servers["home"].password == "sup%r,s3cret%"

@@ -305,8 +305,10 @@ class QuasselConnection:
 
         Always yields exactly one terminal `Disconnected` event before the
         iterator stops, even on success — this gives consumers a single
-        place to know the connection is gone. Re-iterating after that is
-        a no-op (the connection is closed).
+        place to know the connection is gone. Calling `events()` a second
+        time raises `RuntimeError`: the connection is single-use, and a
+        silent empty iterator would hide a caller bug (a reconnect needs
+        a fresh `QuasselConnection`).
         """
         if self._state is not ConnState.INITIAL:
             raise RuntimeError(
@@ -400,7 +402,9 @@ class QuasselConnection:
             # plaintext socket unless the caller explicitly opted in.
             raise ProbeError(
                 "core did not enable TLS but we offered it; refusing to send "
-                "credentials over plaintext (construct with tls=False to override)"
+                "credentials over plaintext (re-run with --no-tls, or set "
+                "tls = false in the server config, only if you trust this "
+                "network path)"
             )
 
         # ---- ClientInit ----

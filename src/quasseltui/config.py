@@ -138,7 +138,12 @@ def load(path: Path | None = None) -> Config | None:
     if not path.exists():
         return None
 
-    parser = configparser.ConfigParser()
+    # interpolation=None: values are literal. The default
+    # BasicInterpolation treats % as a substitution marker and raises
+    # InterpolationSyntaxError lazily at get() time — outside this
+    # try — for something as ordinary as a password containing %.
+    # No quasseltui config key has any use for interpolation.
+    parser = configparser.ConfigParser(interpolation=None)
     try:
         with path.open(encoding="utf-8") as fh:
             parser.read_file(fh)
@@ -211,11 +216,14 @@ def _parse_server(path: Path, name: str, section: configparser.SectionProxy) -> 
         except ValueError as exc:
             raise ConfigError(f"{path}: [server:{name}] {key}: {exc}") from exc
 
-    # Passwords are read verbatim (no strip) so leading/trailing spaces
-    # survive, but an empty value is still treated as "not set" rather
-    # than an intentional empty password — those would fail the login
-    # anyway, and treating empty as unset means the interactive prompt
-    # still fires when the field is present but blank.
+    # Passwords skip the local `.strip()` the other fields get, but
+    # configparser itself already strips leading/trailing whitespace
+    # around values at parse time — INI simply cannot represent a
+    # password with surrounding spaces (interior whitespace is fine).
+    # An empty value is treated as "not set" rather than an intentional
+    # empty password — those would fail the login anyway, and treating
+    # empty as unset means the interactive prompt still fires when the
+    # field is present but blank.
     raw_password = section.get("password", "")
     password = raw_password if raw_password else None
 

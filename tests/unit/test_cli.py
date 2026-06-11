@@ -996,3 +996,99 @@ def test_main_with_no_subcommand_prints_help_and_exits_2(
     # user immediately sees what they can actually run next.
     for subcommand in ("probe-only", "login-only", "stream-only", "dump-state", "ui-demo", "ui"):
         assert subcommand in err
+
+
+class TestKeyboardInterrupt:
+    def test_ctrl_c_in_headless_command_exits_cleanly(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Ctrl+C during stream-only/dump-state (long-running by design)
+        used to dump a raw KeyboardInterrupt traceback. It must exit
+        with the conventional 130 and a one-line note."""
+
+        async def _interrupted(args: Any) -> int:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "_stream_only", _interrupted)
+        rc = cli.main(
+            ["stream-only", "--host", "h", "--port", "4242", "--user", "u", "--password", "p"]
+        )
+        assert rc == 130
+        err = capsys.readouterr().err
+        assert "interrupted" in err.lower()
+        assert "Traceback" not in err
+
+
+class TestHelpDiscoverability:
+    def test_top_level_help_mentions_config_file_and_server_shortcut(self) -> None:
+        """The README advertises `quasseltui <SERVER>` and the config
+        file; the --help output never mentioned either, so a user who
+        only reads --help can't discover them."""
+        help_text = cli.build_parser().format_help()
+        assert "config.ini" in help_text
+        assert "quasseltui <SERVER>" in help_text or "quasseltui SERVER" in help_text
+
+
+class TestSessionInitPrintingSanitized:
+    def test_core_controlled_names_are_sanitized(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """login-only prints identity and buffer names straight from the
+        core; embedded escape bytes must not reach the terminal raw
+        (dump-state already sanitizes — this closes the policy gap)."""
+        from quasseltui.protocol.messages import SessionInit
+        from quasseltui.protocol.usertypes import (
+            BufferId,
+            BufferInfo,
+            BufferType,
+            NetworkId,
+        )
+
+        session = SessionInit(
+            identities=({"identityId": 1, "identityName": "evil\x1b[31mname"},),
+            network_ids=(NetworkId(1),),
+            buffer_infos=(
+                BufferInfo(
+                    buffer_id=BufferId(10),
+                    network_id=NetworkId(1),
+                    type=BufferType.Channel,
+                    group_id=0,
+                    name="#chan\x07beep",
+                ),
+            ),
+            raw={},
+        )
+        cli._print_session_init(session)
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "\x07" not in out
+        assert "\\x1b" in out
+        assert "\\x07" in out
+
+
+class TestUiLoggingHandlers:
+    def test_default_is_a_null_handler(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """In `ui` mode a stderr StreamHandler binds the REAL stderr
+        before Textual swaps sys.stderr, so every runtime WARNING wrote
+        raw text into the alternate screen, garbling the TUI. Default:
+        swallow (the in-app notice system is the user-facing channel)."""
+        import logging
+
+        monkeypatch.delenv("QUASSELTUI_LOG", raising=False)
+        handlers = cli._ui_logging_handlers()
+        assert len(handlers) == 1
+        assert isinstance(handlers[0], logging.NullHandler)
+
+    def test_env_var_routes_to_file(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        import logging
+
+        target = tmp_path / "quasseltui.log"
+        monkeypatch.setenv("QUASSELTUI_LOG", str(target))
+        handlers = cli._ui_logging_handlers()
+        assert len(handlers) == 1
+        assert isinstance(handlers[0], logging.FileHandler)
+        assert handlers[0].baseFilename == str(target)
+        handlers[0].close()

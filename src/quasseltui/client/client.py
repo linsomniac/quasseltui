@@ -133,8 +133,9 @@ class QuasselClient:
         """Drive the protocol connection and yield client-facing events.
 
         Always yields exactly one terminal `ClientDisconnected` before
-        stopping. Re-iterating after that is a no-op — the underlying
-        connection is closed. Errors raised by the dispatcher, by the
+        stopping. Calling this a second time raises `RuntimeError` from
+        the underlying single-use connection — reconnects build a fresh
+        `QuasselClient` (see `QuasselApp.action_reconnect`). Errors raised by the dispatcher, by the
         `SessionReady` fan-out (InitRequest writes), or by the enclosing
         protocol loop are converted into a terminal `ClientDisconnected`
         so the caller never sees an uncaught exception leak out of the

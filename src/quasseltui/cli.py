@@ -316,6 +316,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="quasseltui",
         description="Terminal client for Quassel IRC cores.",
+        epilog=(
+            "Connection settings can live in a config file "
+            "(~/.config/quasseltui/config.ini, XDG-aware) with named "
+            "[server:NAME] sections. With a config in place, "
+            "`quasseltui SERVER` is shorthand for `quasseltui ui --server "
+            "SERVER`, and bare `quasseltui` connects to the default server. "
+            "Note: put options AFTER the subcommand "
+            "(`quasseltui ui --server home`, not `quasseltui --server home`)."
+        ),
     )
     parser.add_argument("--version", action="version", version=f"quasseltui {__version__}")
 
@@ -441,14 +450,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(normalized)
 
-    if args.mode == "probe-only":
-        return asyncio.run(_probe_only(args))
-    if args.mode == "login-only":
-        return asyncio.run(_login_only(args))
-    if args.mode == "stream-only":
-        return asyncio.run(_stream_only(args))
-    if args.mode == "dump-state":
-        return asyncio.run(_dump_state(args))
+    try:
+        if args.mode == "probe-only":
+            return asyncio.run(_probe_only(args))
+        if args.mode == "login-only":
+            return asyncio.run(_login_only(args))
+        if args.mode == "stream-only":
+            return asyncio.run(_stream_only(args))
+        if args.mode == "dump-state":
+            return asyncio.run(_dump_state(args))
+    except KeyboardInterrupt:
+        # stream-only/dump-state run for --duration by design; Ctrl+C is
+        # a normal way to end them early. 130 = 128 + SIGINT, the shell
+        # convention. asyncio.run has already cancelled the tasks and
+        # closed the loop by the time the interrupt re-raises here.
+        print("interrupted", file=sys.stderr)
+        return 130
     if args.mode == "ui-demo":
         return _ui_demo(args)
     if args.mode == "ui":
@@ -476,6 +493,23 @@ def _ui_demo(_args: argparse.Namespace) -> int:
 
     QuasselApp(build_demo_state()).run()
     return 0
+
+
+def _ui_logging_handlers() -> list[logging.Handler]:
+    """Logging handlers for `ui` mode.
+
+    A default stderr StreamHandler binds the REAL stderr object at
+    handler-creation time, so Textual's application-mode redirect
+    (which swaps `sys.stderr` only) never captures it — every runtime
+    WARNING wrote raw text into the alternate screen, garbling the TUI
+    until the next repaint. Default to swallowing log output (the
+    in-app notice system is the user-facing channel); set
+    QUASSELTUI_LOG=<path> to capture it to a file for debugging.
+    """
+    log_path = os.environ.get("QUASSELTUI_LOG")
+    if log_path:
+        return [logging.FileHandler(log_path)]
+    return [logging.NullHandler()]
 
 
 def _ui(args: argparse.Namespace) -> int:
@@ -525,6 +559,7 @@ def _ui(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=_ui_logging_handlers(),
     )
 
     # Lazy import for the same reason as `_ui_demo`: keep Textual out
@@ -791,6 +826,9 @@ async def _login_only(args: argparse.Namespace) -> int:
 
 
 def _print_session_init(session: SessionInit) -> None:
+    # Identity and buffer names are core-controlled (and ultimately
+    # IRC-user-controlled) strings printed to a raw terminal — same
+    # trust boundary as dump-state, same sanitizer.
     print(
         f"connected — {len(session.identities)} identities, "
         f"{len(session.network_ids)} networks, "
@@ -800,9 +838,9 @@ def _print_session_init(session: SessionInit) -> None:
     if session.identities:
         print("identities:")
         for ident in session.identities:
-            name = ident.get("identityName") or ident.get("IdentityName") or "?"
+            name = str(ident.get("identityName") or ident.get("IdentityName") or "?")
             ident_id = ident.get("identityId") or ident.get("IdentityId")
-            print(f"  - {name} (id={ident_id})")
+            print(f"  - {_sanitize_terminal(name)} (id={ident_id})")
 
     if session.network_ids:
         print("networks:")
@@ -819,7 +857,8 @@ def _print_session_init(session: SessionInit) -> None:
             print(f"  network_id={net_id} ({len(buffers)} buffers)")
             for buf in sorted(buffers, key=lambda b: (b.type.value, b.name.lower())):
                 kind = _buffer_type_label(buf.type)
-                print(f"    [{kind}] {buf.name or '(unnamed)'} (buffer_id={int(buf.buffer_id)})")
+                safe_name = _sanitize_terminal(buf.name or "(unnamed)")
+                print(f"    [{kind}] {safe_name} (buffer_id={int(buf.buffer_id)})")
 
 
 def _buffer_type_label(t: BufferType) -> str:

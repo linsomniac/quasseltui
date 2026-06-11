@@ -202,3 +202,43 @@ async def test_open_tcp_connection_enables_tcp_keepalive() -> None:
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_bad_cafile_is_wrapped_with_expanded_path() -> None:
+    """A missing/unreadable cafile used to escape as a bare
+    `[Errno 2] No such file or directory` from outside the
+    TransportError wrap, and `~` was never expanded (the README's
+    self-signed-core setup uses a home-relative path)."""
+    from quasseltui.protocol.transport import TlsOptions, TransportError, start_tls_on_writer
+
+    options = TlsOptions(cafile="~/definitely-missing-quasseltui-test.pem")
+    writer = _FastWriter()
+    with pytest.raises(TransportError) as excinfo:
+        await start_tls_on_writer(writer, host="core", options=options)  # type: ignore[arg-type]
+    message = str(excinfo.value)
+    assert "trust anchors" in message
+    # The expanded (absolute) path is named, not the raw tilde form.
+    assert "~" not in message.split("cafile=")[1].split(",")[0] or "definitely-missing" in message
+    assert "definitely-missing-quasseltui-test.pem" in message
+
+
+@pytest.mark.asyncio
+async def test_cert_verify_failure_names_the_remedy() -> None:
+    """Most real quasselcores are self-signed; a first-time user hitting
+    CERTIFICATE_VERIFY_FAILED must be told about --cafile/--insecure
+    instead of staring at a bare OpenSSL error."""
+    import ssl
+
+    from quasseltui.protocol.transport import TlsOptions, TransportError, start_tls_on_writer
+
+    class _VerifyFailWriter(_FastWriter):
+        async def start_tls(self, *_args: Any, **_kwargs: Any) -> None:
+            raise ssl.SSLCertVerificationError(1, "certificate verify failed: self-signed")
+
+    writer = _VerifyFailWriter()
+    with pytest.raises(TransportError) as excinfo:
+        await start_tls_on_writer(writer, host="core", options=TlsOptions())  # type: ignore[arg-type]
+    message = str(excinfo.value)
+    assert "--cafile" in message
+    assert "--insecure" in message

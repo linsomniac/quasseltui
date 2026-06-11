@@ -735,3 +735,20 @@ def _split_frames(buffer: bytes) -> list[bytes]:
         out.append(buffer[pos : pos + length])
         pos += length
     return out
+
+
+class TestDowngradeMessageWording:
+    @pytest.mark.asyncio
+    async def test_plaintext_abort_names_the_cli_flag(self, patched_transport) -> None:
+        """The fail-closed downgrade abort used to say 'construct with
+        tls=False' — library-API language no CLI user can act on. It
+        must name --no-tls and the config knob."""
+        ctx = patched_transport(b"", tls_offered=True, tls_enabled=False)
+        del ctx
+        conn = QuasselConnection(host="core", port=4242, user="u", password="p", tls=True)
+        events = [e async for e in conn.events()]
+        assert len(events) == 1
+        last = events[0]
+        assert isinstance(last, Disconnected)
+        assert "--no-tls" in last.reason
+        assert "tls=False" not in last.reason

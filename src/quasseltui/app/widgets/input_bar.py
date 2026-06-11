@@ -29,6 +29,8 @@ into a foreign widget class.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 from textual.widgets import Input
 
 from quasseltui.app.messages import LineSubmitted, MarkerToLatestRequested
@@ -37,9 +39,13 @@ from quasseltui.app.messages import LineSubmitted, MarkerToLatestRequested
 class InputBar(Input):
     """Single-line text input docked at the bottom of the chat screen."""
 
+    DEFAULT_PLACEHOLDER: ClassVar[str] = "Type a message and press Enter…"
+    """Exposed so the app can restore it after the disconnected-state
+    placeholder (which names the disconnect reason) on reconnect."""
+
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(
-            placeholder="Type a message and press Enter…",
+            placeholder=self.DEFAULT_PLACEHOLDER,
             id=id,
         )
 

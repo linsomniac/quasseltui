@@ -33,15 +33,18 @@ otherwise leave the user in a blank Textual screen. The app's
 `_on_session_ended` handler reads that flag, sanitizes and truncates
 the reason, and exits the app with return code 1 and a visible exit
 banner so the user sees an explanation once the real terminal is
-restored. A non-fatal `SessionEnded` is just logged — the last state
-stays on screen so the user can still scroll history and quit via
-Ctrl+Q; phase 11 will surface it in a status bar and optionally feed
-a reconnect supervisor.
+restored. A non-fatal `SessionEnded` enters the disconnected state:
+the last state stays on screen so the user can still scroll history,
+the input bar is disabled with a placeholder naming the reason, and
+Ctrl+R rebuilds the client (via `client_factory`) and bridge over the
+same `ClientState` — history survives and the re-seeded session
+merges into it.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, ClassVar, Literal, TypeVar
 
 from textual import on
@@ -125,6 +128,7 @@ class QuasselApp(App[None]):
     # plain cursor navigation inside the input working as expected.
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+q", "quit", "Quit", priority=True),
+        Binding("ctrl+r", "reconnect", "Reconnect", priority=True),
         Binding("alt+up", "prev_buffer", "Previous buffer", priority=True, show=False),
         Binding("alt+down", "next_buffer", "Next buffer", priority=True, show=False),
     ]
@@ -134,19 +138,30 @@ class QuasselApp(App[None]):
         state: ClientState,
         *,
         client: QuasselClient | None = None,
+        client_factory: Callable[[], QuasselClient] | None = None,
     ) -> None:
         super().__init__()
         self._state = state
         self._client = client
+        # Builds a replacement client around the SAME ClientState for
+        # Ctrl+R after a mid-session drop. Supplied by the `ui` CLI
+        # path (which holds the credentials); absent in `ui-demo` and
+        # for embedders that don't want reconnect.
+        self._client_factory = client_factory
+        # Text the user had typed when the connection died — cleared
+        # out of the input bar so the disconnect placeholder is
+        # visible (Textual renders placeholders only on an empty
+        # value), and restored on reconnect.
+        self._pending_input: str | None = None
         # Phase 8 will turn this into a reactive attribute so widgets
         # can watch it directly; phase 7 keeps it as a plain attribute
         # driven explicitly by the bridge and read by the message
         # handlers below.
         self.active_buffer_id: BufferId | None = None
-        # Set once a mid-session disconnect lands. The live UI has no
-        # reconnect path yet, so this latches for the rest of the
-        # session and gates the disconnected-state surface (disabled
-        # input + placeholder). Read by tests and a future status bar.
+        # Set when a mid-session disconnect lands; gates the
+        # disconnected-state surface (disabled input + placeholder)
+        # and post-drop backlog requests. Cleared by a successful
+        # Ctrl+R `action_reconnect`.
         self.connection_lost: bool = False
         # In-app notice history. A full-screen TUI hides `logging`
         # output, so user-facing warnings (failed sends, lost
@@ -157,17 +172,51 @@ class QuasselApp(App[None]):
     def on_mount(self) -> None:
         self.push_screen(ChatScreen(self._state))
         if self._client is not None:
-            bridge = ClientBridge(
-                events=self._client.events(),
-                sink=self,
-                state=self._state,
-            )
-            # `exclusive=True` guarantees that a second mount (which
-            # should never happen in practice but would if a test
-            # remounted) cancels the previous bridge before starting
-            # a new one, so we never have two bridges racing on the
-            # same connection.
-            self.run_worker(bridge.run(), name="quassel-bridge", exclusive=True)
+            self._start_bridge()
+
+    def _start_bridge(self) -> None:
+        """Launch the bridge worker over the current client's events.
+
+        `exclusive=True` guarantees that a second start (a remounting
+        test, or `action_reconnect` replacing the client) cancels the
+        previous bridge before starting a new one, so we never have
+        two bridges racing on the same sink.
+        """
+        assert self._client is not None
+        bridge = ClientBridge(
+            events=self._client.events(),
+            sink=self,
+            state=self._state,
+        )
+        self.run_worker(bridge.run(), name="quassel-bridge", exclusive=True)
+
+    async def action_reconnect(self) -> None:
+        """Ctrl+R: rebuild the client and bridge after a mid-session drop.
+
+        Only acts when the connection is actually lost — tearing down a
+        healthy session would be a destructive misclick. The replacement
+        client shares the existing `ClientState` (history survives); the
+        dispatcher's re-seed clears the per-session backlog latches so
+        the next refresh re-fetches and merges the gap. Any input text
+        stashed at disconnect time is restored.
+        """
+        if self._client is None or self._client_factory is None:
+            return
+        if not self.connection_lost:
+            self._notify_user("Already connected")
+            return
+        await self._client.close()  # idempotent; usually already closed
+        self._client = self._client_factory()
+        self.connection_lost = False
+        input_bar = self._find(InputBar)
+        if input_bar is not None:
+            input_bar.disabled = False
+            input_bar.placeholder = InputBar.DEFAULT_PLACEHOLDER
+            if self._pending_input and not input_bar.value:
+                input_bar.value = self._pending_input
+        self._pending_input = None
+        self._notify_user("Reconnecting…")
+        self._start_bridge()
 
     async def on_unmount(self) -> None:
         """Close the live client on app teardown.
@@ -332,8 +381,15 @@ class QuasselApp(App[None]):
 
         Only restores if the input bar is still empty — if the user
         has already started typing something new, we don't overwrite
-        their work. Silent no-op if the bar is not yet mounted.
+        their work. Silent no-op if the bar is not yet mounted. Once
+        the connection is lost the bar is disabled and shows the
+        disconnect placeholder, so the text is stashed for the
+        reconnect path instead of being trapped in a disabled widget.
         """
+        if self.connection_lost:
+            if self._pending_input is None:
+                self._pending_input = text
+            return
         input_bar = self._find(InputBar)
         if input_bar is not None and not input_bar.value:
             input_bar.value = text
@@ -446,9 +502,12 @@ class QuasselApp(App[None]):
 
         Idempotent — a second `SessionEnded` (or a redraw) won't stack
         notices or re-disable an already-disabled bar. Disabling the
-        input bar is the honest signal here: with no reconnect path yet,
-        a typed line has nowhere to go, so we stop pretending it can be
-        sent and explain why in the placeholder.
+        input bar is the honest signal: a typed line has nowhere to go
+        until the user reconnects, and the placeholder names both the
+        reason and the remedy. Any text sitting in the bar is stashed
+        (Textual only renders the placeholder when the value is empty,
+        and the most common way to discover a disconnect is pressing
+        Enter on a line that fails to send) and restored on Ctrl+R.
         """
         if self.connection_lost:
             return
@@ -457,7 +516,10 @@ class QuasselApp(App[None]):
         input_bar = self._find(InputBar)
         if input_bar is not None:
             input_bar.disabled = True
-            input_bar.placeholder = f"Disconnected: {reason} — press Ctrl+Q to quit"
+            if input_bar.value:
+                self._pending_input = input_bar.value
+                input_bar.value = ""
+            input_bar.placeholder = f"Disconnected: {reason} — Ctrl+R to reconnect, Ctrl+Q to quit"
 
     def _notify_user(
         self,

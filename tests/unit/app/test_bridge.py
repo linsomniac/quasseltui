@@ -546,3 +546,28 @@ class TestPickDefaultBufferFreeFunction:
         state.messages[a.buffer_id] = []
         state.messages[b.buffer_id] = [_irc_message(2)]
         assert _pick_default_buffer(state) == BufferId(2)
+
+
+class TestSessionReopen:
+    async def test_session_opened_with_active_buffer_refreshes_it(self) -> None:
+        """After a reconnect the sink already has an active buffer. The
+        re-seeded SessionOpened must refresh that buffer (which also
+        triggers the app's gap-filling backlog re-request) instead of
+        leaving the log stale until the next live message."""
+        buf = _buffer_info(11)
+        state = _state_with_buffers(buf)
+        sink = _StubSink()
+        sink.active_buffer_id = BufferId(11)
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        bridge = ClientBridge(
+            events=_iter(SessionOpened(session=session, peer_features=frozenset())),
+            sink=sink,
+            state=state,
+        )
+        await bridge.run()
+        assert _types_of(sink.posted) == ["BufferListUpdated", "ActiveBufferUpdated"]
+        active_updates = [m for m in sink.posted if isinstance(m, ActiveBufferUpdated)]
+        assert active_updates[0].buffer_id == BufferId(11)
+        # The pointer must not have been re-picked away from the user's
+        # buffer.
+        assert sink.active_buffer_id == BufferId(11)

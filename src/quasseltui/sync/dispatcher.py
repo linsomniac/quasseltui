@@ -132,15 +132,24 @@ class Dispatcher:
     ) -> None:
         """Populate `ClientState` from a fresh `SessionInit`.
 
-        Called exactly once, immediately after the handshake finishes.
-        Emits `SessionOpened` first, then `NetworkAdded` / `BufferAdded` /
-        `IdentityAdded` for everything the core announced in the session.
-        Actual network *state* (name, my_nick, ...) arrives later via
-        `InitData` messages — the Network SyncObjects we create here start
-        out empty and get filled in asynchronously.
+        Called exactly once per dispatcher, immediately after the
+        handshake finishes. Emits `SessionOpened` first, then
+        `NetworkAdded` / `BufferAdded` / `IdentityAdded` for everything
+        the core announced in the session. Actual network *state*
+        (name, my_nick, ...) arrives later via `InitData` messages —
+        the Network SyncObjects we create here start out empty and get
+        filled in asynchronously.
+
+        Reconnect note: the state may be a REUSED `ClientState` from a
+        previous session (so message history survives a reconnect).
+        Per-session latches are reset here: clearing
+        `backlog_requested` makes the next buffer switch re-request
+        history, and the msg_id dedup in `_merge_backlog` makes that
+        re-request safely fill the gap since the disconnect.
         """
         self._state.session = session
         self._state.peer_features = peer_features
+        self._state.backlog_requested.clear()
         self._emit(SessionOpened(session=session, peer_features=peer_features))
 
         # Create Network placeholders

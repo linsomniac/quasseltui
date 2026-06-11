@@ -82,6 +82,7 @@ class QuasselClient:
         connect_timeout: float = 10.0,
         offered_features: tuple[str, ...] = DEFAULT_CLIENT_FEATURES,
         max_messages_per_buffer: int = 5000,
+        state: ClientState | None = None,
     ) -> None:
         self._connection = QuasselConnection(
             host=host,
@@ -95,7 +96,16 @@ class QuasselClient:
             connect_timeout=connect_timeout,
             offered_features=offered_features,
         )
-        self.state = ClientState(max_messages_per_buffer=max_messages_per_buffer)
+        # An injected state is the reconnect path: the app builds a
+        # replacement client around the SAME ClientState so message
+        # history survives and the re-seeded session merges into it
+        # (the dispatcher's seed clears per-session latches itself).
+        # When injected, the state's own max_messages_per_buffer wins.
+        self.state = (
+            state
+            if state is not None
+            else ClientState(max_messages_per_buffer=max_messages_per_buffer)
+        )
         self._pending_events: list[ClientEvent] = []
         self._dispatcher = Dispatcher(state=self.state, emit=self._pending_events.append)
         self._closed = False

@@ -471,3 +471,23 @@ class TestRequestBacklog:
         await asyncio.gather(first, second)
         assert len(fake.sent) == 1
         assert BufferId(10) in client.state.backlog_requested
+
+
+class TestInjectedState:
+    def test_injected_state_is_reused_not_replaced(self) -> None:
+        """Reconnect support: the app builds a replacement client around
+        the SAME ClientState so message history survives and the
+        re-seeded session merges into it."""
+        from quasseltui.client.state import ClientState
+
+        shared = ClientState(max_messages_per_buffer=123)
+        client = QuasselClient(
+            host="localhost",
+            port=4242,
+            user="t",
+            password="t",
+            tls=False,
+            state=shared,
+        )
+        assert client.state is shared
+        assert client.state.max_messages_per_buffer == 123

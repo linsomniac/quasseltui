@@ -1625,3 +1625,108 @@ async def test_non_empty_enter_does_not_place_marker() -> None:
         assert sent == [(buf.buffer_id, "hello")]
         assert state.read_markers == {}
         assert input_bar.value == ""
+
+
+@pytest.mark.asyncio
+async def test_ctrl_r_reconnects_after_disconnect() -> None:
+    """Ctrl+R after a mid-session drop must build a fresh client from the
+    factory, restart the bridge, clear the disconnected latch, re-enable
+    the input bar, and restore any text the user had typed when the
+    connection died. Before this, the placeholder literally told the
+    user to quit — the only recovery was restarting the whole app and
+    re-entering the password.
+    """
+    from quasseltui.app.widgets.input_bar import InputBar
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = []
+    client = _StubClient(state)
+    replacement = _StubClient(state)
+    factory_calls: list[int] = []
+
+    def factory() -> _StubClient:
+        factory_calls.append(1)
+        return replacement
+
+    app = QuasselApp(state, client=client, client_factory=factory)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.value = "draft line"
+        client.push_event(ClientDisconnected(reason="core went away", error=None))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.connection_lost is True
+        assert input_bar.disabled is True
+        # The pending text is stashed so the placeholder (which Textual
+        # renders only when value is empty) is actually visible — and
+        # the placeholder names the remedy.
+        assert input_bar.value == ""
+        assert "Ctrl+R" in input_bar.placeholder
+
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        await pilot.pause()
+        assert factory_calls == [1]
+        assert client.closed is True
+        assert app.connection_lost is False
+        assert input_bar.disabled is False
+        assert input_bar.placeholder == InputBar.DEFAULT_PLACEHOLDER
+        assert input_bar.value == "draft line"
+
+        # The new bridge is live: a session event over the replacement
+        # client reaches the app.
+        replacement.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.connection_lost is False
+
+
+@pytest.mark.asyncio
+async def test_ctrl_r_while_connected_does_not_rebuild_client() -> None:
+    """Reconnect is a recovery action: while the session is healthy it
+    must not tear down a working connection."""
+    state = _empty_state_with_one_network()
+    client = _StubClient(state)
+    factory_calls: list[int] = []
+
+    def factory() -> _StubClient:
+        factory_calls.append(1)
+        return _StubClient(state)
+
+    app = QuasselApp(state, client=client, client_factory=factory)  # type: ignore[arg-type]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        assert factory_calls == []
+        assert client.closed is False
+
+
+@pytest.mark.asyncio
+async def test_ctrl_r_without_factory_is_a_safe_noop() -> None:
+    """ui-demo (no client) and any embedder that didn't pass a factory
+    must not crash on Ctrl+R."""
+    state = _empty_state_with_one_network()
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        client.push_event(ClientDisconnected(reason="gone", error=None))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.connection_lost is True
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        # Still disconnected, no crash, no replacement client.
+        assert app.connection_lost is True

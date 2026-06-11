@@ -639,3 +639,37 @@ class TestMergeBacklog:
         msgs = state.messages[BufferId(10)]
         assert len(msgs) == 2
         assert [m.contents for m in msgs] == ["correct buffer", "also correct"]
+
+
+class TestReseedForReconnect:
+    def test_seed_clears_stale_backlog_latches(self) -> None:
+        """backlog_requested is per-session: re-seeding (reconnect) must
+        clear it so the gap since the disconnect gets re-fetched and
+        merged (dedup by msg_id makes the re-request safe)."""
+        state, dispatcher, _events = _make_state_and_dispatcher()
+        state.backlog_requested.add(BufferId(10))
+        dispatcher.seed_from_session(
+            _session(network_ids=[1], buffer_infos=[_buffer(10, 1, "#python")]),
+            frozenset(),
+        )
+        assert state.backlog_requested == set()
+
+    def test_seed_preserves_existing_message_history(self) -> None:
+        """Reconnect re-seeds into the same state — history must survive."""
+        state, dispatcher, _events = _make_state_and_dispatcher()
+        buf = _buffer(10, 1, "#python")
+        dispatcher.seed_from_session(
+            _session(network_ids=[1], buffer_infos=[buf]),
+            frozenset({"LongTime"}),
+        )
+        dispatcher.handle_rpc(
+            RpcCall(signal_name=DISPLAY_MSG_SIGNAL, params=[_make_message(1, buf, "history")])
+        )
+        assert len(state.messages[BufferId(10)]) == 1
+
+        dispatcher2 = Dispatcher(state=state, emit=lambda e: None)
+        dispatcher2.seed_from_session(
+            _session(network_ids=[1], buffer_infos=[buf]),
+            frozenset({"LongTime"}),
+        )
+        assert [m.contents for m in state.messages[BufferId(10)]] == ["history"]

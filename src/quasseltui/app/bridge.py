@@ -188,7 +188,15 @@ class ClientBridge:
         if isinstance(event, SessionOpened):
             self._session_opened = True
             self._sink.post_message(BufferListUpdated())
-            self._maybe_pick_default_active_buffer()
+            if self._sink.active_buffer_id is not None:
+                # Reconnect path: the sink kept its active buffer across
+                # the new session. Refresh it so the log redraws and the
+                # app's backlog re-request fills the gap since the drop
+                # (seed_from_session cleared the backlog latches).
+                self._ever_active = True
+                self._sink.post_message(ActiveBufferUpdated(buffer_id=self._sink.active_buffer_id))
+            else:
+                self._maybe_pick_default_active_buffer()
             return
         if isinstance(event, BufferAdded | BufferRenamed):
             self._sink.post_message(BufferListUpdated())

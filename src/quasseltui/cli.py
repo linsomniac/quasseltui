@@ -543,11 +543,29 @@ def _ui(args: argparse.Namespace) -> int:
         build_date=BUILD_DATE,
         connect_timeout=args.connect_timeout,
     )
+
+    def _replacement_client() -> QuasselClient:
+        # Ctrl+R reconnect support: a fresh connection wrapped around
+        # the SAME ClientState, so history survives and the re-seeded
+        # session merges into what's already on screen.
+        return QuasselClient(
+            host=args.host,
+            port=args.port,
+            user=user,
+            password=password,
+            tls=not args.no_tls,
+            tls_options=tls_options,
+            client_version=CLIENT_VERSION,
+            build_date=BUILD_DATE,
+            connect_timeout=args.connect_timeout,
+            state=client.state,
+        )
+
     # The app owns the client lifecycle from this point — its
     # `on_unmount` closes the connection. We pass the client's own
     # `state` so widgets render from the same store the dispatcher is
     # writing to; a copy here would mean the UI silently lags behind.
-    app = QuasselApp(client.state, client=client)
+    app = QuasselApp(client.state, client=client, client_factory=_replacement_client)
     app.run()
     # Surface fatal exits (pre-session handshake failures) to the
     # shell. Clean quits via Ctrl+Q have return_code=0 or None; early

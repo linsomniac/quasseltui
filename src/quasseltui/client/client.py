@@ -224,10 +224,16 @@ class QuasselClient:
         Idempotent per session: records the buffer_id in
         `state.backlog_requested` so the caller can skip re-requesting
         on repeated buffer switches. A second call for the same
-        buffer is a no-op.
+        buffer is a no-op. The latch is claimed BEFORE the send await
+        (so two interleaved calls for the same buffer can't both pass
+        the check and double-request) and released on any send failure
+        (so a failed request stays retryable on the next buffer
+        switch). The dispatcher clears it if the buffer is removed
+        before the reply lands.
         """
         if buffer_id in self.state.backlog_requested:
             return
+        self.state.backlog_requested.add(buffer_id)
         sync = SyncMessage(
             class_name=b"BacklogManager",
             object_name="",
@@ -237,8 +243,11 @@ class QuasselClient:
         try:
             await self._connection.send(sync)
         except (OSError, ssl.SSLError) as exc:
+            self.state.backlog_requested.discard(buffer_id)
             raise QuasselError(f"failed to request backlog: {exc}") from exc
-        self.state.backlog_requested.add(buffer_id)
+        except QuasselError:
+            self.state.backlog_requested.discard(buffer_id)
+            raise
 
     async def close(self) -> None:
         """Idempotent shutdown. Safe to call in a ``finally`` block."""

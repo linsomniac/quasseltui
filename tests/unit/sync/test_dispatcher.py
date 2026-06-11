@@ -401,6 +401,47 @@ class TestBufferRemoval:
         assert len([e for e in events if isinstance(e, MessageReceived)]) == 5
 
 
+class TestMidSessionBufferCreation:
+    """A buffer that appears mid-session (incoming PM, /join result) has no
+    dedicated wire signal — its first displayMsg carries the new
+    BufferInfo. The dispatcher must emit BufferAdded for it, or the UI
+    never learns the buffer exists and the messages are invisible."""
+
+    def test_display_msg_for_unknown_buffer_emits_buffer_added(self) -> None:
+        state, dispatcher, events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(
+            _session(network_ids=[1], buffer_infos=[]),
+            frozenset({"LongTime"}),
+        )
+        events.clear()
+        buf = _buffer(42, 1, "newfriend")
+        msg = _make_message(1, buf, "psst, you there?")
+        dispatcher.handle_rpc(RpcCall(signal_name=DISPLAY_MSG_SIGNAL, params=[msg]))
+
+        added = [e for e in events if isinstance(e, BufferAdded)]
+        assert len(added) == 1
+        assert added[0].buffer_id == BufferId(42)
+        assert added[0].network_id == NetworkId(1)
+        assert added[0].name == "newfriend"
+        # BufferAdded must precede MessageReceived so the UI can create
+        # the tree node before it routes the message to it.
+        kinds = [type(e).__name__ for e in events]
+        assert kinds.index("BufferAdded") < kinds.index("MessageReceived")
+        assert state.buffers[BufferId(42)].name == "newfriend"
+
+    def test_display_msg_for_known_buffer_does_not_reemit_buffer_added(self) -> None:
+        _state, dispatcher, events = _make_state_and_dispatcher()
+        buf = _buffer(10, 1, "#python")
+        dispatcher.seed_from_session(
+            _session(network_ids=[1], buffer_infos=[buf]),
+            frozenset({"LongTime"}),
+        )
+        events.clear()
+        msg = _make_message(1, buf, "hello again")
+        dispatcher.handle_rpc(RpcCall(signal_name=DISPLAY_MSG_SIGNAL, params=[msg]))
+        assert not [e for e in events if isinstance(e, BufferAdded)]
+
+
 def _make_message(
     msg_id: int,
     buf: BufferInfo,
@@ -510,6 +551,72 @@ class TestMergeBacklog:
         msgs = state.messages[BufferId(10)]
         assert len(msgs) == 3
         assert [m.contents for m in msgs] == ["backlog 1", "existing", "backlog 3"]
+
+    def test_empty_backlog_reply_emits_backlog_received_zero(self) -> None:
+        """An empty reply is still a reply: the UI waits on BacklogReceived
+        to know the request completed (e.g. to stop a spinner or decide
+        the buffer simply has no history). Silence here looked exactly
+        like the known 'backlog never appears' bug."""
+        state, dispatcher, events, _buf = self._seed_with_buffer()
+        state.backlog_requested.add(BufferId(10))
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"BacklogManager",
+                object_name="",
+                slot_name=b"receiveBacklog",
+                params=[BufferId(10), MsgId(-1), MsgId(-1), 100, 0, []],
+            )
+        )
+        bl = [e for e in events if isinstance(e, BacklogReceived)]
+        assert len(bl) == 1
+        assert bl[0].buffer_id == BufferId(10)
+        assert bl[0].count == 0
+        # The reply DID arrive — keep the latch so we don't re-request
+        # an empty history on every buffer switch.
+        assert BufferId(10) in state.backlog_requested
+
+    def test_malformed_backlog_reply_still_emits_zero_count(self) -> None:
+        """A reply whose messages param isn't a list (decode quirk) must
+        not silently strand the request: the latch would stay set with
+        no event, making backlog permanently unfetchable this session."""
+        state, dispatcher, events, _buf = self._seed_with_buffer()
+        state.backlog_requested.add(BufferId(10))
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"BacklogManager",
+                object_name="",
+                slot_name=b"receiveBacklog",
+                params=[BufferId(10), MsgId(-1), MsgId(-1), 100, 0, "garbage"],
+            )
+        )
+        bl = [e for e in events if isinstance(e, BacklogReceived)]
+        assert len(bl) == 1
+        assert bl[0].count == 0
+
+    def test_backlog_reply_for_removed_buffer_clears_latch(self) -> None:
+        """A late reply for a removed buffer is discarded, and the latch
+        is cleared with it so a re-created buffer can request again."""
+        state, dispatcher, events, buf = self._seed_with_buffer()
+        state.backlog_requested.add(BufferId(10))
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"BufferSyncer",
+                object_name="",
+                slot_name=b"removeBuffer",
+                params=[10],
+            )
+        )
+        events.clear()
+        msgs = [_make_message(1, buf, "late")]
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"BacklogManager",
+                object_name="",
+                slot_name=b"receiveBacklog",
+                params=[BufferId(10), MsgId(-1), MsgId(-1), 100, 0, msgs],
+            )
+        )
+        assert BufferId(10) not in state.backlog_requested
 
     def test_backlog_mixed_buffer_ids_are_filtered(self) -> None:
         """Messages whose buffer_id doesn't match the slot's authoritative

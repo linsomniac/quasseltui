@@ -19,9 +19,12 @@ Things worth pinning:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from collections.abc import AsyncIterator
 from typing import Any
+
+import pytest
 
 from quasseltui.client.client import QuasselClient
 from quasseltui.client.events import (
@@ -412,3 +415,59 @@ class TestSendInput:
         # The original OSError is chained so the log message has enough
         # context to debug which system call actually failed.
         assert isinstance(excinfo.value.__cause__, BrokenPipeError)
+
+
+class TestRequestBacklog:
+    """The backlog_requested latch must never strand a buffer: a failed
+    send (or a reply that never merges — covered in test_dispatcher) has
+    to leave the request retryable on the next buffer switch, and
+    concurrent calls must not double-request."""
+
+    async def test_send_failure_leaves_latch_clear_for_retry(self) -> None:
+        from quasseltui.protocol.errors import QuasselError
+
+        client, fake = _make_client([])
+
+        async def dead_send(message: SignalProxyMessage) -> None:
+            raise BrokenPipeError("peer hung up")
+
+        fake.send = dead_send  # type: ignore[method-assign]
+        with pytest.raises(QuasselError):
+            await client.request_backlog(BufferId(10))
+        assert BufferId(10) not in client.state.backlog_requested
+
+    async def test_connection_state_error_leaves_latch_clear(self) -> None:
+        from quasseltui.protocol.errors import QuasselError
+
+        client, fake = _make_client([])
+
+        async def refusing_send(message: SignalProxyMessage) -> None:
+            raise QuasselError("cannot send SignalProxy message in state CLOSED")
+
+        fake.send = refusing_send  # type: ignore[method-assign]
+        with pytest.raises(QuasselError):
+            await client.request_backlog(BufferId(10))
+        assert BufferId(10) not in client.state.backlog_requested
+
+    async def test_concurrent_requests_send_only_once(self) -> None:
+        """Two interleaved calls for the same buffer (rapid A->B->A buffer
+        switching) must produce exactly one wire request: the latch is
+        claimed before the await, not after."""
+        client, fake = _make_client([])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_send(message: SignalProxyMessage) -> None:
+            fake.sent.append(message)
+            started.set()
+            await release.wait()
+
+        fake.send = slow_send  # type: ignore[method-assign]
+        first = asyncio.ensure_future(client.request_backlog(BufferId(10)))
+        await started.wait()
+        second = asyncio.ensure_future(client.request_backlog(BufferId(10)))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+        assert len(fake.sent) == 1
+        assert BufferId(10) in client.state.backlog_requested

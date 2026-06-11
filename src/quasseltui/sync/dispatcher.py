@@ -420,8 +420,14 @@ class Dispatcher:
         payload contents. Messages whose `buffer_info.buffer_id`
         doesn't match the slot's are dropped. If the target buffer has
         been removed (no longer in `state.buffers`), the entire reply
-        is silently discarded — a late backlog reply must not resurrect
-        a buffer that the core already told us to remove.
+        is discarded — a late backlog reply must not resurrect a buffer
+        that the core already told us to remove — and the buffer's
+        `backlog_requested` latch is cleared with it.
+
+        Contract: every reply that maps to a live buffer emits exactly
+        one `BacklogReceived`, including empty replies (count=0). The
+        UI relies on the event to know the request completed; a silent
+        empty reply is indistinguishable from the reply never arriving.
         """
         raw_messages = mgr.last_received
         mgr.last_received = []
@@ -430,9 +436,12 @@ class Dispatcher:
         # corrupting per-buffer history by mixing buffer_ids.
         buffer_id = BufferId(int(mgr.last_buffer_id)) if mgr.last_buffer_id is not None else None
         mgr.last_buffer_id = None
-        if not raw_messages or buffer_id is None:
+        if buffer_id is None:
             return
         if buffer_id not in self._state.buffers:
+            # Late reply for a removed buffer: drop it, and unlatch the
+            # request flag so a re-created buffer can request again.
+            self._state.backlog_requested.discard(buffer_id)
             _log.debug("dropping backlog for removed buffer %d", int(buffer_id))
             return
         existing = self._state.messages.setdefault(buffer_id, [])
@@ -476,7 +485,23 @@ class Dispatcher:
         """
         buffer_info: BufferInfo = raw.buffer_info
         buffer_id = buffer_info.buffer_id
+        # AIDEV-NOTE: a buffer created mid-session (incoming PM, /join
+        # result) has no dedicated wire signal — its first displayMsg
+        # carries the new BufferInfo. Emit BufferAdded BEFORE
+        # MessageReceived so the UI creates the tree node before it
+        # routes the message; without this, mid-session buffers (and
+        # every message in them) were invisible until restart.
+        is_new_buffer = buffer_id not in self._state.buffers
         self._state.buffers.setdefault(buffer_id, buffer_info)
+        if is_new_buffer:
+            self._emit(
+                BufferAdded(
+                    buffer_id=buffer_id,
+                    network_id=buffer_info.network_id,
+                    name=buffer_info.name,
+                    type=buffer_info.type,
+                )
+            )
         message_list = self._state.messages.setdefault(buffer_id, [])
         narrow = IrcMessage(
             msg_id=raw.msg_id,

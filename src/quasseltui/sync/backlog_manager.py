@@ -53,13 +53,18 @@ class BacklogManager(SyncObject):
         additional: Any,
         messages: Any,
     ) -> None:
+        # Record the buffer_id even when the payload is malformed: the
+        # dispatcher's merge hook then emits BacklogReceived(count=0)
+        # for it, so the requester isn't silently stranded waiting for
+        # a reply that, from its point of view, never arrived.
+        self.last_buffer_id = buffer_id
         if not isinstance(messages, list):
             _log.warning(
                 "receiveBacklog: expected list of Messages, got %s",
                 type(messages).__name__,
             )
+            self.last_received = []
             return
-        self.last_buffer_id = buffer_id
         self.last_received = [m for m in messages if isinstance(m, Message)]
         _log.debug(
             "receiveBacklog for buffer %s: %d messages",

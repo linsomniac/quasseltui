@@ -83,7 +83,6 @@ from quasseltui.protocol.signalproxy import (
     InitData,
     InitRequest,
     RpcCall,
-    SignalProxyError,
     SignalProxyMessage,
     SyncMessage,
     decode_signalproxy_payload,
@@ -453,20 +452,20 @@ class QuasselConnection:
                     payload,
                     peer_features=self._peer_features,
                 )
-            except SignalProxyError as exc:
-                # Decode failures are unrecoverable — once we lose sync on
-                # one frame the next frame's QVariantList header is
-                # gibberish. Tear down and surface to the consumer.
-                yield Disconnected(reason=f"signalproxy decode failed: {exc}", error=exc)
-                await self._cleanup()
-                return
             except (QuasselError, QDataStreamError) as exc:
-                # QDataStreamError covers unsupported user types or
-                # type IDs from older cores. Like SignalProxyError
-                # these desynchronize the frame stream.
-                yield Disconnected(reason=f"signalproxy decode failed: {exc}", error=exc)
-                await self._cleanup()
-                return
+                # AIDEV-NOTE: a per-frame decode failure does NOT
+                # desynchronize the stream — frames are length-prefixed
+                # and `read_frame` extracted this payload completely
+                # before we tried to decode it, so the next frame's
+                # header sits at a known offset. Skip the frame (the
+                # 2026-06 review found a full teardown here let one
+                # unsupported QVariant type id kill the whole session,
+                # with no reconnect path to recover). QDataStreamError
+                # covers unsupported user types / type IDs from cores
+                # newer or older than us; SignalProxyError (a
+                # QuasselError) covers unknown frame shapes.
+                _log.warning("skipping undecodable frame (%d bytes): %s", len(payload), exc)
+                continue
 
             # _handle_signalproxy may perform a write (HeartBeatReply).
             # A write failure there means the socket is dead — tear down

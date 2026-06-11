@@ -22,12 +22,13 @@ envelope has type id `Quassel::Types::VariantType::Short = 130` (which we
 expose as `QMetaType.Short` for muscle memory). This is the only place the
 distinction matters; everything else uses standard Qt-flavored type IDs.
 
-Defensive parsing: malformed messages raise `SignalProxyError` but never
-attempt to "skip" past garbled payloads — desynchronization here is
-unrecoverable, so we surface the failure to the connection state machine
-which closes the socket. Forward-compatible parsing (unknown class names,
-unknown slot names) is the responsibility of the layer above; this codec
-just unpacks bytes into typed structs.
+Defensive parsing: malformed messages raise `SignalProxyError`; this codec
+never tries to guess its way past garbled bytes. Recovery is the connection
+state machine's job — frames are length-prefixed, so a payload that fails to
+decode here is skipped there and the next frame stays in sync. Forward-
+compatible parsing (unknown class names, unknown slot names) is the
+responsibility of the layer above; this codec just unpacks bytes into typed
+structs.
 """
 
 from __future__ import annotations

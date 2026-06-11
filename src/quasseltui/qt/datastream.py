@@ -41,6 +41,12 @@ import struct
 DEFAULT_MAX_STRING_BYTES = 16 * 1024 * 1024  # 16 MiB
 DEFAULT_MAX_BYTEARRAY_BYTES = 64 * 1024 * 1024  # 64 MiB
 DEFAULT_MAX_CONTAINER_ITEMS = 1_000_000
+# Real Quassel payloads nest QVariant containers ~6-8 levels deep at most
+# (SessionState -> Identities -> Identity -> maps). The bound exists because
+# a ~9 KB payload of nested empty lists — far under every byte/count cap —
+# would otherwise blow Python's recursion limit, and RecursionError escapes
+# the typed-error handling that keeps decode failures recoverable.
+DEFAULT_MAX_NESTING_DEPTH = 32
 
 # Julian Day Number for the proleptic Gregorian date 0001-01-01, which is
 # Python's `date.toordinal() == 1`. Used to convert between Python ordinals
@@ -60,9 +66,11 @@ class QDataStreamReader:
 
     __slots__ = (
         "_data",
+        "_nesting",
         "_pos",
         "max_bytearray_bytes",
         "max_container_items",
+        "max_nesting_depth",
         "max_string_bytes",
         "peer_features",
     )
@@ -74,14 +82,34 @@ class QDataStreamReader:
         max_string_bytes: int = DEFAULT_MAX_STRING_BYTES,
         max_bytearray_bytes: int = DEFAULT_MAX_BYTEARRAY_BYTES,
         max_container_items: int = DEFAULT_MAX_CONTAINER_ITEMS,
+        max_nesting_depth: int = DEFAULT_MAX_NESTING_DEPTH,
         peer_features: frozenset[str] = frozenset(),
     ) -> None:
         self._data = data
         self._pos = 0
+        self._nesting = 0
         self.max_string_bytes = max_string_bytes
         self.max_bytearray_bytes = max_bytearray_bytes
         self.max_container_items = max_container_items
+        self.max_nesting_depth = max_nesting_depth
         self.peer_features = peer_features
+
+    def push_nesting(self) -> None:
+        """Enter one level of recursive QVariant decoding.
+
+        Called by `read_variant` on entry (paired with `pop_nesting` in a
+        `finally`). Raises rather than letting unbounded attacker-controlled
+        nesting reach Python's recursion limit.
+        """
+        self._nesting += 1
+        if self._nesting > self.max_nesting_depth:
+            raise QDataStreamError(
+                f"QVariant nesting depth {self._nesting} exceeds "
+                f"max_nesting_depth {self.max_nesting_depth}"
+            )
+
+    def pop_nesting(self) -> None:
+        self._nesting -= 1
 
     @property
     def position(self) -> int:
@@ -136,6 +164,12 @@ class QDataStreamReader:
 
     def read_bool(self) -> bool:
         return self.read_uint8() != 0
+
+    def read_double(self) -> float:
+        # Qt writes doubles as 8-byte big-endian IEEE 754 under the pinned
+        # Qt_4_2 stream version (no FloatingPointPrecision negotiation).
+        value: float = struct.unpack(">d", self.read_bytes(8))[0]
+        return value
 
     def read_qstring(self) -> str | None:
         length = self.read_uint32()
@@ -254,6 +288,9 @@ class QDataStreamWriter:
 
     def write_bool(self, value: bool) -> None:
         self.write_uint8(1 if value else 0)
+
+    def write_double(self, value: float) -> None:
+        self._buf.extend(struct.pack(">d", value))
 
     def write_qstring(self, value: str | None) -> None:
         if value is None:

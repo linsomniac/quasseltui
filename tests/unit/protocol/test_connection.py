@@ -544,6 +544,55 @@ class TestConnectedLoop:
         assert conn.state is ConnState.CLOSED
 
     @pytest.mark.asyncio
+    async def test_undecodable_frame_is_skipped_not_fatal(self, patched_transport) -> None:
+        """A frame whose payload fails to decode (unsupported QVariant type,
+        malformed SignalProxy shape) must be logged and SKIPPED, not tear
+        down the connection. Frames are length-prefixed, so one bad payload
+        cannot desynchronize the stream — and before this fix, a single
+        sync message carrying a type we lack a codec for (e.g. QChar from a
+        channel mode change, pre-codec) permanently killed the session.
+        """
+        features = frozenset({FEATURE_LONG_TIME, FEATURE_RICH_MESSAGES})
+        good_sync = SyncMessage(
+            class_name=b"Network",
+            object_name="1",
+            slot_name=b"setNetworkName",
+            params=["libera"],
+        )
+        # QVariantList count=1 whose element claims unsupported type id 255.
+        bad_variant_frame = encode_frame(b"\x00\x00\x00\x01" + b"\x00\x00\x00\xff" + b"\x00")
+        # Structurally valid QVariantList but an empty SignalProxy frame.
+        bad_shape_frame = encode_frame(b"\x00\x00\x00\x00")
+        inbound = _build_inbound(
+            init_ack=_base_init_ack(),
+            login_ack=_base_login_ack(),
+            session_init=_base_session_init(),
+            signalproxy_frames=[
+                bad_variant_frame,
+                bad_shape_frame,
+                _framed_signalproxy(good_sync, features),
+            ],
+        )
+        patched_transport(inbound, tls_offered=False, tls_enabled=False)
+
+        conn = QuasselConnection(
+            host="core",
+            port=4242,
+            user="u",
+            password="p",
+            tls=False,
+        )
+        events = [e async for e in conn.events()]
+        # The good frame AFTER the two bad ones must still arrive.
+        sync_events = [e for e in events if isinstance(e, SyncEvent)]
+        assert len(sync_events) == 1
+        assert sync_events[0].message == good_sync
+        # Exactly one terminal Disconnected — from inbound EOF, not decode.
+        disconnects = [e for e in events if isinstance(e, Disconnected)]
+        assert len(disconnects) == 1
+        assert "decode" not in disconnects[0].reason
+
+    @pytest.mark.asyncio
     async def test_events_can_only_be_iterated_once(self, patched_transport) -> None:
         inbound = _build_inbound(
             init_ack=_base_init_ack(),

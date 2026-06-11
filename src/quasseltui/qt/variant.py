@@ -68,9 +68,12 @@ def read_qvariantmap(reader: QDataStreamReader) -> QVariantMap:
     out: QVariantMap = {}
     for _ in range(count):
         key = reader.read_qstring()
-        if key is None:
-            raise QDataStreamError("QVariantMap key is a null QString")
-        out[key] = read_variant(reader)
+        # AIDEV-NOTE: a null QString key is coerced to "" like the
+        # QStringList elements below — Qt treats null and empty QStrings
+        # equivalently, and raising here would discard the whole frame
+        # over one degenerate key (e.g. in a Network Supports/ISUPPORT
+        # map) instead of preserving the rest of the message.
+        out[key if key is not None else ""] = read_variant(reader)
     return out
 
 
@@ -185,6 +188,28 @@ def _write_uint16(writer: QDataStreamWriter, value: Any) -> None:
     writer.write_uint16(int(value))
 
 
+def _read_double(reader: QDataStreamReader) -> float:
+    return reader.read_double()
+
+
+def _write_double(writer: QDataStreamWriter, value: Any) -> None:
+    writer.write_double(float(value))
+
+
+def _read_qchar(reader: QDataStreamReader) -> str:
+    # QChar is one UTF-16 code unit. Real cores send these in
+    # IrcChannel::addChannelMode/removeChannelMode sync calls on every
+    # channel mode change, so this codec is load-bearing for session
+    # survival, not a completeness nicety.
+    return chr(reader.read_uint16())
+
+
+def _write_qchar(writer: QDataStreamWriter, value: Any) -> None:
+    if not isinstance(value, str) or len(value) != 1 or ord(value) > 0xFFFF:
+        raise TypeError(f"cannot serialize {value!r} as QChar (need a single UTF-16 code unit)")
+    writer.write_uint16(ord(value))
+
+
 def _read_qdatetime(reader: QDataStreamReader) -> _dt.datetime:
     return reader.read_qdatetime()
 
@@ -217,6 +242,8 @@ _READERS: dict[int, ReaderFn] = {
     QMetaType.UInt: _read_uint32,
     QMetaType.LongLong: _read_int64,
     QMetaType.ULongLong: _read_uint64,
+    QMetaType.Double: _read_double,
+    QMetaType.QChar: _read_qchar,
     QMetaType.QString: _read_qstring,
     QMetaType.QByteArray: _read_qbytearray,
     QMetaType.QVariantMap: read_qvariantmap,
@@ -234,6 +261,8 @@ _WRITERS: dict[int, WriterFn] = {
     QMetaType.UInt: _write_uint32,
     QMetaType.LongLong: _write_int64,
     QMetaType.ULongLong: _write_uint64,
+    QMetaType.Double: _write_double,
+    QMetaType.QChar: _write_qchar,
     QMetaType.QString: _write_qstring,
     QMetaType.QByteArray: _write_qbytearray,
     QMetaType.QVariantMap: write_qvariantmap,
@@ -270,14 +299,28 @@ def read_variant(reader: QDataStreamReader) -> Any:
     Qt's `QVariant::save` always writes the typed payload after the null flag,
     even when `is_null` is set. We must mirror that — if we skipped the payload
     on a typed-null variant we'd desynchronize the entire surrounding stream.
-    The payload is read and then the value is collapsed to `None` for the
-    caller.
+    For scalar types the value is then collapsed to `None` for the caller; for
+    containers and user types the decoded payload is returned regardless (see
+    the AIDEV-NOTE below).
 
     `QMetaType.UserType` is dispatched via `quasseltui.qt.usertypes`: we read
     the type-name as a QByteArray, strip any trailing null bytes, then call
     the registered payload reader. Unknown user types raise rather than
     silently desynchronize the stream.
+
+    Container and user types recurse back through here; the reader's
+    nesting guard bounds that recursion so malformed input raises
+    `QDataStreamError` instead of `RecursionError` (which would escape the
+    typed-error handling upstream).
     """
+    reader.push_nesting()
+    try:
+        return _read_variant_inner(reader)
+    finally:
+        reader.pop_nesting()
+
+
+def _read_variant_inner(reader: QDataStreamReader) -> Any:
     type_id = reader.read_uint32()
     is_null = reader.read_uint8()
     if type_id == QMetaType.Invalid:
@@ -286,18 +329,17 @@ def read_variant(reader: QDataStreamReader) -> Any:
     # (QVariantList, QVariantMap, QStringList) and user types.
     # Some Quassel cores set is_null=1 on QVariantList payloads
     # (e.g. backlog message lists) that contain valid data —
-    # respecting the flag would silently discard the messages.
-    # For scalar types (Int, Bool, etc.), is_null is respected.
+    # respecting the flag would silently discard the messages, and
+    # real Quassel clients use the deserialized payload regardless
+    # of the flag. For scalar types (Int, Bool, etc.), is_null is
+    # respected.
     _ignore_null = type_id in _CONTAINER_TYPE_IDS
     if type_id == QMetaType.UserType:
         raw_name = reader.read_qbytearray()
         if raw_name is None:
             raise QDataStreamError(f"QVariant<UserType> name is null at offset {reader.position}")
         name = normalize_name(raw_name)
-        value = read_user_type_payload(reader, name)
-        if is_null:
-            return None
-        return value
+        return read_user_type_payload(reader, name)
     fn = _READERS.get(type_id)
     if fn is None:
         raise QDataStreamError(
@@ -390,6 +432,8 @@ def _infer_type_id(value: Any) -> int:
         return QMetaType.Bool
     if isinstance(value, int):
         return QMetaType.Int
+    if isinstance(value, float):
+        return QMetaType.Double
     if isinstance(value, str):
         return QMetaType.QString
     if isinstance(value, bytes | bytearray | memoryview):

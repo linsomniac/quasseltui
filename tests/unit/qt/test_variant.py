@@ -322,24 +322,27 @@ class TestUserTypeEnvelope:
         with pytest.raises(QDataStreamError, match=r"unsupported QVariant<UserType> name"):
             read_variant(reader)
 
-    def test_user_type_with_null_flag_consumes_payload(self) -> None:
+    def test_user_type_with_null_flag_preserves_payload(self) -> None:
         # is_null=1 must NOT skip the payload — the payload is still on the
-        # wire because Qt's QVariant::save always serializes it. The decoded
-        # value collapses to None for the caller, but the stream cursor must
-        # still advance past those bytes.
+        # wire because Qt's QVariant::save always serializes it. And like
+        # the container types, the decoded value must be RETURNED, not
+        # collapsed to None: real Quassel clients ignore the null flag and
+        # use the deserialized payload, and a spurious is_null from a core
+        # would otherwise silently discard valid data (same failure family
+        # as the is_null=1 QVariantList backlog lists we already handle).
         writer = QDataStreamWriter()
         writer.write_uint32(127)
         writer.write_uint8(1)  # is_null
         writer.write_qbytearray(b"PairTest")
-        writer.write_uint32(0)  # payload byte 1
-        writer.write_uint32(0)  # payload byte 2
+        writer.write_uint32(3)  # payload half 1
+        writer.write_uint32(7)  # payload half 2
         # And a follow-on Int variant we'd misread if the cursor was wrong.
         write_variant(writer, 42, type_id=QMetaType.Int)
 
         reader = QDataStreamReader(writer.to_bytes())
         first = read_variant(reader)
         second = read_variant(reader)
-        assert first is None
+        assert first == (3, 7)
         assert second == 42
         assert reader.at_end()
 
@@ -552,6 +555,96 @@ class TestLegacyCoreCompat:
         write_variant(writer, 0, type_id=QMetaType.UShort)
         blob = writer.to_bytes()
         assert blob[:4] == b"\x00\x00\x00\x85"  # 133
+
+
+class TestDoubleAndQChar:
+    """Double (6) and QChar (7) codecs.
+
+    QChar is the one that matters against a real core: `IrcChannel::
+    addChannelMode(QChar, QString)` / `removeChannelMode` are sync slots
+    broadcast on every channel mode change (+m, +k, +l, ...), and the
+    QChar argument arrives as wire type 7. Before these codecs existed a
+    routine mode change killed the whole session.
+    """
+
+    def test_double_round_trip(self) -> None:
+        writer = QDataStreamWriter()
+        write_variant(writer, 2.5, type_id=QMetaType.Double)
+        reader = QDataStreamReader(writer.to_bytes())
+        result = read_variant(reader)
+        assert result == 2.5
+        assert reader.at_end()
+
+    def test_double_wire_type_id_is_6_and_payload_is_ieee754(self) -> None:
+        writer = QDataStreamWriter()
+        write_variant(writer, 1.0, type_id=QMetaType.Double)
+        blob = writer.to_bytes()
+        assert blob[:4] == b"\x00\x00\x00\x06"
+        assert blob[4] == 0  # is_null
+        assert blob[5:] == b"\x3f\xf0\x00\x00\x00\x00\x00\x00"  # IEEE 754 big-endian 1.0
+
+    def test_float_inference_picks_double(self) -> None:
+        writer = QDataStreamWriter()
+        write_variant(writer, 3.25)
+        blob = writer.to_bytes()
+        assert blob[:4] == b"\x00\x00\x00\x06"
+        assert read_variant(QDataStreamReader(blob)) == 3.25
+
+    def test_qchar_round_trip(self) -> None:
+        writer = QDataStreamWriter()
+        write_variant(writer, "m", type_id=QMetaType.QChar)
+        reader = QDataStreamReader(writer.to_bytes())
+        result = read_variant(reader)
+        assert result == "m"
+        assert reader.at_end()
+
+    def test_qchar_decodes_from_core_wire_bytes(self) -> None:
+        # type=7, is_null=0, payload = one UTF-16 code unit, big-endian.
+        # This is exactly what a core ships for addChannelMode('m', ...).
+        blob = b"\x00\x00\x00\x07" + b"\x00" + b"\x00\x6d"
+        reader = QDataStreamReader(blob)
+        assert read_variant(reader) == "m"
+        assert reader.at_end()
+
+    def test_qchar_write_rejects_multichar_and_astral(self) -> None:
+        writer = QDataStreamWriter()
+        with pytest.raises(TypeError):
+            write_variant(writer, "mm", type_id=QMetaType.QChar)
+        with pytest.raises(TypeError):
+            # U+1F600 needs a surrogate pair — QChar is a single code unit.
+            write_variant(writer, "\U0001f600", type_id=QMetaType.QChar)
+
+
+class TestDecodeRobustness:
+    """Malformed-but-bounded inputs must raise QDataStreamError (which the
+    connection layer can skip past), never crash the process."""
+
+    def test_null_qvariantmap_key_coerced_to_empty(self) -> None:
+        """A null QString map key is coerced to '' like the QStringList
+        precedent, instead of raising and killing the connection."""
+        writer = QDataStreamWriter()
+        writer.write_uint32(1)  # count = 1
+        writer.write_qstring(None)  # null key
+        write_variant(writer, "val")
+        reader = QDataStreamReader(writer.to_bytes())
+        assert read_qvariantmap(reader) == {"": "val"}
+        assert reader.at_end()
+
+    def test_deeply_nested_containers_raise_clean_error(self) -> None:
+        """~1000 nested QVariantLists is ~9KB of wire bytes — far below the
+        size caps — but would blow Python's recursion limit. That must
+        surface as QDataStreamError, not RecursionError escaping the
+        typed-error handling."""
+        # Innermost: an empty QVariantList payload (count=0).
+        payload = b"\x00\x00\x00\x00"
+        for _ in range(1000):
+            # Wrap: list with count=1 whose element is a QVariant envelope
+            # of type QVariantList (9), is_null=0, then the inner payload.
+            payload = b"\x00\x00\x00\x01" + b"\x00\x00\x00\x09" + b"\x00" + payload
+        blob = b"\x00\x00\x00\x09" + b"\x00" + payload  # outermost envelope
+        reader = QDataStreamReader(blob)
+        with pytest.raises(QDataStreamError, match="nest"):
+            read_variant(reader)
 
 
 class TestNetworkServerUserType:

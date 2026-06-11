@@ -1092,3 +1092,22 @@ class TestUiLoggingHandlers:
         assert isinstance(handlers[0], logging.FileHandler)
         assert handlers[0].baseFilename == str(target)
         handlers[0].close()
+
+
+class TestUiLoggingBadPath:
+    def test_unwritable_log_path_falls_back_to_null_handler(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """An unwritable QUASSELTUI_LOG used to crash `ui` with a raw
+        traceback AFTER the password prompt. Degrade with a stderr
+        note instead."""
+        import logging
+
+        monkeypatch.setenv("QUASSELTUI_LOG", "/nonexistent-dir-quasseltui/x.log")
+        handlers = cli._ui_logging_handlers()
+        assert len(handlers) == 1
+        assert isinstance(handlers[0], logging.NullHandler)
+        err = capsys.readouterr().err
+        assert "QUASSELTUI_LOG" in err

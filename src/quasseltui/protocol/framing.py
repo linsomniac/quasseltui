@@ -54,10 +54,31 @@ async def read_frame(
     than `max_frame_bytes` — the latter is checked BEFORE we start reading
     the payload so a malicious peer can't make us allocate gigabytes.
     """
+    length = await read_frame_header(reader, max_frame_bytes=max_frame_bytes)
+    return await read_frame_payload(reader, length)
+
+
+async def read_frame_header(
+    reader: asyncio.StreamReader,
+    *,
+    max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
+) -> int:
+    """Read and validate the 4-byte length prefix only.
+
+    Split from `read_frame` so the connection layer can apply different
+    deadlines to "waiting for the next frame" (idleness — bounded by the
+    liveness watchdog) and "receiving an announced payload" (bandwidth —
+    bounded much more generously).
+    """
     header = await _read_exactly(reader, _HEADER_SIZE)
     length = parse_frame_header(header)
     if length > max_frame_bytes:
         raise FrameTooLargeError(f"frame length {length} exceeds max_frame_bytes {max_frame_bytes}")
+    return length
+
+
+async def read_frame_payload(reader: asyncio.StreamReader, length: int) -> bytes:
+    """Read the `length`-byte payload following a validated header."""
     if length == 0:
         return b""
     return await _read_exactly(reader, length)

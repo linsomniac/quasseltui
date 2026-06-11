@@ -355,3 +355,55 @@ class TestMessageRoundtrip:
 
         with pytest.raises(QDataStreamError, match="expected Message"):
             _write_message(writer, "not a message")
+
+
+class TestMessageTimestampClamping:
+    def test_absurd_int64_timestamp_is_clamped_not_valueerror(self) -> None:
+        """A garbage int64 ms-timestamp (the classic symptom of a feature
+        negotiation mismatch misaligning the read cursor) used to raise
+        a bare ValueError from datetime.fromtimestamp — which escaped
+        every typed-error net because QDataStreamError is itself a
+        ValueError subclass. Clamp like read_qdatetime does."""
+        from quasseltui.qt.datastream import QDataStreamReader, QDataStreamWriter
+
+        writer = QDataStreamWriter(peer_features=frozenset({"LongTime"}))
+        writer.write_int64(1)  # msg_id
+        writer.write_int64(2**62)  # absurd ms timestamp
+        writer.write_uint32(1)  # type Plain
+        writer.write_uint8(0)  # flags
+        # BufferInfo payload
+        writer.write_int32(10)
+        writer.write_int32(1)
+        writer.write_int16(2)
+        writer.write_uint32(0)
+        writer.write_qbytearray(b"#chan")
+        writer.write_qbytearray(b"nick!u@h")  # sender
+        writer.write_qbytearray(b"hello")  # contents
+
+        from quasseltui.protocol.usertypes import _read_message
+
+        reader = QDataStreamReader(writer.to_bytes(), peer_features=frozenset({"LongTime"}))
+        msg = _read_message(reader)
+        # Clamped to a representable datetime instead of raising.
+        assert msg.timestamp.year in (1, 9999)
+        assert msg.contents == "hello"
+
+    def test_negative_timestamp_clamps_low(self) -> None:
+        from quasseltui.protocol.usertypes import _read_message
+        from quasseltui.qt.datastream import QDataStreamReader, QDataStreamWriter
+
+        writer = QDataStreamWriter(peer_features=frozenset({"LongTime"}))
+        writer.write_int64(1)
+        writer.write_int64(-(2**62))
+        writer.write_uint32(1)
+        writer.write_uint8(0)
+        writer.write_int32(10)
+        writer.write_int32(1)
+        writer.write_int16(2)
+        writer.write_uint32(0)
+        writer.write_qbytearray(b"#chan")
+        writer.write_qbytearray(b"nick!u@h")
+        writer.write_qbytearray(b"hello")
+        reader = QDataStreamReader(writer.to_bytes(), peer_features=frozenset({"LongTime"}))
+        msg = _read_message(reader)
+        assert msg.timestamp.year == 1

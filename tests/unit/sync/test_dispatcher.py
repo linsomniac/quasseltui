@@ -983,3 +983,131 @@ class TestMarkerSeedFromCore:
         )
         dispatcher.handle_init_data(init)
         assert state.read_markers[BufferId(10)] == MsgId(99)
+
+
+class TestBranchReviewHardening:
+    def test_malformed_backlog_buffer_id_is_dropped_not_typeerror(self) -> None:
+        """A receiveBacklog whose buffer_id param is garbage used to raise
+        TypeError from BufferId(int(...)) — past every (OSError,
+        QuasselError) net, crashing the bridge worker."""
+        _state, dispatcher, events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(
+            _session(network_ids=[1], buffer_infos=[_buffer(10, 1, "#a")]),
+            frozenset(),
+        )
+        events.clear()
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"BacklogManager",
+                object_name="",
+                slot_name=b"receiveBacklog",
+                params=[{"not": "an id"}, MsgId(-1), MsgId(-1), 100, 0, []],
+            )
+        )
+        assert [e for e in events if isinstance(e, BacklogReceived)] == []
+
+    def test_rename_for_uninstantiated_user_still_rekeys_rosters(self) -> None:
+        """A nick can be in channel rosters (via joinIrcUsers / the init
+        seed) without an IrcUser syncable ever existing. Dropping the
+        __objectRenamed__ in that case ghosts the old nick forever."""
+        state, dispatcher, _events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(_session(network_ids=[1]), frozenset())
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"Network",
+                object_name="1",
+                slot_name=b"addIrcUser",
+                params=["alice!a@h"],
+            )
+        )
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"IrcChannel",
+                object_name="1/#chan",
+                slot_name=b"joinIrcUsers",
+                params=[["alice"], ["@"]],
+            )
+        )
+        assert dispatcher.get(b"IrcUser", "1/alice") is None  # never instantiated
+        dispatcher.handle_rpc(
+            RpcCall(signal_name=b"__objectRenamed__", params=[b"IrcUser", "1/bob", "1/alice"])
+        )
+        chan = dispatcher.get(b"IrcChannel", "1/#chan")
+        assert isinstance(chan, IrcChannel)
+        assert chan.user_modes == {"bob": "@"}
+        net = state.networks[NetworkId(1)]
+        assert "bob" in net.users and "alice" not in net.users
+
+    def test_network_disconnect_clears_rosters(self) -> None:
+        """Network::setConnected(false) mirrors the C++ client's
+        removeChansAndUsers(): without it every IRC-side disconnect
+        leaves permanently stale rosters that merge ghosts on
+        reconnect."""
+        state, dispatcher, _events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(_session(network_ids=[1]), frozenset())
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"Network",
+                object_name="1",
+                slot_name=b"addIrcUser",
+                params=["alice!a@h"],
+            )
+        )
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"IrcChannel",
+                object_name="1/#chan",
+                slot_name=b"joinIrcUsers",
+                params=[["alice"], ["@"]],
+            )
+        )
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"IrcUser", object_name="1/alice", slot_name=b"setUser", params=["a"]
+            )
+        )
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"Network", object_name="1", slot_name=b"setConnected", params=[False]
+            )
+        )
+        net = state.networks[NetworkId(1)]
+        assert net.users == set()
+        assert net.channels == set()
+        assert dispatcher.get(b"IrcUser", "1/alice") is None
+        assert dispatcher.get(b"IrcChannel", "1/#chan") is None
+
+    def test_own_part_tears_down_the_channel(self) -> None:
+        """When WE part a channel, the core stops syncing it — keeping
+        the old roster means ghost members merge in on rejoin."""
+        state, dispatcher, _events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(_session(network_ids=[1]), frozenset())
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"Network", object_name="1", slot_name=b"setMyNick", params=["me"]
+            )
+        )
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"IrcChannel",
+                object_name="1/#chan",
+                slot_name=b"joinIrcUsers",
+                params=[["me", "alice"], ["", "@"]],
+            )
+        )
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"Network", object_name="1", slot_name=b"addIrcChannel", params=["#chan"]
+            )
+        )
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"IrcUser",
+                object_name="1/me",
+                slot_name=b"partChannel",
+                params=["#chan"],
+            )
+        )
+        assert dispatcher.get(b"IrcChannel", "1/#chan") is None
+        net = state.networks[NetworkId(1)]
+        assert "#chan" not in net.channels

@@ -1880,7 +1880,10 @@ async def test_click_in_scrollback_highlights_but_does_not_move_marker() -> None
         log = app.screen.query_one(MessageLog)
         # Find the index of a non-disabled message row to "click".
         target = next(i for i in range(log.option_count) if not log.get_option_at_index(i).disabled)
-        event = SimpleNamespace(style=Style(meta={"option": target}))
+        event = SimpleNamespace(
+            style=Style(meta={"option": target}),
+            prevent_default=lambda: None,
+        )
         await log._on_click(event)  # type: ignore[arg-type]
         await pilot.pause()
         await pilot.pause()
@@ -2140,3 +2143,109 @@ async def test_message_for_inactive_buffer_marks_activity_until_visited() -> Non
         await pilot.pause()
         assert buf_b.buffer_id not in app.buffer_activity
         assert tree.activity_level(buf_b.buffer_id) is None
+
+
+@pytest.mark.asyncio
+async def test_failed_reconnect_relatches_instead_of_exiting() -> None:
+    """Ctrl+R against a still-down core produced a pre-session
+    disconnect, which the fresh bridge stamped fatal=True — exiting the
+    entire app with return code 1 and destroying the scrollback the
+    disconnected state had deliberately preserved. A failed reconnect
+    must re-enter the disconnected state so the user can retry."""
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = []
+    client = _StubClient(state)
+    replacement = _StubClient(state)
+    app = QuasselApp(state, client=client, client_factory=lambda: replacement)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        client.push_event(ClientDisconnected(reason="core went away", error=None))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.connection_lost is True
+
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        assert app.connection_lost is False
+
+        # The replacement client never reaches SessionOpened — the core
+        # is still down.
+        replacement.push_event(ClientDisconnected(reason="connect refused", error=None))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.return_code in (None, 0)  # app did NOT exit
+        assert app.connection_lost is True  # re-latched; Ctrl+R again works
+
+
+@pytest.mark.asyncio
+async def test_click_dispatch_prevents_base_optionlist_select() -> None:
+    """The _on_click override alone does not stop Textual from ALSO
+    running OptionList's own _on_click (handlers run across the MRO),
+    which calls action_select() and moves the marker anyway. The
+    override must call event.prevent_default()."""
+    from types import SimpleNamespace
+
+    from rich.style import Style
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1, contents="row")]
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        log = app.screen.query_one(MessageLog)
+        target = next(i for i in range(log.option_count) if not log.get_option_at_index(i).disabled)
+        prevented: list[bool] = []
+        event = SimpleNamespace(
+            style=Style(meta={"option": target}),
+            prevent_default=lambda: prevented.append(True),
+        )
+        await log._on_click(event)  # type: ignore[arg-type]
+        assert prevented == [True]
+
+
+@pytest.mark.asyncio
+async def test_tree_refresh_resyncs_activity_from_app() -> None:
+    """Activity recorded before the tree mounts (or across rebuilds)
+    must not drift: the sidebar refresh re-syncs from the app's
+    authoritative dict."""
+    state = _empty_state_with_one_network()
+    buf_a = _buffer(11, name="#a")
+    buf_b = _buffer(12, name="#b")
+    state.buffers[buf_a.buffer_id] = buf_a
+    state.buffers[buf_b.buffer_id] = buf_b
+    state.messages[buf_a.buffer_id] = [_irc_message(11, msg_id=1)]
+    state.messages[buf_b.buffer_id] = []
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        # Simulate drift: activity recorded on the app while the tree
+        # copy is empty (e.g. recorded pre-mount).
+        app.buffer_activity[buf_b.buffer_id] = "highlight"
+        from quasseltui.app.messages import BufferListUpdated
+
+        app.post_message(BufferListUpdated())
+        await pilot.pause()
+        await pilot.pause()
+        tree = app.screen.query_one(BufferTree)
+        assert tree.activity_level(buf_b.buffer_id) == "highlight"

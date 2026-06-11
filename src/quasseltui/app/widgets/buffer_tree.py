@@ -124,6 +124,15 @@ class BufferTree(Tree[BufferInfo | None]):
         if leaf is not None and leaf.data is not None:
             leaf.set_label(self._styled_label(leaf.data))
 
+    def sync_activity(self, activity: dict[BufferId, str]) -> None:
+        """Replace the indicator mirror wholesale from the app's dict.
+
+        Called before `refresh_from_state` so indicators recorded while
+        the tree wasn't mounted (or across rebuilds) can't drift from
+        the app's authoritative `buffer_activity`.
+        """
+        self._activity = dict(activity)
+
     def activity_level(self, buffer_id: BufferId) -> str | None:
         """Current indicator level for a buffer ("message"/"highlight"/None)."""
         return self._activity.get(buffer_id)

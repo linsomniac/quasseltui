@@ -182,19 +182,22 @@ class QuasselApp(App[None]):
         if self._client is not None:
             self._start_bridge()
 
-    def _start_bridge(self) -> None:
+    def _start_bridge(self, *, presession_fatal: bool = True) -> None:
         """Launch the bridge worker over the current client's events.
 
         `exclusive=True` guarantees that a second start (a remounting
         test, or `action_reconnect` replacing the client) cancels the
         previous bridge before starting a new one, so we never have
-        two bridges racing on the same sink.
+        two bridges racing on the same sink. `presession_fatal=False`
+        is the reconnect flavor: a still-down core re-enters the
+        disconnected state instead of exiting the app.
         """
         assert self._client is not None
         bridge = ClientBridge(
             events=self._client.events(),
             sink=self,
             state=self._state,
+            presession_fatal=presession_fatal,
         )
         self.run_worker(bridge.run(), name="quassel-bridge", exclusive=True)
 
@@ -224,7 +227,7 @@ class QuasselApp(App[None]):
                 input_bar.value = self._pending_input
         self._pending_input = None
         self._notify_user("Reconnecting…")
-        self._start_bridge()
+        self._start_bridge(presession_fatal=False)
 
     async def on_unmount(self) -> None:
         """Close the live client on app teardown.
@@ -250,6 +253,10 @@ class QuasselApp(App[None]):
         tree = self._find(BufferTree)
         if tree is None:
             return
+        # Re-sync the unread indicators from the authoritative dict
+        # before rebuilding: activity recorded while the tree wasn't
+        # mounted (or got rebuilt) must not be lost.
+        tree.sync_activity(self.buffer_activity)
         tree.refresh_from_state()
 
     @on(ActiveBufferUpdated)

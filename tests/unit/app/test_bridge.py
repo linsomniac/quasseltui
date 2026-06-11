@@ -640,3 +640,41 @@ class TestBufferActivity:
         )
         await bridge.run()
         assert not [m for m in sink.posted if isinstance(m, BufferActivity)]
+
+
+class TestBridgeReviewHardening:
+    async def test_self_flagged_echo_does_not_light_activity(self) -> None:
+        """The user's own lines echoed back by the core (e.g. sent from
+        another client) must not light unread/highlight indicators."""
+        import dataclasses
+
+        buf_a, buf_b = _buffer_info(1, name="#a"), _buffer_info(2, name="#b")
+        state = _state_with_buffers(buf_a, buf_b)
+        sink = _StubSink()
+        sink.active_buffer_id = BufferId(1)
+        msg = dataclasses.replace(_irc_message(2, msg_id=5), flags=MessageFlag.Self)
+        bridge = ClientBridge(
+            events=_iter(MessageReceived(message=msg)),
+            sink=sink,
+            state=state,
+        )
+        await bridge.run()
+        assert not [m for m in sink.posted if isinstance(m, BufferActivity)]
+
+    async def test_presession_disconnect_can_be_non_fatal(self) -> None:
+        """The reconnect path builds a fresh bridge; if the core is still
+        down, the resulting pre-session disconnect must NOT be stamped
+        fatal (which exits the whole app with return code 1) — the user
+        deliberately retried from an already-disconnected state."""
+        state = _state_with_buffers()
+        sink = _StubSink()
+        bridge = ClientBridge(
+            events=_iter(ClientDisconnected(reason="connect refused", error=None)),
+            sink=sink,
+            state=state,
+            presession_fatal=False,
+        )
+        await bridge.run()
+        ended = [m for m in sink.posted if isinstance(m, SessionEnded)]
+        assert len(ended) == 1
+        assert ended[0].fatal is False

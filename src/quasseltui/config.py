@@ -45,6 +45,11 @@ AIDEV-NOTE: The INI format was chosen over TOML at the user's request
 so that the file is comfortable to hand-edit without worrying about
 TOML's stricter quoting rules around paths and special characters in
 passwords.
+
+Values are read with interpolation disabled, so `%` is literal. (Before
+v0.9.2 the parser used configparser's default BasicInterpolation: a
+bare `%` crashed and `%%` meant a single percent — if you doubled
+percents to work around that, un-double them.)
 """
 
 from __future__ import annotations

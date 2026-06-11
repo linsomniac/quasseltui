@@ -207,6 +207,25 @@ def _write_msg_id(writer: QDataStreamWriter, value: Any) -> None:
     writer.write_int64(int(value))
 
 
+def _clamped_utc_timestamp(seconds: float) -> _dt.datetime:
+    """`datetime.fromtimestamp` with out-of-range values clamped.
+
+    A garbage timestamp is the classic symptom of a feature-negotiation
+    mismatch misaligning the read cursor (e.g. LongTime assumed but the
+    core wrote 4 bytes). `fromtimestamp` raises a BARE ValueError for
+    out-of-range input — and because `QDataStreamError` subclasses
+    ValueError, no typed-error net anywhere can catch one without also
+    catching the other. Clamp instead, mirroring `read_qdatetime`'s
+    "don't crash the message decode loop" policy; the rest of the
+    message remains usable and the absurd date is visible in the UI.
+    """
+    try:
+        return _dt.datetime.fromtimestamp(seconds, tz=_dt.UTC)
+    except (ValueError, OverflowError, OSError):
+        boundary = _dt.datetime.max if seconds > 0 else _dt.datetime.min
+        return boundary.replace(tzinfo=_dt.UTC)
+
+
 def _read_buffer_info(reader: QDataStreamReader) -> BufferInfo:
     buffer_id = reader.read_int32()
     network_id = reader.read_int32()
@@ -302,10 +321,10 @@ def _read_message(reader: QDataStreamReader) -> Message:
     msg_id = reader.read_int64()
     if FEATURE_LONG_TIME in features:
         ts_ms = reader.read_int64()
-        timestamp = _dt.datetime.fromtimestamp(ts_ms / 1000.0, tz=_dt.UTC)
+        timestamp = _clamped_utc_timestamp(ts_ms / 1000.0)
     else:
         ts_sec = reader.read_uint32()
-        timestamp = _dt.datetime.fromtimestamp(ts_sec, tz=_dt.UTC)
+        timestamp = _clamped_utc_timestamp(ts_sec)
     type_value = reader.read_uint32()
     try:
         type_enum = MessageType(type_value)

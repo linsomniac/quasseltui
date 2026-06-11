@@ -83,6 +83,7 @@ class QuasselClient:
         client_version: str = "quasseltui",
         build_date: str = "1970-01-01",
         connect_timeout: float = 10.0,
+        handshake_timeout: float | None = None,
         offered_features: tuple[str, ...] = DEFAULT_CLIENT_FEATURES,
         max_messages_per_buffer: int = 5000,
         state: ClientState | None = None,
@@ -97,6 +98,7 @@ class QuasselClient:
             client_version=client_version,
             build_date=build_date,
             connect_timeout=connect_timeout,
+            handshake_timeout=handshake_timeout,
             offered_features=offered_features,
         )
         # An injected state is the reconnect path: the app builds a
@@ -144,7 +146,13 @@ class QuasselClient:
         async for proto_event in self._connection.events():
             try:
                 self._handle_protocol_event(proto_event)
-            except (OSError, QuasselError) as exc:
+            except Exception as exc:
+                # Broad on purpose: the docstring promises the caller
+                # never sees an exception leak from this iterator, and a
+                # dispatcher bug (KeyError, TypeError from a malformed
+                # frame) otherwise crashes the bridge worker and with it
+                # the whole TUI. CancelledError is BaseException and
+                # passes through.
                 yield ClientDisconnected(
                     reason=f"dispatcher error: {exc}",
                     error=exc,

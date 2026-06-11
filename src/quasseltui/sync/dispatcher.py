@@ -355,7 +355,14 @@ class Dispatcher:
         new_name, old_name = str(new_raw), str(old_raw)
         obj = self._objects.pop((class_name, old_name), None)
         if obj is None:
-            _log.debug("__objectRenamed__ for unknown %r::%r", class_name, old_name)
+            # A nick can sit in channel rosters (joinIrcUsers, the init
+            # seed) without an IrcUser syncable ever having been
+            # instantiated. The rosters still need the re-key or the
+            # old nick ghosts there forever.
+            if class_name == IrcUser.CLASS_NAME:
+                self._rekey_rosters_by_name(old_name, new_name)
+            else:
+                _log.debug("__objectRenamed__ for unknown %r::%r", class_name, old_name)
             return
         if isinstance(obj, IrcUser):
             old_nick = obj.nick
@@ -365,6 +372,28 @@ class Dispatcher:
         else:
             obj.object_name = new_name
             self._objects[(class_name, new_name)] = obj
+
+    def _rekey_rosters_by_name(self, old_name: str, new_name: str) -> None:
+        """Roster-only rename when no IrcUser object exists for the nick."""
+        old_net, _, old_nick = old_name.partition("/")
+        new_net, _, new_nick = new_name.partition("/")
+        if not old_nick or not new_nick or old_net != new_net:
+            return
+        try:
+            net_id = int(old_net)
+        except ValueError:
+            return
+        network = self._state.networks.get(NetworkId(net_id))
+        if network is not None and old_nick in network.users:
+            network.users.discard(old_nick)
+            network.users.add(new_nick)
+        for obj in self._objects.values():
+            if (
+                isinstance(obj, IrcChannel)
+                and obj.network_id == net_id
+                and old_nick in obj.user_modes
+            ):
+                obj.user_modes[new_nick] = obj.user_modes.pop(old_nick)
 
     def _rekey_user_rosters(self, user: IrcUser, old_nick: str) -> None:
         """Move a renamed user's roster entries to the new nick."""
@@ -525,6 +554,12 @@ class Dispatcher:
             field_name = _NETWORK_UPDATE_SLOTS[slot_name]
             assert isinstance(obj, Network)
             new_value = getattr(obj, field_name, None)
+            if slot_name == b"setConnected" and not obj.is_connected:
+                # Mirror the C++ client's removeChansAndUsers(): an
+                # IRC-side disconnect invalidates the entire roster.
+                # Without this, every disconnect/reconnect cycle left
+                # stale members that merged with the fresh seed.
+                self._clear_network_rosters(obj)
             self._emit(
                 NetworkUpdated(
                     network_id=NetworkId(obj.network_id),
@@ -543,8 +578,31 @@ class Dispatcher:
 
     def _cascade_user_part(self, user: IrcUser, channel_name: str) -> None:
         chan = self._objects.get((IrcChannel.CLASS_NAME, f"{user.network_id}/{channel_name}"))
-        if isinstance(chan, IrcChannel):
-            chan.user_modes.pop(user.nick, None)
+        if not isinstance(chan, IrcChannel):
+            return
+        chan.user_modes.pop(user.nick, None)
+        # OUR own part means the core stops syncing this channel
+        # entirely — tear it down (mirroring the C++ client), or the
+        # stale roster merges ghost members into the fresh seed on
+        # rejoin.
+        network = self._state.networks.get(NetworkId(user.network_id))
+        if network is not None and network.my_nick and user.nick == network.my_nick:
+            chan.user_modes.clear()
+            network.channels.discard(chan.name)
+            self._objects.pop((IrcChannel.CLASS_NAME, chan.object_name), None)
+
+    def _clear_network_rosters(self, network: Network) -> None:
+        """Drop every IrcUser/IrcChannel of a network and empty its sets."""
+        net_id = network.network_id
+        stale = [
+            key
+            for key, obj in self._objects.items()
+            if isinstance(obj, IrcUser | IrcChannel) and obj.network_id == net_id
+        ]
+        for key in stale:
+            del self._objects[key]
+        network.users.clear()
+        network.channels.clear()
 
     def _cascade_user_quit(self, user: IrcUser) -> None:
         """Remove a quit user from every roster and from the registry.
@@ -629,8 +687,16 @@ class Dispatcher:
         mgr.last_received = []
         # AIDEV-NOTE: buffer_id comes from the slot param, not from
         # the payload messages — prevents a hostile/buggy core from
-        # corrupting per-buffer history by mixing buffer_ids.
-        buffer_id = BufferId(int(mgr.last_buffer_id)) if mgr.last_buffer_id is not None else None
+        # corrupting per-buffer history by mixing buffer_ids. Coerced
+        # defensively: a garbage param would otherwise raise TypeError
+        # past every (OSError, QuasselError) net.
+        try:
+            buffer_id = (
+                BufferId(int(mgr.last_buffer_id)) if mgr.last_buffer_id is not None else None
+            )
+        except (TypeError, ValueError):
+            _log.warning("receiveBacklog with malformed buffer_id %r", mgr.last_buffer_id)
+            buffer_id = None
         mgr.last_buffer_id = None
         if buffer_id is None:
             return

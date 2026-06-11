@@ -221,6 +221,10 @@ class MessageLog(OptionList):
         the base behavior returns (annoying but functional) rather
         than anything crashing.
         """
+        # Stop Textual from ALSO dispatching OptionList's own _on_click —
+        # handlers run across the MRO, so without this the base class
+        # still calls action_select() and the marker moves anyway.
+        event.prevent_default()
         clicked_option: int | None = event.style.meta.get("option")
         if clicked_option is None:
             return

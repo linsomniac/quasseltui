@@ -123,10 +123,18 @@ class ClientBridge:
         sink: MessageSink,
         state: ClientState,
         debounce_seconds: float | None = None,
+        presession_fatal: bool = True,
     ) -> None:
         self._events = events
         self._sink = sink
         self._state = state
+        # Whether a disconnect BEFORE SessionOpened is stamped fatal.
+        # True for the first connection (a failed startup handshake
+        # should exit with a visible banner); False for reconnect
+        # bridges — the user retried from an already-disconnected
+        # state, and a still-down core must re-enter the disconnected
+        # state, not exit the app and destroy the scrollback.
+        self._presession_fatal = presession_fatal
         self._debounce_seconds = (
             debounce_seconds if debounce_seconds is not None else self.DEBOUNCE_SECONDS
         )
@@ -219,9 +227,8 @@ class ClientBridge:
                 self._sink.post_message(ActiveBufferUpdated(buffer_id=self._sink.active_buffer_id))
             return
         if isinstance(event, ClientDisconnected):
-            self._sink.post_message(
-                SessionEnded(reason=event.reason, fatal=not self._session_opened)
-            )
+            fatal = not self._session_opened and self._presession_fatal
+            self._sink.post_message(SessionEnded(reason=event.reason, fatal=fatal))
             return
         # IdentityAdded and anything else — no UI effect in phase 7.
 
@@ -273,9 +280,12 @@ class ClientBridge:
             self._ever_active = True
             self._sink.post_message(ActiveBufferUpdated(buffer_id=buffer_id))
         if buffer_id != self._sink.active_buffer_id:
-            self._sink.post_message(
-                BufferActivity(buffer_id=buffer_id, highlight=self._is_highlight(event))
-            )
+            if not (event.message.flags & MessageFlag.Self):
+                # The user's own lines echoed back by the core (sent
+                # from this or another client) are not unread activity.
+                self._sink.post_message(
+                    BufferActivity(buffer_id=buffer_id, highlight=self._is_highlight(event))
+                )
             return
         self._schedule_active_refresh()
 

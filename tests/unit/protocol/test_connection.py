@@ -637,7 +637,7 @@ class TestConnectedLoop:
             user="u",
             password="p",
             tls=False,
-            connect_timeout=0.05,
+            handshake_timeout=0.05,
         )
         events = [e async for e in conn.events()]
         assert len(events) == 1
@@ -752,3 +752,215 @@ class TestDowngradeMessageWording:
         assert isinstance(last, Disconnected)
         assert "--no-tls" in last.reason
         assert "tls=False" not in last.reason
+
+
+class TestDecodeRobustnessHardening:
+    """Branch-review fixes: the skip path must survive every realistic
+    decode failure, escalate on systematic failure, and the events()
+    contract must hold even for unexpected exception types."""
+
+    def _conn(
+        self, inbound: bytes, monkeypatch: pytest.MonkeyPatch, **kwargs: Any
+    ) -> QuasselConnection:
+        stream = FakeStream(inbound)
+        import quasseltui.protocol.connection as mod
+
+        async def fake_open(*_a: Any, **_k: Any) -> tuple[Any, Any]:
+            return stream, stream
+
+        async def fake_probe(*_a: Any, **_k: Any) -> NegotiatedProtocol:
+            return NegotiatedProtocol(
+                protocol=ProtocolType.DataStream,
+                peer_features=0,
+                connection_features=ConnectionFeature.NONE,
+            )
+
+        monkeypatch.setattr(mod, "open_tcp_connection", fake_open)
+        monkeypatch.setattr(mod, "probe", fake_probe)
+        return QuasselConnection(
+            host="core", port=4242, user="u", password="p", tls=False, **kwargs
+        )
+
+    @pytest.mark.asyncio
+    async def test_bare_valueerror_from_decode_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """QDataStreamError subclasses ValueError, so the old except tuple
+        could never catch a BARE ValueError (e.g. an out-of-range Message
+        timestamp) — it leaked out of events(), violating the 'always
+        yields one terminal Disconnected' contract and skipping cleanup."""
+        features = frozenset({FEATURE_LONG_TIME, FEATURE_RICH_MESSAGES})
+        good_sync = SyncMessage(
+            class_name=b"Network", object_name="1", slot_name=b"setNetworkName", params=["x"]
+        )
+        inbound = _build_inbound(
+            init_ack=_base_init_ack(),
+            login_ack=_base_login_ack(),
+            session_init=_base_session_init(),
+            signalproxy_frames=[
+                encode_frame(b"poison"),
+                _framed_signalproxy(good_sync, features),
+            ],
+        )
+        conn = self._conn(inbound, monkeypatch)
+        import quasseltui.protocol.connection as mod
+
+        real_decode = mod.decode_signalproxy_payload
+        calls = 0
+
+        def flaky_decode(payload: bytes, **kw: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if payload == b"poison":
+                raise ValueError("year 292278994 is out of range")
+            return real_decode(payload, **kw)
+
+        monkeypatch.setattr(mod, "decode_signalproxy_payload", flaky_decode)
+        events = [e async for e in conn.events()]
+        assert any(isinstance(e, SyncEvent) for e in events)
+        assert isinstance(events[-1], Disconnected)
+        assert conn.state is ConnState.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_still_yields_terminal_disconnected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A truly unexpected error type (a bug, a Python API change) must
+        be converted into Disconnected + cleanup, not leak from the
+        iterator and crash the bridge worker / whole app."""
+        inbound = _build_inbound(
+            init_ack=_base_init_ack(),
+            login_ack=_base_login_ack(),
+            session_init=_base_session_init(),
+            signalproxy_frames=[encode_frame(b"boom")],
+        )
+        conn = self._conn(inbound, monkeypatch)
+        import quasseltui.protocol.connection as mod
+
+        def exploding_decode(payload: bytes, **kw: Any) -> Any:
+            raise RuntimeError("simulated decoder bug")
+
+        monkeypatch.setattr(mod, "decode_signalproxy_payload", exploding_decode)
+        events = [e async for e in conn.events()]
+        last = events[-1]
+        assert isinstance(last, Disconnected)
+        assert "simulated decoder bug" in last.reason
+        assert conn.state is ConnState.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_systematic_decode_failure_escalates_to_disconnect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Skipping forever turns a systematically undecodable stream into
+        silent message loss (and the only log line goes to NullHandler in
+        ui mode). After several CONSECUTIVE failures, tear down with a
+        descriptive reason."""
+        features = frozenset({FEATURE_LONG_TIME, FEATURE_RICH_MESSAGES})
+        bad = encode_frame(b"\x00\x00\x00\x01" + b"\x00\x00\x00\xff" + b"\x00")
+        inbound = _build_inbound(
+            init_ack=_base_init_ack(),
+            login_ack=_base_login_ack(),
+            session_init=_base_session_init(),
+            signalproxy_frames=[bad] * 20
+            + [_framed_signalproxy(HeartBeat(timestamp=dt.datetime.now(dt.UTC)), features)],
+        )
+        conn = self._conn(inbound, monkeypatch)
+        events = [e async for e in conn.events()]
+        last = events[-1]
+        assert isinstance(last, Disconnected)
+        assert "undecodable" in last.reason
+        # It gave up before consuming all 20 — the heartbeat after them
+        # was never reached.
+        assert not any(isinstance(e, HeartBeatEvent) for e in events)
+
+    @pytest.mark.asyncio
+    async def test_occasional_decode_failures_do_not_escalate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A good frame resets the consecutive-failure counter."""
+        features = frozenset({FEATURE_LONG_TIME, FEATURE_RICH_MESSAGES})
+        bad = encode_frame(b"\x00\x00\x00\x01" + b"\x00\x00\x00\xff" + b"\x00")
+        good = _framed_signalproxy(
+            SyncMessage(
+                class_name=b"Network", object_name="1", slot_name=b"setNetworkName", params=["x"]
+            ),
+            features,
+        )
+        frames = ([bad] * 3 + [good]) * 4  # never 5 consecutive failures
+        inbound = _build_inbound(
+            init_ack=_base_init_ack(),
+            login_ack=_base_login_ack(),
+            session_init=_base_session_init(),
+            signalproxy_frames=frames,
+        )
+        conn = self._conn(inbound, monkeypatch)
+        events = [e async for e in conn.events()]
+        assert len([e for e in events if isinstance(e, SyncEvent)]) == 4
+        assert isinstance(events[-1], Disconnected)
+        assert "undecodable" not in events[-1].reason
+
+
+class TestTimeoutWindows:
+    @pytest.mark.asyncio
+    async def test_handshake_window_has_a_generous_floor(self) -> None:
+        """The handshake window covers the entire SessionInit transfer,
+        which scales with core size and is well known to take tens of
+        seconds on big cores — a 10s default was a regression for
+        connections that previously succeeded. connect_timeout stays a
+        floor for users who raised it."""
+        conn = QuasselConnection(host="h", port=1, user="u", password="p", connect_timeout=5.0)
+        assert conn._handshake_timeout >= 60.0
+        conn2 = QuasselConnection(host="h", port=1, user="u", password="p", connect_timeout=120.0)
+        assert conn2._handshake_timeout == 120.0
+        conn3 = QuasselConnection(host="h", port=1, user="u", password="p", handshake_timeout=7.0)
+        assert conn3._handshake_timeout == 7.0
+
+    @pytest.mark.asyncio
+    async def test_slow_large_frame_is_not_killed_by_idle_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The liveness deadline detects IDLE connections. Once a frame
+        header has arrived, data is flowing — the payload gets a much
+        larger window so a multi-MB backlog frame on a slow link is not
+        killed mid-transfer. A payload that then stalls forever is still
+        eventually detected (here: 10x the liveness window)."""
+        import struct
+
+        features = frozenset({FEATURE_LONG_TIME, FEATURE_RICH_MESSAGES})
+        del features
+        # Handshake, then a frame header announcing 100 bytes... that
+        # never arrive (mid-frame half-open stall).
+        inbound = _build_inbound(
+            init_ack=_base_init_ack(),
+            login_ack=_base_login_ack(),
+            session_init=_base_session_init(),
+        ) + struct.pack(">I", 100)
+        stream = HangingStream(inbound)
+        import quasseltui.protocol.connection as mod
+
+        async def fake_open(*_a: Any, **_k: Any) -> tuple[Any, Any]:
+            return stream, stream
+
+        async def fake_probe(*_a: Any, **_k: Any) -> NegotiatedProtocol:
+            return NegotiatedProtocol(
+                protocol=ProtocolType.DataStream,
+                peer_features=0,
+                connection_features=ConnectionFeature.NONE,
+            )
+
+        monkeypatch.setattr(mod, "open_tcp_connection", fake_open)
+        monkeypatch.setattr(mod, "probe", fake_probe)
+        conn = QuasselConnection(
+            host="core", port=4242, user="u", password="p", tls=False, liveness_timeout=0.02
+        )
+        import time
+
+        start = time.monotonic()
+        events = [e async for e in conn.events()]
+        elapsed = time.monotonic() - start
+        last = events[-1]
+        assert isinstance(last, Disconnected)
+        # Killed by the (larger) payload window, not instantly by the
+        # idle one — and not hanging forever either.
+        assert 0.1 <= elapsed < 5.0
+        assert conn.state is ConnState.CLOSED

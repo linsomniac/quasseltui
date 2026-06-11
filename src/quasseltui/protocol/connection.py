@@ -62,7 +62,7 @@ from quasseltui.protocol.errors import (
     ProbeError,
     QuasselError,
 )
-from quasseltui.protocol.framing import read_frame, write_frame
+from quasseltui.protocol.framing import read_frame_header, read_frame_payload, write_frame
 from quasseltui.protocol.handshake import (
     encode_client_init,
     encode_client_login,
@@ -99,7 +99,6 @@ from quasseltui.protocol.transport import (
     open_tcp_connection,
     start_tls_on_writer,
 )
-from quasseltui.qt.datastream import QDataStreamError
 
 _log = logging.getLogger(__name__)
 
@@ -229,6 +228,24 @@ _DEFAULT_BUILD_DATE = "1970-01-01"
 # no FIN/RST ever arrives, so only a read deadline can detect it).
 DEFAULT_LIVENESS_TIMEOUT_SECONDS = 90.0
 
+# Once a frame header has arrived, data is flowing — the payload window is
+# this multiple of the liveness window so a large backlog frame on a slow
+# link isn't killed by the idle deadline, while a mid-frame stall is still
+# eventually detected (15 minutes at the defaults).
+_PAYLOAD_TIMEOUT_FACTOR = 10
+
+# Consecutive undecodable frames before the skip path gives up and tears
+# down. One-off oddities (an exotic type we lack a codec for) skip quietly;
+# a stream where nothing decodes is a protocol desync and endless skipping
+# would be silent message loss.
+_MAX_CONSECUTIVE_DECODE_FAILURES = 5
+
+# The handshake window must accommodate the full SessionInit transfer,
+# which scales with core size (every network/buffer/identity) and is well
+# known to take tens of seconds on large cores. connect_timeout acts as a
+# floor for users who raised it, never a ceiling.
+DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 60.0
+
 
 class QuasselConnection:
     """One Quassel core connection: probe + handshake + signal stream."""
@@ -260,10 +277,15 @@ class QuasselConnection:
         self._connect_timeout = connect_timeout
         # The handshake (probe reply, TLS upgrade, init/login/session
         # exchanges) gets its own full window rather than whatever is
-        # left over from the TCP connect — a slow-but-working link must
-        # not eat the budget a stalled peer check needs.
+        # left over from the TCP connect — and a generous floor: the
+        # window includes the whole SessionInit transfer, which takes
+        # tens of seconds on large cores, so tying it to the 10s
+        # connect default would refuse connections that previously
+        # worked. An explicit handshake_timeout always wins.
         self._handshake_timeout = (
-            handshake_timeout if handshake_timeout is not None else connect_timeout
+            handshake_timeout
+            if handshake_timeout is not None
+            else max(DEFAULT_HANDSHAKE_TIMEOUT_SECONDS, connect_timeout)
         )
         self._liveness_timeout = liveness_timeout
         self._offered_features = tuple(offered_features)
@@ -343,8 +365,20 @@ class QuasselConnection:
             core_init_ack=ack,
         )
 
-        async for event in self._connected_loop():
-            yield event
+        try:
+            async for event in self._connected_loop():
+                yield event
+        except Exception as exc:
+            # Defensive catch-all mirroring the handshake path above: an
+            # exception type the loop's nets don't anticipate (a decoder
+            # bug, a Python API change) must still honor the "always
+            # yields exactly one terminal Disconnected" contract — the
+            # alternative is the exception leaking out of the iterator,
+            # the socket staying open, and the bridge worker (and with
+            # it the whole TUI) crashing. CancelledError/GeneratorExit
+            # are BaseException and pass through untouched.
+            yield Disconnected(reason=f"internal error in receive loop: {exc}", error=exc)
+            await self._cleanup()
 
     # -- handshake driver ---------------------------------------------------
 
@@ -481,15 +515,23 @@ class QuasselConnection:
     async def _connected_loop(self) -> AsyncIterator[ProtocolEvent]:
         assert self._reader is not None
         assert self._writer is not None
+        consecutive_decode_failures = 0
         while True:
             try:
                 # Liveness watchdog: the core heartbeats every ~30s, so a
                 # healthy connection always produces a frame within the
                 # window. A half-open socket (suspend/resume, NAT expiry,
                 # peer power loss) delivers neither bytes nor EOF — this
-                # deadline is the only way to notice.
+                # deadline is the only way to notice. The deadline covers
+                # the frame HEADER (idleness); once the header arrives,
+                # data is flowing, so the payload gets a much larger
+                # window — a multi-MB backlog frame on a slow link must
+                # not be killed mid-transfer, while a mid-frame half-open
+                # stall is still eventually detected.
                 async with asyncio.timeout(self._liveness_timeout):
-                    payload = await read_frame(self._reader)
+                    length = await read_frame_header(self._reader)
+                async with asyncio.timeout(self._liveness_timeout * _PAYLOAD_TIMEOUT_FACTOR):
+                    payload = await read_frame_payload(self._reader, length)
             except TimeoutError as exc:
                 # NOTE: must precede the OSError handler — TimeoutError
                 # subclasses OSError since Python 3.10, and "core closed
@@ -517,18 +559,38 @@ class QuasselConnection:
                     payload,
                     peer_features=self._peer_features,
                 )
-            except (QuasselError, QDataStreamError) as exc:
+                consecutive_decode_failures = 0
+            except (QuasselError, ValueError) as exc:
                 # AIDEV-NOTE: a per-frame decode failure does NOT
                 # desynchronize the stream — frames are length-prefixed
-                # and `read_frame` extracted this payload completely
-                # before we tried to decode it, so the next frame's
-                # header sits at a known offset. Skip the frame (the
-                # 2026-06 review found a full teardown here let one
-                # unsupported QVariant type id kill the whole session,
-                # with no reconnect path to recover). QDataStreamError
-                # covers unsupported user types / type IDs from cores
-                # newer or older than us; SignalProxyError (a
-                # QuasselError) covers unknown frame shapes.
+                # and the payload was extracted completely before we
+                # tried to decode it, so the next frame's header sits at
+                # a known offset. Skip the frame (the 2026-06 review
+                # found a full teardown here let one unsupported QVariant
+                # type id kill the whole session, with no reconnect path
+                # to recover). The except tuple is (QuasselError,
+                # ValueError) deliberately: QDataStreamError SUBCLASSES
+                # ValueError, so naming it separately is redundant, and
+                # decode helpers can surface bare ValueErrors (int(),
+                # struct, enum coercion) that must be skippable too.
+                #
+                # Systematic failure escalates: if NOTHING decodes any
+                # more (a misnegotiated feature shifting every Message
+                # read, a protocol break), endless skipping would be
+                # silent message loss with the only signal in a hidden
+                # log. A few consecutive failures means the stream is
+                # effectively dead — tear down with a reason instead.
+                consecutive_decode_failures += 1
+                if consecutive_decode_failures >= _MAX_CONSECUTIVE_DECODE_FAILURES:
+                    yield Disconnected(
+                        reason=(
+                            f"{consecutive_decode_failures} consecutive undecodable "
+                            f"frames (protocol desync or feature mismatch); last: {exc}"
+                        ),
+                        error=exc,
+                    )
+                    await self._cleanup()
+                    return
                 _log.warning("skipping undecodable frame (%d bytes): %s", len(payload), exc)
                 continue
 

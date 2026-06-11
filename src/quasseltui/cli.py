@@ -508,7 +508,12 @@ def _ui_logging_handlers() -> list[logging.Handler]:
     """
     log_path = os.environ.get("QUASSELTUI_LOG")
     if log_path:
-        return [logging.FileHandler(log_path)]
+        try:
+            return [logging.FileHandler(log_path)]
+        except OSError as exc:
+            # Degrade rather than crash `ui` with a raw traceback after
+            # the password prompt.
+            print(f"ui: QUASSELTUI_LOG: {exc} — logging disabled", file=sys.stderr)
     return [logging.NullHandler()]
 
 
@@ -688,17 +693,21 @@ def _print_reply(reply: ClientInitAck | ClientInitReject) -> None:
     print(f"  configured:    {reply.configured}")
     print(f"  core features: {reply.core_features:#010x}")
     if reply.feature_list:
-        print(f"  feature list:  {', '.join(reply.feature_list)}")
+        print(f"  feature list:  {_sanitize_terminal(', '.join(reply.feature_list))}")
     if reply.protocol_version is not None:
         print(f"  proto version: {reply.protocol_version}")
     if reply.storage_backends:
         print("  storage backends:")
         for b in reply.storage_backends:
-            print(f"    - {b.display_name}: {b.description}")
+            print(
+                f"    - {_sanitize_terminal(b.display_name)}: {_sanitize_terminal(b.description)}"
+            )
     if reply.authenticators:
         print("  authenticators:")
         for a in reply.authenticators:
-            print(f"    - {a.display_name}: {a.description}")
+            print(
+                f"    - {_sanitize_terminal(a.display_name)}: {_sanitize_terminal(a.description)}"
+            )
 
 
 async def _login_only(args: argparse.Namespace) -> int:
@@ -840,7 +849,7 @@ def _print_session_init(session: SessionInit) -> None:
         for ident in session.identities:
             name = str(ident.get("identityName") or ident.get("IdentityName") or "?")
             ident_id = ident.get("identityId") or ident.get("IdentityId")
-            print(f"  - {_sanitize_terminal(name)} (id={ident_id})")
+            print(f"  - {_sanitize_terminal(name)} (id={_sanitize_terminal(str(ident_id))})")
 
     if session.network_ids:
         print("networks:")

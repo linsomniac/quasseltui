@@ -100,6 +100,19 @@ class FakeStream:
         return None
 
 
+class HangingStream(FakeStream):
+    """A FakeStream that hangs forever once its inbound bytes run out.
+
+    Models a silent peer / half-open TCP connection: the socket stays
+    "open" but no further bytes ever arrive and no EOF is delivered.
+    """
+
+    async def readexactly(self, n: int) -> bytes:
+        if self._pos + n > len(self._inbound):
+            await asyncio.Event().wait()  # never set — hangs until cancelled
+        return await super().readexactly(n)
+
+
 # ---------------------------------------------------------------------------
 # Builders for the handshake + streaming byte sequences.
 # ---------------------------------------------------------------------------
@@ -541,6 +554,97 @@ class TestConnectedLoop:
         assert isinstance(last, Disconnected)
         assert isinstance(last.error, OSError)
         assert "broken pipe" in last.reason
+        assert conn.state is ConnState.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_dead_connection_detected_by_liveness_watchdog(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A half-open connection (suspend/resume, NAT expiry, core host
+        power loss) delivers neither bytes nor EOF. The core heartbeats
+        every ~30s when healthy, so a read that produces nothing for the
+        liveness window means the connection is dead — the loop must
+        yield Disconnected instead of pending forever while the UI looks
+        healthy and messages are silently lost.
+        """
+        inbound = _build_inbound(
+            init_ack=_base_init_ack(),
+            login_ack=_base_login_ack(),
+            session_init=_base_session_init(),
+        )
+        stream = HangingStream(inbound)
+        import quasseltui.protocol.connection as mod
+
+        async def fake_open(*_a: Any, **_k: Any) -> tuple[Any, Any]:
+            return stream, stream
+
+        async def fake_probe(*_a: Any, **_k: Any) -> NegotiatedProtocol:
+            return NegotiatedProtocol(
+                protocol=ProtocolType.DataStream,
+                peer_features=0,
+                connection_features=ConnectionFeature.NONE,
+            )
+
+        monkeypatch.setattr(mod, "open_tcp_connection", fake_open)
+        monkeypatch.setattr(mod, "probe", fake_probe)
+
+        conn = QuasselConnection(
+            host="core",
+            port=4242,
+            user="u",
+            password="p",
+            tls=False,
+            liveness_timeout=0.05,
+        )
+        events = [e async for e in conn.events()]
+        assert isinstance(events[0], SessionReady)
+        last = events[-1]
+        assert isinstance(last, Disconnected)
+        assert "no data from core" in last.reason
+        assert conn.state is ConnState.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_silent_peer_after_connect_fails_handshake_with_timeout(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """connect_timeout used to bound only the TCP connect; a peer that
+        accepts and then never replies (accept-then-drop firewall, hung
+        core, wrong service on the port) left the handshake pending
+        forever — a blank TUI with no error. The whole post-connect
+        handshake must be bounded too.
+        """
+        stream = HangingStream(b"")
+        import quasseltui.protocol.connection as mod
+
+        async def fake_open(*_a: Any, **_k: Any) -> tuple[Any, Any]:
+            return stream, stream
+
+        async def fake_probe(*_a: Any, **_k: Any) -> NegotiatedProtocol:
+            return NegotiatedProtocol(
+                protocol=ProtocolType.DataStream,
+                peer_features=0,
+                connection_features=ConnectionFeature.NONE,
+            )
+
+        monkeypatch.setattr(mod, "open_tcp_connection", fake_open)
+        monkeypatch.setattr(mod, "probe", fake_probe)
+
+        conn = QuasselConnection(
+            host="core",
+            port=4242,
+            user="u",
+            password="p",
+            tls=False,
+            connect_timeout=0.05,
+        )
+        events = [e async for e in conn.events()]
+        assert len(events) == 1
+        last = events[0]
+        assert isinstance(last, Disconnected)
+        assert "handshake" in last.reason
+        assert "stalled" in last.reason
         assert conn.state is ConnState.CLOSED
 
     @pytest.mark.asyncio

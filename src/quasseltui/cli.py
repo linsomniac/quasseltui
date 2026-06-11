@@ -170,7 +170,10 @@ def _add_core_connect_args(
         "--connect-timeout",
         type=float,
         default=None,
-        help="Seconds to wait for the TCP connect (default: 10).",
+        help=(
+            "Seconds to wait for the TCP connect, and again for the "
+            "protocol handshake after it (default: 10)."
+        ),
     )
 
 

@@ -33,7 +33,12 @@ asyncio event loop) or (b) wait for the next event before sending. Phase 5's
 Heartbeat policy: a HeartBeat from the core is the *only* unsolicited
 liveness check, and the core drops connections that don't reply within ~30s.
 We send the reply *before* yielding the event so the timing isn't at the
-mercy of how slowly the consumer iterates.
+mercy of how slowly the consumer iterates. We do NOT send client-initiated
+HeartBeats (that would need a background writer task in a deliberately
+single-task module); instead the CONNECTED read loop enforces a liveness
+deadline — if no frame (heartbeat or otherwise) arrives within
+`liveness_timeout`, the connection is presumed dead and torn down with a
+clear reason. SO_KEEPALIVE on the socket backstops this at the OS level.
 """
 
 from __future__ import annotations
@@ -218,6 +223,12 @@ ProtocolEvent = (
 
 _DEFAULT_BUILD_DATE = "1970-01-01"
 
+# The core heartbeats every ~30s, so a healthy idle connection delivers at
+# least one frame per 30s. Three missed heartbeats means the connection is
+# dead (half-open TCP after suspend/resume, NAT expiry, peer power loss —
+# no FIN/RST ever arrives, so only a read deadline can detect it).
+DEFAULT_LIVENESS_TIMEOUT_SECONDS = 90.0
+
 
 class QuasselConnection:
     """One Quassel core connection: probe + handshake + signal stream."""
@@ -234,6 +245,8 @@ class QuasselConnection:
         client_version: str = "quasseltui",
         build_date: str = _DEFAULT_BUILD_DATE,
         connect_timeout: float = 10.0,
+        handshake_timeout: float | None = None,
+        liveness_timeout: float = DEFAULT_LIVENESS_TIMEOUT_SECONDS,
         offered_features: tuple[str, ...] = DEFAULT_CLIENT_FEATURES,
     ) -> None:
         self._host = host
@@ -245,6 +258,14 @@ class QuasselConnection:
         self._client_version = client_version
         self._build_date = build_date
         self._connect_timeout = connect_timeout
+        # The handshake (probe reply, TLS upgrade, init/login/session
+        # exchanges) gets its own full window rather than whatever is
+        # left over from the TCP connect — a slow-but-working link must
+        # not eat the budget a stalled peer check needs.
+        self._handshake_timeout = (
+            handshake_timeout if handshake_timeout is not None else connect_timeout
+        )
+        self._liveness_timeout = liveness_timeout
         self._offered_features = tuple(offered_features)
 
         self._reader: asyncio.StreamReader | None = None
@@ -331,6 +352,14 @@ class QuasselConnection:
         On success, sets `self._session`, `self._peer_features`, and the
         reader/writer pair. On failure, raises one of the typed errors that
         `events()` catches.
+
+        The TCP connect is bounded by `connect_timeout` (inside
+        `open_tcp_connection`); everything after it — probe reply, TLS
+        upgrade, and the three handshake exchanges — shares one
+        `handshake_timeout` window. Without the second bound, a peer
+        that accepts the connection and then goes silent (accept-then-
+        drop firewall, hung core, wrong service on the port) left the
+        client pending forever on a blank screen.
         """
         self._state = ConnState.PROBING
         self._reader, self._writer = await open_tcp_connection(
@@ -338,6 +367,19 @@ class QuasselConnection:
             self._port,
             connect_timeout=self._connect_timeout,
         )
+        try:
+            async with asyncio.timeout(self._handshake_timeout):
+                return await self._handshake_after_connect()
+        except TimeoutError as exc:
+            raise HandshakeError(
+                f"core accepted the TCP connection but the handshake stalled "
+                f"(no reply within {self._handshake_timeout:g}s during "
+                f"{self._state.name.lower()})"
+            ) from exc
+
+    async def _handshake_after_connect(self) -> ClientInitAck:
+        assert self._reader is not None
+        assert self._writer is not None
         offered_conn = ConnectionFeature.Encryption if self._tls else ConnectionFeature.NONE
         negotiated = await probe(
             self._reader,
@@ -437,7 +479,26 @@ class QuasselConnection:
         assert self._writer is not None
         while True:
             try:
-                payload = await read_frame(self._reader)
+                # Liveness watchdog: the core heartbeats every ~30s, so a
+                # healthy connection always produces a frame within the
+                # window. A half-open socket (suspend/resume, NAT expiry,
+                # peer power loss) delivers neither bytes nor EOF — this
+                # deadline is the only way to notice.
+                async with asyncio.timeout(self._liveness_timeout):
+                    payload = await read_frame(self._reader)
+            except TimeoutError as exc:
+                # NOTE: must precede the OSError handler — TimeoutError
+                # subclasses OSError since Python 3.10, and "core closed
+                # connection" would be a lie here.
+                yield Disconnected(
+                    reason=(
+                        f"no data from core in {self._liveness_timeout:g}s "
+                        f"(connection presumed dead; core heartbeats every ~30s)"
+                    ),
+                    error=exc,
+                )
+                await self._cleanup()
+                return
             except (OSError, asyncio.IncompleteReadError) as exc:
                 yield Disconnected(reason=f"core closed connection: {exc}", error=exc)
                 await self._cleanup()
@@ -503,7 +564,17 @@ class QuasselConnection:
         `HeartBeatEvent` while the connection was actually gone).
         """
         if isinstance(message, HeartBeat):
-            await self._send_signalproxy(HeartBeatReply(timestamp=message.timestamp))
+            # Bound the reply write: write_frame drains, and a stalled
+            # uplink with a full send buffer would otherwise wedge the
+            # read loop on its own heartbeat reply indefinitely.
+            try:
+                async with asyncio.timeout(self._liveness_timeout):
+                    await self._send_signalproxy(HeartBeatReply(timestamp=message.timestamp))
+            except TimeoutError as exc:
+                raise QuasselError(
+                    f"heartbeat reply stalled for {self._liveness_timeout:g}s "
+                    f"(send buffer full, connection presumed dead)"
+                ) from exc
             return HeartBeatEvent(message=message)
         if isinstance(message, HeartBeatReply):
             # We never *send* HeartBeats from the client side, so a

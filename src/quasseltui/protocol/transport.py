@@ -18,6 +18,8 @@ the I/O primitives the probe and connection state machine compose with.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import socket
 import ssl
 from dataclasses import dataclass
 
@@ -61,9 +63,15 @@ async def open_tcp_connection(
     *,
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """Open a plain TCP connection with a bounded connect timeout."""
+    """Open a plain TCP connection with a bounded connect timeout.
+
+    Enables SO_KEEPALIVE on the socket: a Quassel session is long-lived
+    and a half-open connection (suspend/resume, NAT expiry) otherwise
+    sits undetected by the kernel forever. The application-level
+    liveness watchdog fires first in practice; this is the OS backstop.
+    """
     try:
-        return await asyncio.wait_for(
+        reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),
             timeout=connect_timeout,
         )
@@ -73,6 +81,12 @@ async def open_tcp_connection(
         ) from exc
     except OSError as exc:
         raise TransportError(f"failed to connect to {host}:{port}: {exc}") from exc
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        # Suppress: setsockopt can fail on exotic transports only.
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    return reader, writer
 
 
 async def start_tls_on_writer(

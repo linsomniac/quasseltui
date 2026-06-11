@@ -16,12 +16,13 @@ and deterministic (no `asyncio.sleep` slippage).
 from __future__ import annotations
 
 import asyncio
+import socket
 from typing import Any
 
 import pytest
 
 from quasseltui.protocol import transport as transport_module
-from quasseltui.protocol.transport import close_writer
+from quasseltui.protocol.transport import close_writer, open_tcp_connection
 
 
 class _FakeTransport:
@@ -172,3 +173,32 @@ async def test_close_writer_handles_none_transport_on_timeout(
     writer = _NoTransportWriter()
     await close_writer(writer)  # type: ignore[arg-type]
     # No crash is the assertion; nothing else to check.
+
+
+@pytest.mark.asyncio
+async def test_open_tcp_connection_enables_tcp_keepalive() -> None:
+    """SO_KEEPALIVE must be set on the connected socket.
+
+    It is the OS-level backstop beneath the application-level liveness
+    watchdog for half-open connections (suspend/resume, NAT expiry):
+    without it, a dead peer with no traffic is never detected by the
+    kernel either. Uses a real localhost socket because FakeStream can't
+    model socket options.
+    """
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer.close()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        _reader, writer = await open_tcp_connection("127.0.0.1", port, connect_timeout=5.0)
+        try:
+            sock = writer.get_extra_info("socket")
+            assert sock is not None
+            assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
+        finally:
+            await close_writer(writer)
+    finally:
+        server.close()
+        await server.wait_closed()

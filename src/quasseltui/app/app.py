@@ -69,7 +69,7 @@ from quasseltui.app.widgets.input_bar import InputBar
 from quasseltui.app.widgets.message_log import MessageLog
 from quasseltui.client.state import ClientState
 from quasseltui.protocol.errors import QuasselError
-from quasseltui.protocol.usertypes import BufferId, BufferInfo, NetworkId
+from quasseltui.protocol.usertypes import BufferId, BufferInfo, MsgId, NetworkId
 from quasseltui.util.text import sanitize_terminal
 
 if TYPE_CHECKING:
@@ -310,6 +310,7 @@ class QuasselApp(App[None]):
         marked.
         """
         self._state.read_markers[event.buffer_id] = event.msg_id
+        self._sync_marker_to_core(event.buffer_id, event.msg_id)
         if event.buffer_id == self.active_buffer_id:
             self.post_message(ActiveBufferUpdated(buffer_id=event.buffer_id))
 
@@ -338,6 +339,7 @@ class QuasselApp(App[None]):
         if not messages:
             return
         self._state.read_markers[buffer_id] = messages[-1].msg_id
+        self._sync_marker_to_core(buffer_id, messages[-1].msg_id)
         self.post_message(ActiveBufferUpdated(buffer_id=buffer_id))
 
     @on(LineSubmitted)
@@ -433,8 +435,56 @@ class QuasselApp(App[None]):
         its default-pick and removal-recovery paths, but those also
         post `ActiveBufferUpdated`, so the same handler covers them.
         """
+        previous = self.active_buffer_id
         self.active_buffer_id = buffer_id
         self.post_message(ActiveBufferUpdated(buffer_id=buffer_id))
+        if previous is not None and previous != buffer_id:
+            self._report_last_seen(previous)
+
+    def _report_last_seen(self, buffer_id: BufferId) -> None:
+        """Fire-and-forget requestSetLastSeenMsg for a buffer being left.
+
+        Round-trips read state through the core so reading here clears
+        the unread flags in every other Quassel client. Only fires on
+        user-driven switches (`_set_active_buffer`); the bridge's
+        default-pick writes the pointer directly and must not mark
+        anything read on the user's behalf.
+        """
+        if self._client is None or self.connection_lost:
+            return
+        messages = self._state.messages.get(buffer_id)
+        if not messages:
+            return
+        self.run_worker(self._send_last_seen(buffer_id, messages[-1].msg_id), exclusive=False)
+
+    async def _send_last_seen(self, buffer_id: BufferId, msg_id: MsgId) -> None:
+        if self._client is None:
+            return
+        try:
+            await self._client.set_last_seen(buffer_id, msg_id)
+        except QuasselError as exc:
+            # Not user-notified: losing one read-state sync is invisible
+            # locally and the next switch retries naturally.
+            _log.warning("set_last_seen failed for buffer %d: %s", int(buffer_id), exc)
+
+    def _sync_marker_to_core(self, buffer_id: BufferId, msg_id: MsgId) -> None:
+        """Fire-and-forget requestSetMarkerLine for a user-placed marker.
+
+        The core persists marker lines, so a marker placed here survives
+        restarts (re-seeded from BufferSyncer InitData) and shows up in
+        other clients.
+        """
+        if self._client is None or self.connection_lost:
+            return
+        self.run_worker(self._send_marker_line(buffer_id, msg_id), exclusive=False)
+
+    async def _send_marker_line(self, buffer_id: BufferId, msg_id: MsgId) -> None:
+        if self._client is None:
+            return
+        try:
+            await self._client.set_marker_line(buffer_id, msg_id)
+        except QuasselError as exc:
+            _log.warning("set_marker_line failed for buffer %d: %s", int(buffer_id), exc)
 
     async def _request_backlog(self, buffer_id: BufferId) -> None:
         """Fire-and-forget backlog request. Errors are logged, not raised."""

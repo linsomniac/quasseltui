@@ -33,17 +33,28 @@ class IrcUser(SyncObject):
         # style init fields from Network.IrcUsersAndChannels.
         self.channels: set[str] = set()
 
+    def rename(self, object_name: str) -> None:
+        """Re-address this user after a SignalProxy `__objectRenamed__`.
+
+        Updates `object_name`, `network_id`, and `nick` together so the
+        three never disagree. The dispatcher re-keys its registry and
+        the channel/network rosters around this call.
+        """
+        self.object_name = object_name
+        self.network_id, self.nick = _split_user_object_name(object_name)
+
     # -- slot handlers ------------------------------------------------------
 
-    # AIDEV-NOTE: Quassel's IrcUser objectName is built from `<netId>/<nick>`
-    # at construction, but Quassel does NOT re-address the SyncObject when
-    # the nick changes — the C++ IrcUser keeps its original objectName for
-    # the lifetime of the user (see src/common/ircuser.cpp). So the
-    # dispatcher registry key staying bound to the old nick is correct
-    # behavior, not a bug. Leaving this note because it's a natural
-    # source of confusion when reading the dispatcher's lookup-by-key
-    # logic. If a future Quassel version DOES re-address on nick change,
-    # we'd need to re-key `_objects` in `Dispatcher` from `setNick`.
+    # AIDEV-NOTE: Quassel DOES re-address IrcUser syncables on nick change:
+    # C++ IrcUser::setNick() calls updateObjectName() -> renameObject(),
+    # which broadcasts the `__objectRenamed__` RpcCall and addresses every
+    # subsequent Sync frame to "<netId>/<newNick>" (src/common/ircuser.cpp
+    # + syncableobject.cpp). The dispatcher handles that RPC by re-keying
+    # its registry via `rename()` above — a 2026-06-10 review corrected an
+    # earlier version of this note that claimed the objectName was stable
+    # for the lifetime of the user. The `setNick` slot below still updates
+    # the field for completeness, but the authoritative re-key is the
+    # rename RPC.
     @sync_slot(b"setNick")
     def _sync_set_nick(self, nick: str) -> None:
         if nick:
@@ -84,10 +95,11 @@ class IrcUser(SyncObject):
 
     @sync_slot(b"quit")
     def _sync_quit(self) -> None:
-        # The user has left the network entirely. The dispatcher will also
-        # remove us from its `(class_name, object_name)` registry; we clear
-        # our own membership set so any straggler reference sees a clean
-        # "nobody home" state.
+        # The user has left the network entirely. The dispatcher's
+        # post-slot cascade (`_cascade_user_quit`) removes us from every
+        # channel roster, the network's user set, and its registry; we
+        # clear our own membership set so any straggler reference sees a
+        # clean "nobody home" state.
         self.channels.clear()
 
     # -- init-field handlers ------------------------------------------------

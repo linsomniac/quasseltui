@@ -491,3 +491,60 @@ class TestInjectedState:
         )
         assert client.state is shared
         assert client.state.max_messages_per_buffer == 123
+
+
+class TestReadStateWriteback:
+    async def test_set_last_seen_sends_request(self) -> None:
+        client, fake = _make_client([])
+        await client.set_last_seen(BufferId(10), MsgId(42))
+        assert len(fake.sent) == 1
+        sync = fake.sent[0]
+        assert isinstance(sync, SyncMessage)
+        assert sync.class_name == b"BufferSyncer"
+        assert sync.object_name == ""
+        assert sync.slot_name == b"requestSetLastSeenMsg"
+        assert sync.params == [BufferId(10), MsgId(42)]
+
+    async def test_set_marker_line_sends_request(self) -> None:
+        client, fake = _make_client([])
+        await client.set_marker_line(BufferId(10), MsgId(42))
+        assert len(fake.sent) == 1
+        sync = fake.sent[0]
+        assert isinstance(sync, SyncMessage)
+        assert sync.slot_name == b"requestSetMarkerLine"
+        assert sync.params == [BufferId(10), MsgId(42)]
+
+    async def test_write_failures_are_wrapped(self) -> None:
+        from quasseltui.protocol.errors import QuasselError
+
+        client, fake = _make_client([])
+
+        async def dead_send(message: SignalProxyMessage) -> None:
+            raise BrokenPipeError("gone")
+
+        fake.send = dead_send  # type: ignore[method-assign]
+        with pytest.raises(QuasselError):
+            await client.set_last_seen(BufferId(10), MsgId(42))
+        with pytest.raises(QuasselError):
+            await client.set_marker_line(BufferId(10), MsgId(42))
+
+
+class TestMidSessionNetworkInitRequest:
+    async def test_network_created_triggers_init_request(self) -> None:
+        """A network created mid-session (from another client) needs an
+        InitRequest or its name/roster never populate. Seed networks must
+        not be double-requested."""
+        rpc = RpcEvent(
+            message=RpcCall(signal_name=b"2networkCreated(NetworkId)", params=[NetworkId(7)])
+        )
+        script: list[ProtocolEvent] = [
+            _session_ready(_session(network_ids=[1])),
+            rpc,
+            ProtoDisconnected(reason="done"),
+        ]
+        client, fake = _make_client(script)
+        await _drain(client)
+        init_requests = [m for m in fake.sent if isinstance(m, InitRequest)]
+        names = [(r.class_name, r.object_name) for r in init_requests]
+        assert names.count((b"Network", "7")) == 1
+        assert names.count((b"Network", "1")) == 1

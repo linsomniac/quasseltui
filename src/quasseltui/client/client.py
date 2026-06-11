@@ -29,6 +29,7 @@ the fan-out.
 
 from __future__ import annotations
 
+import logging
 import ssl
 from collections.abc import AsyncIterator
 from typing import Any
@@ -54,7 +55,7 @@ from quasseltui.protocol.transport import TlsOptions
 from quasseltui.protocol.usertypes import BufferId, MsgId
 from quasseltui.sync.buffer_syncer import BufferSyncer
 from quasseltui.sync.dispatcher import Dispatcher
-from quasseltui.sync.events import ClientDisconnected, ClientEvent
+from quasseltui.sync.events import ClientDisconnected, ClientEvent, NetworkAdded
 from quasseltui.sync.network import Network
 
 # Qt-metacall-style signature string used by Quassel core's SignalProxy to
@@ -63,6 +64,8 @@ from quasseltui.sync.network import Network
 # `UserInputHandler::sendInput(BufferInfo, QString)`. Hard-coded here
 # because it's a protocol constant, not a configurable choice.
 _SEND_INPUT_SIGNAL = b"2sendInput(BufferInfo,QString)"
+
+_log = logging.getLogger(__name__)
 
 
 class QuasselClient:
@@ -109,6 +112,11 @@ class QuasselClient:
         self._pending_events: list[ClientEvent] = []
         self._dispatcher = Dispatcher(state=self.state, emit=self._pending_events.append)
         self._closed = False
+        # Network ids we've already InitRequested. Lazily seeded from
+        # SessionInit's network list (those are covered by the
+        # SessionReady fan-out) so a mid-session networkCreated gets
+        # exactly one request and seed networks get none extra.
+        self._networks_requested: set[int] | None = None
 
     # -- public API ----------------------------------------------------------
 
@@ -145,7 +153,9 @@ class QuasselClient:
             # Drain any events the dispatcher (and session fan-out below)
             # appended to our buffer.
             while self._pending_events:
-                yield self._pending_events.pop(0)
+                pending = self._pending_events.pop(0)
+                yield pending
+                await self._maybe_request_network_init(pending)
             # Session-ready fan-out has to happen after we've yielded the
             # SessionOpened event so a caller observing a specific order
             # sees (SessionOpened, *NetworkAdded, ..., *InitData effects).
@@ -168,9 +178,38 @@ class QuasselClient:
                     await self._connection.close()
                     return
                 while self._pending_events:
-                    yield self._pending_events.pop(0)
+                    pending = self._pending_events.pop(0)
+                    yield pending
+                    await self._maybe_request_network_init(pending)
             if isinstance(proto_event, ProtoDisconnected):
                 return
+
+    async def _maybe_request_network_init(self, event: ClientEvent) -> None:
+        """InitRequest a network that appeared mid-session.
+
+        A `networkCreated` broadcast (e.g. the user added a network from
+        their desktop client) registers an empty Network placeholder —
+        without an InitRequest its name and roster never populate. Seed
+        networks are excluded: `_fanout_init_requests` already covers
+        them at SessionReady. Send failures are logged, not fatal — if
+        the socket is really dead the read loop surfaces the disconnect
+        with a better reason than this side-write could.
+        """
+        if not isinstance(event, NetworkAdded):
+            return
+        if self._networks_requested is None:
+            session = self.state.session
+            self._networks_requested = (
+                {int(n) for n in session.network_ids} if session is not None else set()
+            )
+        nid = int(event.network_id)
+        if nid in self._networks_requested:
+            return
+        self._networks_requested.add(nid)
+        try:
+            await self._send_init_request(Network.CLASS_NAME, str(nid))
+        except (OSError, QuasselError) as exc:
+            _log.warning("InitRequest for new network %d failed: %s", nid, exc)
 
     async def send_input(self, buffer_id: BufferId, text: str) -> None:
         """Send user input (chat line or /-command) for `buffer_id`.
@@ -258,6 +297,44 @@ class QuasselClient:
         except QuasselError:
             self.state.backlog_requested.discard(buffer_id)
             raise
+
+    async def set_last_seen(self, buffer_id: BufferId, msg_id: MsgId) -> None:
+        """Tell the core the user has read `buffer_id` up to `msg_id`.
+
+        Sends `BufferSyncer::requestSetLastSeenMsg`; the core persists it
+        and broadcasts `setLastSeenMsg` to every connected client, which
+        is what clears the unread state on desktop/mobile Quassel when
+        the user reads here. Raises `QuasselError` on send failure, same
+        contract as `send_input`.
+        """
+        await self._send_buffer_syncer_request(b"requestSetLastSeenMsg", buffer_id, msg_id)
+
+    async def set_marker_line(self, buffer_id: BufferId, msg_id: MsgId) -> None:
+        """Move the core-persisted marker line for `buffer_id` to `msg_id`.
+
+        Sends `BufferSyncer::requestSetMarkerLine`. The core stores the
+        marker across sessions and broadcasts it to other clients, so a
+        marker placed here survives restarts (it is re-seeded from
+        BufferSyncer InitData) instead of living only in process memory.
+        """
+        await self._send_buffer_syncer_request(b"requestSetMarkerLine", buffer_id, msg_id)
+
+    async def _send_buffer_syncer_request(
+        self,
+        slot_name: bytes,
+        buffer_id: BufferId,
+        msg_id: MsgId,
+    ) -> None:
+        sync = SyncMessage(
+            class_name=b"BufferSyncer",
+            object_name="",
+            slot_name=slot_name,
+            params=[buffer_id, msg_id],
+        )
+        try:
+            await self._connection.send(sync)
+        except (OSError, ssl.SSLError) as exc:
+            raise QuasselError(f"failed to send {slot_name.decode()}: {exc}") from exc
 
     async def close(self) -> None:
         """Idempotent shutdown. Safe to call in a ``finally`` block."""

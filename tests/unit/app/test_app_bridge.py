@@ -68,6 +68,8 @@ class _StubClient:
         self.state = state
         self._queue: asyncio.Queue[ClientEvent] = asyncio.Queue()
         self.closed = False
+        self.last_seen_calls: list[tuple[BufferId, MsgId]] = []
+        self.marker_calls: list[tuple[BufferId, MsgId]] = []
 
     def push_event(self, event: ClientEvent) -> None:
         self._queue.put_nowait(event)
@@ -80,6 +82,12 @@ class _StubClient:
         self, buffer_id: BufferId, limit: int = 100
     ) -> None:  # pragma: no cover - stub
         pass
+
+    async def set_last_seen(self, buffer_id: BufferId, msg_id: MsgId) -> None:
+        self.last_seen_calls.append((buffer_id, msg_id))
+
+    async def set_marker_line(self, buffer_id: BufferId, msg_id: MsgId) -> None:
+        self.marker_calls.append((buffer_id, msg_id))
 
     async def close(self) -> None:
         self.closed = True
@@ -1730,3 +1738,61 @@ async def test_ctrl_r_without_factory_is_a_safe_noop() -> None:
         await pilot.pause()
         # Still disconnected, no crash, no replacement client.
         assert app.connection_lost is True
+
+
+@pytest.mark.asyncio
+async def test_switching_buffers_reports_last_seen_to_core() -> None:
+    """Leaving a buffer must push requestSetLastSeenMsg to the core so
+    reading in quasseltui marks the buffer read in every other Quassel
+    client. Before this, read state never round-tripped at all."""
+    state = _empty_state_with_one_network()
+    buf_a = _buffer(11, name="#a")
+    buf_b = _buffer(12, name="#b")
+    state.buffers[buf_a.buffer_id] = buf_a
+    state.buffers[buf_b.buffer_id] = buf_b
+    state.messages[buf_a.buffer_id] = [_irc_message(11, msg_id=5, contents="latest")]
+    state.messages[buf_b.buffer_id] = []
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        # Default pick lands on #a (the buffer with content).
+        assert app.active_buffer_id == buf_a.buffer_id
+
+        app.post_message(BufferSelected(buffer_id=buf_b.buffer_id))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.active_buffer_id == buf_b.buffer_id
+        assert client.last_seen_calls == [(buf_a.buffer_id, MsgId(5))]
+
+
+@pytest.mark.asyncio
+async def test_marker_placement_syncs_marker_line_to_core() -> None:
+    """A locally placed read marker must round-trip to the core via
+    requestSetMarkerLine so it persists across runs and other clients."""
+    from quasseltui.app.messages import MarkerToLatestRequested
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#a")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=7, contents="newest")]
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.active_buffer_id == buf.buffer_id
+
+        app.post_message(MarkerToLatestRequested())
+        await pilot.pause()
+        await pilot.pause()
+        assert client.marker_calls == [(buf.buffer_id, MsgId(7))]

@@ -36,7 +36,14 @@ from typing import Any
 
 from quasseltui.protocol.messages import SessionInit
 from quasseltui.protocol.signalproxy import InitData, RpcCall, SyncMessage
-from quasseltui.protocol.usertypes import BufferId, BufferInfo, IdentityId, Message, NetworkId
+from quasseltui.protocol.usertypes import (
+    BufferId,
+    BufferInfo,
+    IdentityId,
+    Message,
+    MsgId,
+    NetworkId,
+)
 from quasseltui.sync.backlog_manager import BacklogManager
 from quasseltui.sync.base import SyncObject
 from quasseltui.sync.buffer_syncer import BufferSyncer
@@ -50,6 +57,7 @@ from quasseltui.sync.events import (
     IrcMessage,
     MessageReceived,
     NetworkAdded,
+    NetworkRemoved,
     NetworkUpdated,
     SessionOpened,
 )
@@ -66,6 +74,17 @@ _log = logging.getLogger(__name__)
 # prefix at comparison time so callers see the bare signature.
 DISPLAY_MSG_SIGNAL = b"2displayMsg(Message)"
 
+# SignalProxy's object-rename broadcast (no "2" prefix — it's an internal
+# SignalProxy control message, not a Qt signal). Params:
+# [className: bytes, newName: str, oldName: str]. Quassel re-addresses
+# IrcUser syncables this way on every nick change.
+OBJECT_RENAMED_SIGNAL = b"__objectRenamed__"
+
+# Network lifecycle broadcasts — sent when a network is added/removed on
+# the core (e.g. from a desktop client connected to the same core).
+NETWORK_CREATED_SIGNAL = b"2networkCreated(NetworkId)"
+NETWORK_REMOVED_SIGNAL = b"2networkRemoved(NetworkId)"
+
 
 # Slot names whose success should turn into a `NetworkUpdated` event. Value
 # is the `Network` attribute name to read after the mutation; the same name
@@ -79,6 +98,18 @@ _NETWORK_UPDATE_SLOTS: dict[bytes, str] = {
     b"setConnectionState": "connection_state",
     b"setConnected": "is_connected",
 }
+
+
+def _as_network_id(value: Any) -> NetworkId | None:
+    """Coerce a wire param (NetworkId user type or plain int) to NetworkId."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, NetworkId):
+        return value
+    try:
+        return NetworkId(int(value))
+    except (TypeError, ValueError):
+        return None
 
 
 class Dispatcher:
@@ -173,10 +204,13 @@ class Dispatcher:
                 )
             )
 
-        # Seed identities from the raw session identities list
+        # Seed identities from the raw session identities list. Real
+        # cores wrap identityId in the IdentityId user type (decoded to
+        # the IdentityId dataclass, not a plain int) — accepting only
+        # int silently dropped every identity from a real core.
         for raw_ident in session.identities:
             ident_id_raw = raw_ident.get("identityId") or raw_ident.get("IdentityId")
-            if not isinstance(ident_id_raw, int):
+            if isinstance(ident_id_raw, bool) or not isinstance(ident_id_raw, int | IdentityId):
                 continue
             ident_id = IdentityId(int(ident_id_raw))
             identity = Identity(object_name=str(int(ident_id)))
@@ -203,7 +237,7 @@ class Dispatcher:
             _log.debug("ignoring Sync for unknown class %r::%r", msg.class_name, msg.object_name)
             return
         obj.handle_sync(msg.slot_name, list(msg.params))
-        self._emit_slot_side_effects(msg.class_name, msg.object_name, msg.slot_name, obj)
+        self._emit_slot_side_effects(msg.class_name, msg.slot_name, obj, list(msg.params))
 
     # -- InitData dispatch ---------------------------------------------------
 
@@ -250,28 +284,148 @@ class Dispatcher:
                     name=obj.identity_name,
                 )
             )
+        elif isinstance(obj, BufferSyncer):
+            self._seed_read_markers(obj)
+
+    def _seed_read_markers(self, syncer: BufferSyncer) -> None:
+        """Adopt the core's persisted marker lines as local read markers.
+
+        The core stores marker lines across sessions; without this seed a
+        marker placed in a previous run (or from another client) never
+        shows up here. `setdefault` so a marker the user already placed
+        in THIS session isn't clobbered by late-arriving InitData. The
+        core uses -1 for "no marker".
+        """
+        for bid, mid in syncer.marker_lines_by_buffer.items():
+            if mid < 0:
+                continue
+            self._state.read_markers.setdefault(BufferId(bid), MsgId(mid))
 
     # -- RpcCall dispatch ----------------------------------------------------
 
     def handle_rpc(self, msg: RpcCall) -> None:
         """Handle top-level `RpcCall`s that aren't routed to a SyncObject.
 
-        Today we only care about `displayMsg(Message)`. Everything else is
-        silently dropped — the core does send occasional other RPC signals
-        (`connectToNetwork`, etc.) that are client-to-core directional and
-        have no meaning when the core sends them back to us.
+        Recognized signals: `displayMsg(Message)` (live IRC traffic),
+        `__objectRenamed__` (nick changes re-address IrcUser syncables),
+        and `networkCreated`/`networkRemoved` (network lifecycle from
+        other clients). Everything else is silently dropped — the core
+        does send occasional other RPC signals (`connectToNetwork`, etc.)
+        that are client-to-core directional and have no meaning when the
+        core sends them back to us.
         """
-        if msg.signal_name != DISPLAY_MSG_SIGNAL:
-            _log.debug("ignoring RpcCall %r with %d params", msg.signal_name, len(msg.params))
+        if msg.signal_name == DISPLAY_MSG_SIGNAL:
+            if not msg.params:
+                _log.warning("displayMsg with no payload")
+                return
+            raw = msg.params[0]
+            if not isinstance(raw, Message):
+                _log.warning("displayMsg expected Message, got %s", type(raw).__name__)
+                return
+            self._store_and_emit_message(raw)
             return
-        if not msg.params:
-            _log.warning("displayMsg with no payload")
+        if msg.signal_name == OBJECT_RENAMED_SIGNAL:
+            self._handle_object_renamed(list(msg.params))
             return
-        raw = msg.params[0]
-        if not isinstance(raw, Message):
-            _log.warning("displayMsg expected Message, got %s", type(raw).__name__)
+        if msg.signal_name == NETWORK_CREATED_SIGNAL:
+            self._handle_network_created(list(msg.params))
             return
-        self._store_and_emit_message(raw)
+        if msg.signal_name == NETWORK_REMOVED_SIGNAL:
+            self._handle_network_removed(list(msg.params))
+            return
+        _log.debug("ignoring RpcCall %r with %d params", msg.signal_name, len(msg.params))
+
+    def _handle_object_renamed(self, params: list[Any]) -> None:
+        """Re-key a SyncObject after a SignalProxy `__objectRenamed__`.
+
+        Quassel re-addresses IrcUser objects on nick change (IrcUser::
+        setNick -> updateObjectName -> renameObject) and addresses every
+        subsequent Sync frame to the NEW name. Without the re-key, the
+        object strands under its old key: later updates for the user
+        either get silently dropped or create a duplicate empty object.
+        """
+        if len(params) < 3:
+            _log.warning("__objectRenamed__ with %d params (expected 3)", len(params))
+            return
+        raw_class, new_raw, old_raw = params[0], params[1], params[2]
+        class_name = raw_class.encode() if isinstance(raw_class, str) else raw_class
+        if not isinstance(class_name, bytes) or new_raw is None or old_raw is None:
+            _log.warning("__objectRenamed__ with malformed params: %r", params)
+            return
+        new_name, old_name = str(new_raw), str(old_raw)
+        obj = self._objects.pop((class_name, old_name), None)
+        if obj is None:
+            _log.debug("__objectRenamed__ for unknown %r::%r", class_name, old_name)
+            return
+        if isinstance(obj, IrcUser):
+            old_nick = obj.nick
+            obj.rename(new_name)
+            self._objects[(class_name, new_name)] = obj
+            self._rekey_user_rosters(obj, old_nick)
+        else:
+            obj.object_name = new_name
+            self._objects[(class_name, new_name)] = obj
+
+    def _rekey_user_rosters(self, user: IrcUser, old_nick: str) -> None:
+        """Move a renamed user's roster entries to the new nick."""
+        new_nick = user.nick
+        if old_nick == new_nick:
+            return
+        network = self._state.networks.get(NetworkId(user.network_id))
+        if network is not None and old_nick in network.users:
+            network.users.discard(old_nick)
+            network.users.add(new_nick)
+        for obj in self._objects.values():
+            if (
+                isinstance(obj, IrcChannel)
+                and obj.network_id == user.network_id
+                and old_nick in obj.user_modes
+            ):
+                obj.user_modes[new_nick] = obj.user_modes.pop(old_nick)
+
+    def _handle_network_created(self, params: list[Any]) -> None:
+        nid = _as_network_id(params[0]) if params else None
+        if nid is None:
+            _log.warning("networkCreated with malformed params: %r", params)
+            return
+        if nid in self._state.networks:
+            return
+        network = Network(object_name=str(int(nid)))
+        self._register(network)
+        self._state.networks[nid] = network
+        # Name/state arrive via the InitData the client requests on
+        # seeing this event (QuasselClient._maybe_request_network_init).
+        self._emit(NetworkAdded(network_id=nid, name=""))
+
+    def _handle_network_removed(self, params: list[Any]) -> None:
+        """Drop a removed network, its syncables, and all its buffers.
+
+        Without this, a network deleted from another client persists in
+        the sidebar for the rest of the session with no way to clear it.
+        """
+        nid = _as_network_id(params[0]) if params else None
+        if nid is None:
+            _log.warning("networkRemoved with malformed params: %r", params)
+            return
+        network = self._state.networks.pop(nid, None)
+        if network is None:
+            return
+        self._objects.pop((Network.CLASS_NAME, str(int(nid))), None)
+        stale = [
+            key
+            for key, obj in self._objects.items()
+            if isinstance(obj, IrcUser | IrcChannel) and obj.network_id == int(nid)
+        ]
+        for key in stale:
+            del self._objects[key]
+        doomed = [bid for bid, info in self._state.buffers.items() if info.network_id == nid]
+        for bid in doomed:
+            del self._state.buffers[bid]
+            self._state.messages.pop(bid, None)
+            self._state.backlog_requested.discard(bid)
+            self._state.read_markers.pop(bid, None)
+            self._emit(BufferRemoved(buffer_id=bid))
+        self._emit(NetworkRemoved(network_id=nid))
 
     # -- internals -----------------------------------------------------------
 
@@ -342,9 +496,9 @@ class Dispatcher:
     def _emit_slot_side_effects(
         self,
         class_name: bytes,
-        object_name: str,
         slot_name: bytes,
         obj: SyncObject,
+        params: list[Any],
     ) -> None:
         """Turn a just-completed Sync call into any applicable public event.
 
@@ -355,7 +509,18 @@ class Dispatcher:
         guarantees that a rename followed by a remove emits BOTH events
         in the right order regardless of which slot happened to trigger
         the drain.
+
+        The IrcUser branch cascades membership removal: real cores SYNC
+        parts/kicks as IrcUser::partChannel and quits as IrcUser::quit
+        (IrcChannel::part is NOT a sync method), so the channel rosters
+        only stay correct if the dispatcher fans the removal out here.
         """
+        if class_name == IrcUser.CLASS_NAME and isinstance(obj, IrcUser):
+            if slot_name == b"partChannel" and params:
+                self._cascade_user_part(obj, str(params[0]))
+            elif slot_name == b"quit":
+                self._cascade_user_quit(obj)
+            return
         if class_name == Network.CLASS_NAME and slot_name in _NETWORK_UPDATE_SLOTS:
             field_name = _NETWORK_UPDATE_SLOTS[slot_name]
             assert isinstance(obj, Network)
@@ -375,6 +540,28 @@ class Dispatcher:
         if class_name == BacklogManager.CLASS_NAME and slot_name == b"receiveBacklog":
             assert isinstance(obj, BacklogManager)
             self._merge_backlog(obj)
+
+    def _cascade_user_part(self, user: IrcUser, channel_name: str) -> None:
+        chan = self._objects.get((IrcChannel.CLASS_NAME, f"{user.network_id}/{channel_name}"))
+        if isinstance(chan, IrcChannel):
+            chan.user_modes.pop(user.nick, None)
+
+    def _cascade_user_quit(self, user: IrcUser) -> None:
+        """Remove a quit user from every roster and from the registry.
+
+        Iterates all channels of the network rather than `user.channels`
+        because the quit slot has already cleared that set by the time
+        this hook runs — and the channel-side rosters are authoritative
+        anyway.
+        """
+        nick = user.nick
+        for obj in self._objects.values():
+            if isinstance(obj, IrcChannel) and obj.network_id == user.network_id:
+                obj.user_modes.pop(nick, None)
+        network = self._state.networks.get(NetworkId(user.network_id))
+        if network is not None:
+            network.users.discard(nick)
+        self._objects.pop((IrcUser.CLASS_NAME, user.object_name), None)
 
     def _drain_buffer_syncer_pending(self, syncer: BufferSyncer) -> None:
         """Emit BufferRemoved / BufferRenamed for pending BufferSyncer ops.

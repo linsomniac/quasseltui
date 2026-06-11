@@ -13,9 +13,10 @@ and (eventually) the TUI's sidebar. We track:
 
 The `ircUsersAndChannels` init field carries the entire roster as a nested
 `QVariantMap` — we can't create `IrcUser` / `IrcChannel` instances ourselves
-here (the dispatcher owns the instance registry), so we store the nested
-map verbatim and let the dispatcher seed the child SyncObjects during the
-`Network` InitData apply step.
+here (the dispatcher owns the instance registry), so we normalize it into
+per-name field dicts (exploding the modern struct-of-arrays shape) and let
+the dispatcher seed the child SyncObjects during the `Network` InitData
+apply step.
 """
 
 from __future__ import annotations
@@ -153,27 +154,71 @@ class Network(SyncObject):
     def _init_irc_users_and_channels(self, value: Any) -> None:
         """Capture the nested user+channel seed map for the dispatcher.
 
-        Quassel ships this as `{"Users": {obj_name: {...fields}}, "Channels":
-        {obj_name: {...}}}` — the wire format is a `QVariantMap` containing
-        two nested maps. The dispatcher will pull these out and create the
-        corresponding `IrcUser` / `IrcChannel` SyncObjects, because *we*
-        don't know the other classes' object-name conventions.
+        Two wire shapes exist:
+
+        - Modern cores (>= 0.10) ship struct-of-arrays: `Users` and
+          `Channels` are each a map of attribute-name -> parallel
+          QVariantList, e.g. `{"nick": ["alice", "bob"], "user": [...]}`.
+          We explode that into per-name field dicts keyed by the "nick"
+          (users) / "name" (channels) column. This is what every real
+          core sends today — the old parser assumed the legacy shape
+          only, and its isinstance(dict) filter dropped the entire
+          roster against a real core (2026-06 review finding).
+        - Legacy shape: a map of object-name -> per-object field dict.
+          Kept as a fallback for old captures and fixtures.
+
+        The dispatcher pulls these out and creates the corresponding
+        `IrcUser` / `IrcChannel` SyncObjects, because *we* don't know
+        the other classes' object-name conventions.
         """
         if not isinstance(value, dict):
             return
         users = value.get("Users") or value.get("users")
         channels = value.get("Channels") or value.get("channels")
         if isinstance(users, dict):
-            # Each value may itself be a QVariantMap of parallel lists or a
-            # ready-made per-user dict depending on core version; we store
-            # it as-is for the dispatcher to unpack.
-            self.users_seed = {str(k): dict(v) for k, v in users.items() if isinstance(v, dict)}
+            users_seed = _explode_parallel_arrays(users, key_field="nick")
+            if users_seed is None:
+                users_seed = {str(k): dict(v) for k, v in users.items() if isinstance(v, dict)}
+            self.users_seed = users_seed
             self.users.update(self.users_seed.keys())
         if isinstance(channels, dict):
-            self.channels_seed = {
-                str(k): dict(v) for k, v in channels.items() if isinstance(v, dict)
-            }
+            channels_seed = _explode_parallel_arrays(channels, key_field="name")
+            if channels_seed is None:
+                channels_seed = {
+                    str(k): dict(v) for k, v in channels.items() if isinstance(v, dict)
+                }
+            self.channels_seed = channels_seed
             self.channels.update(self.channels_seed.keys())
+
+
+def _explode_parallel_arrays(
+    value: dict[str, Any],
+    *,
+    key_field: str,
+) -> dict[str, dict[str, Any]] | None:
+    """Turn a struct-of-arrays map into per-name field dicts, or None.
+
+    `{"nick": ["alice", "bob"], "user": ["al", "bo"]}` becomes
+    `{"alice": {"nick": "alice", "user": "al"}, "bob": {...}}`. Returns
+    `None` when `value[key_field]` isn't a list — that's the legacy
+    per-name-dict shape, which the caller handles separately. Columns
+    shorter than the key column simply omit the missing attribute for
+    the affected entries.
+    """
+    keys = value.get(key_field)
+    if not isinstance(keys, list):
+        return None
+    out: dict[str, dict[str, Any]] = {}
+    for i, key in enumerate(keys):
+        name = str(key) if key is not None else ""
+        if not name:
+            continue
+        entry: dict[str, Any] = {}
+        for attr, column in value.items():
+            if isinstance(column, list) and i < len(column):
+                entry[attr] = column[i]
+        out[name] = entry
+    return out
 
 
 def _coerce_connection_state(value: Any) -> NetworkConnectionState:

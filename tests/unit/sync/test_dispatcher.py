@@ -46,6 +46,8 @@ from quasseltui.sync.events import (
     ClientEvent,
     IdentityAdded,
     MessageReceived,
+    NetworkAdded,
+    NetworkRemoved,
     NetworkUpdated,
     SessionOpened,
 )
@@ -673,3 +675,311 @@ class TestReseedForReconnect:
             frozenset({"LongTime"}),
         )
         assert [m.contents for m in state.messages[BufferId(10)]] == ["history"]
+
+
+class TestIdentityUserTypeSeed:
+    def test_identity_id_usertype_is_accepted(self) -> None:
+        """Real cores wrap identityId in the IdentityId user type, which the
+        registered codec decodes to the IdentityId dataclass — NOT a plain
+        int. The old isinstance(int) guard silently dropped every identity
+        from a real core."""
+        state, dispatcher, events = _make_state_and_dispatcher()
+        session = _session(
+            network_ids=[],
+            identities=[{"identityId": IdentityId(7), "identityName": "main"}],
+        )
+        dispatcher.seed_from_session(session, frozenset())
+        assert IdentityId(7) in state.identities
+        assert state.identities[IdentityId(7)].identity_name == "main"
+        assert any(isinstance(e, IdentityAdded) and e.identity_id == IdentityId(7) for e in events)
+
+
+class TestObjectRenamed:
+    """Quassel DOES re-address IrcUser syncables on nick change:
+    IrcUser::setNick -> updateObjectName -> renameObject broadcasts the
+    __objectRenamed__ RpcCall, and every subsequent Sync frame is
+    addressed to "<netId>/<newNick>". Dropping the RPC strands the
+    object under its old key and every later update for the user is
+    silently lost."""
+
+    def _setup_user_in_channel(self):  # type: ignore[no-untyped-def]
+        state, dispatcher, events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(_session(network_ids=[1]), frozenset())
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"IrcUser",
+                object_name="1/alice",
+                slot_name=b"setUser",
+                params=["al"],
+            )
+        )
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"Network",
+                object_name="1",
+                slot_name=b"addIrcUser",
+                params=["alice!al@host"],
+            )
+        )
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"IrcChannel",
+                object_name="1/#chan",
+                slot_name=b"joinIrcUsers",
+                params=[["alice"], ["@"]],
+            )
+        )
+        events.clear()
+        return state, dispatcher, events
+
+    def test_nick_change_rekeys_object_and_rosters(self) -> None:
+        state, dispatcher, _events = self._setup_user_in_channel()
+        dispatcher.handle_rpc(
+            RpcCall(signal_name=b"__objectRenamed__", params=[b"IrcUser", "1/bob", "1/alice"])
+        )
+        assert dispatcher.get(b"IrcUser", "1/alice") is None
+        user = dispatcher.get(b"IrcUser", "1/bob")
+        assert isinstance(user, IrcUser)
+        assert user.nick == "bob"
+        assert user.user == "al"  # same object, fields preserved
+        chan = dispatcher.get(b"IrcChannel", "1/#chan")
+        assert isinstance(chan, IrcChannel)
+        assert chan.user_modes == {"bob": "@"}
+        assert "bob" in state.networks[NetworkId(1)].users
+        assert "alice" not in state.networks[NetworkId(1)].users
+
+    def test_followup_sync_reaches_renamed_object(self) -> None:
+        _state, dispatcher, _events = self._setup_user_in_channel()
+        dispatcher.handle_rpc(
+            RpcCall(signal_name=b"__objectRenamed__", params=[b"IrcUser", "1/bob", "1/alice"])
+        )
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"IrcUser",
+                object_name="1/bob",
+                slot_name=b"setAway",
+                params=[True],
+            )
+        )
+        user = dispatcher.get(b"IrcUser", "1/bob")
+        assert isinstance(user, IrcUser)
+        assert user.away is True
+        assert user.user == "al"
+
+
+class TestQuitPartCascade:
+    """Membership removal arrives via IrcUser only: IrcUser::partChannel
+    is SYNCed for parts/kicks and IrcUser::quit for quits; IrcChannel::
+    part is NOT a sync method on real cores. The dispatcher must cascade
+    these to the channel rosters or every roster grows stale forever."""
+
+    def _setup(self):  # type: ignore[no-untyped-def]
+        state, dispatcher, events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(_session(network_ids=[1]), frozenset())
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"Network",
+                object_name="1",
+                slot_name=b"addIrcUser",
+                params=["alice!al@host"],
+            )
+        )
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"IrcUser",
+                object_name="1/alice",
+                slot_name=b"joinChannel",
+                params=["#chan"],
+            )
+        )
+        for chan in ("#chan", "#other"):
+            dispatcher.handle_sync(
+                SyncMessage(
+                    class_name=b"IrcChannel",
+                    object_name=f"1/{chan}",
+                    slot_name=b"joinIrcUsers",
+                    params=[["alice", "bob"], ["@", ""]],
+                )
+            )
+        events.clear()
+        return state, dispatcher, events
+
+    def test_part_channel_removes_nick_from_channel_roster(self) -> None:
+        _state, dispatcher, _events = self._setup()
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"IrcUser",
+                object_name="1/alice",
+                slot_name=b"partChannel",
+                params=["#chan"],
+            )
+        )
+        chan = dispatcher.get(b"IrcChannel", "1/#chan")
+        assert isinstance(chan, IrcChannel)
+        assert "alice" not in chan.user_modes
+        assert "bob" in chan.user_modes
+        # The other channel is untouched.
+        other = dispatcher.get(b"IrcChannel", "1/#other")
+        assert isinstance(other, IrcChannel)
+        assert "alice" in other.user_modes
+
+    def test_quit_removes_user_from_every_roster_and_registry(self) -> None:
+        state, dispatcher, _events = self._setup()
+        dispatcher.handle_sync(
+            SyncMessage(
+                class_name=b"IrcUser",
+                object_name="1/alice",
+                slot_name=b"quit",
+                params=[],
+            )
+        )
+        for chan_name in ("1/#chan", "1/#other"):
+            chan = dispatcher.get(b"IrcChannel", chan_name)
+            assert isinstance(chan, IrcChannel)
+            assert "alice" not in chan.user_modes
+            assert "bob" in chan.user_modes
+        assert "alice" not in state.networks[NetworkId(1)].users
+        # The syncable is deregistered, as the IrcUser quit docstring
+        # has always claimed.
+        assert dispatcher.get(b"IrcUser", "1/alice") is None
+
+
+class TestNetworkLifecycleRpc:
+    def test_network_created_registers_placeholder_and_emits(self) -> None:
+        state, dispatcher, events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(_session(network_ids=[1]), frozenset())
+        events.clear()
+        dispatcher.handle_rpc(
+            RpcCall(signal_name=b"2networkCreated(NetworkId)", params=[NetworkId(7)])
+        )
+        assert NetworkId(7) in state.networks
+        added = [e for e in events if isinstance(e, NetworkAdded)]
+        assert len(added) == 1
+        assert added[0].network_id == NetworkId(7)
+
+    def test_network_created_for_known_network_is_idempotent(self) -> None:
+        _state, dispatcher, events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(_session(network_ids=[1]), frozenset())
+        events.clear()
+        dispatcher.handle_rpc(
+            RpcCall(signal_name=b"2networkCreated(NetworkId)", params=[NetworkId(1)])
+        )
+        assert [e for e in events if isinstance(e, NetworkAdded)] == []
+
+    def test_network_removed_drops_network_buffers_and_messages(self) -> None:
+        state, dispatcher, events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(
+            _session(
+                network_ids=[1, 2],
+                buffer_infos=[
+                    _buffer(10, 1, "#a"),
+                    _buffer(11, 1, "#b"),
+                    _buffer(20, 2, "#keep"),
+                ],
+            ),
+            frozenset({"LongTime"}),
+        )
+        dispatcher.handle_rpc(
+            RpcCall(
+                signal_name=DISPLAY_MSG_SIGNAL,
+                params=[_make_message(1, _buffer(10, 1, "#a"), "hello")],
+            )
+        )
+        state.backlog_requested.add(BufferId(10))
+        events.clear()
+
+        dispatcher.handle_rpc(
+            RpcCall(signal_name=b"2networkRemoved(NetworkId)", params=[NetworkId(1)])
+        )
+        assert NetworkId(1) not in state.networks
+        assert NetworkId(2) in state.networks
+        assert BufferId(10) not in state.buffers
+        assert BufferId(11) not in state.buffers
+        assert BufferId(20) in state.buffers
+        assert BufferId(10) not in state.messages
+        assert BufferId(10) not in state.backlog_requested
+        removed = {e.buffer_id for e in events if isinstance(e, BufferRemoved)}
+        assert removed == {BufferId(10), BufferId(11)}
+        network_removed = [e for e in events if isinstance(e, NetworkRemoved)]
+        assert len(network_removed) == 1
+        assert network_removed[0].network_id == NetworkId(1)
+        assert dispatcher.get(b"Network", "1") is None
+
+
+class TestStructOfArraysSeed:
+    def test_parallel_array_users_and_channels_seed(self) -> None:
+        """Real cores (>= 0.10) ship IrcUsersAndChannels as struct-of-
+        arrays: each of Users/Channels is a map of attribute-name ->
+        parallel QVariantList. The old parser assumed per-nick dicts and
+        its isinstance(v, dict) filter dropped everything, yielding an
+        empty roster against every real core."""
+        state, dispatcher, _events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(_session(network_ids=[3]), frozenset())
+        init = InitData(
+            class_name=b"Network",
+            object_name="3",
+            init_data={
+                "networkName": "libera",
+                "IrcUsersAndChannels": {
+                    "Users": {
+                        "nick": ["alice", "bob"],
+                        "user": ["al", "bo"],
+                        "host": ["h1", "h2"],
+                        "away": [False, True],
+                    },
+                    "Channels": {
+                        "name": ["#chan"],
+                        "topic": ["greetings"],
+                        "UserModes": [{"alice": "@", "bob": ""}],
+                    },
+                },
+            },
+        )
+        dispatcher.handle_init_data(init)
+        alice = dispatcher.get(b"IrcUser", "3/alice")
+        assert isinstance(alice, IrcUser)
+        assert (alice.user, alice.host, alice.away) == ("al", "h1", False)
+        bob = dispatcher.get(b"IrcUser", "3/bob")
+        assert isinstance(bob, IrcUser)
+        assert bob.away is True
+        chan = dispatcher.get(b"IrcChannel", "3/#chan")
+        assert isinstance(chan, IrcChannel)
+        assert chan.topic == "greetings"
+        assert chan.user_modes == {"alice": "@", "bob": ""}
+        net = state.networks[NetworkId(3)]
+        assert net.users == {"alice", "bob"}
+        assert net.channels == {"#chan"}
+
+
+class TestMarkerSeedFromCore:
+    def test_marker_lines_init_seeds_read_markers(self) -> None:
+        """The core persists marker lines across sessions; seeding
+        state.read_markers from BufferSyncer InitData is what makes a
+        marker placed in a previous run (or another client) show up."""
+        state, dispatcher, _events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(
+            _session(network_ids=[1], buffer_infos=[_buffer(10, 1, "#a")]),
+            frozenset(),
+        )
+        init = InitData(
+            class_name=b"BufferSyncer",
+            object_name="",
+            init_data={"MarkerLines": {"10": 42}},
+        )
+        dispatcher.handle_init_data(init)
+        assert state.read_markers.get(BufferId(10)) == MsgId(42)
+
+    def test_marker_seed_does_not_clobber_local_placement(self) -> None:
+        state, dispatcher, _events = _make_state_and_dispatcher()
+        dispatcher.seed_from_session(
+            _session(network_ids=[1], buffer_infos=[_buffer(10, 1, "#a")]),
+            frozenset(),
+        )
+        state.read_markers[BufferId(10)] = MsgId(99)
+        init = InitData(
+            class_name=b"BufferSyncer",
+            object_name="",
+            init_data={"MarkerLines": {"10": 42}},
+        )
+        dispatcher.handle_init_data(init)
+        assert state.read_markers[BufferId(10)] == MsgId(99)

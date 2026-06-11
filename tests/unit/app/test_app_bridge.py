@@ -126,11 +126,15 @@ def _option_text(log: MessageLog, index: int) -> str:
 
 
 def _irc_message(bid: int, *, msg_id: int, contents: str = "hi") -> IrcMessage:
+    # "Now" rather than a fixed date: the message log inserts disabled
+    # date-separator rows before non-today messages, and most tests here
+    # assert option ids/indices for plain "today" traffic. Tests that
+    # exercise the separators override the timestamp explicitly.
     return IrcMessage(
         msg_id=MsgId(msg_id),
         buffer_id=BufferId(bid),
         network_id=NetworkId(1),
-        timestamp=dt.datetime(2026, 4, 15, 12, 0, 0, tzinfo=dt.UTC),
+        timestamp=dt.datetime.now(dt.UTC),
         type=MessageType.Plain,
         flags=MessageFlag.NONE,
         sender="alice",
@@ -1796,3 +1800,343 @@ async def test_marker_placement_syncs_marker_line_to_core() -> None:
         await pilot.pause()
         await pilot.pause()
         assert client.marker_calls == [(buf.buffer_id, MsgId(7))]
+
+
+@pytest.mark.asyncio
+async def test_date_separator_rows_on_day_boundaries() -> None:
+    """Multi-day backlog rendered with HH:MM:SS-only timestamps is
+    indistinguishable from today's traffic. The log must insert a
+    disabled date-separator row before messages from a day other than
+    'today' and at each day boundary."""
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    old = _irc_message(11, msg_id=1, contents="two days ago")
+    older_ts = dt.datetime(2026, 4, 14, 9, 0, 0, tzinfo=dt.UTC)
+    newer_ts = dt.datetime(2026, 4, 15, 9, 0, 0, tzinfo=dt.UTC)
+    from dataclasses import replace
+
+    state.messages[buf.buffer_id] = [
+        replace(old, timestamp=older_ts),
+        replace(_irc_message(11, msg_id=2, contents="next day"), timestamp=newer_ts),
+    ]
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        log = app.screen.query_one(MessageLog)
+        rows = [_option_text(log, i) for i in range(log.option_count)]
+        disabled = [
+            _option_text(log, i)
+            for i in range(log.option_count)
+            if log.get_option_at_index(i).disabled
+        ]
+        # One separator before the first (non-today) message, one at the
+        # 14th -> 15th boundary.
+        assert sum("2026-04-14" in row for row in disabled) == 1
+        assert sum("2026-04-15" in row for row in disabled) == 1
+        # Separators are positioned before their day's messages.
+        assert rows.index(next(r for r in rows if "2026-04-14" in r)) < rows.index(
+            next(r for r in rows if "two days ago" in r)
+        )
+        assert rows.index(next(r for r in rows if "2026-04-15" in r)) < rows.index(
+            next(r for r in rows if "next day" in r)
+        )
+
+
+@pytest.mark.asyncio
+async def test_click_in_scrollback_highlights_but_does_not_move_marker() -> None:
+    """OptionList's built-in click handler used to call action_select()
+    for every left click, silently relocating the read marker on focus
+    clicks and failed text-selection attempts. Clicks must highlight
+    only; marker placement stays on Enter."""
+    from types import SimpleNamespace
+
+    from rich.style import Style
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [
+        _irc_message(11, msg_id=1, contents="first"),
+        _irc_message(11, msg_id=2, contents="second"),
+    ]
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        log = app.screen.query_one(MessageLog)
+        # Find the index of a non-disabled message row to "click".
+        target = next(i for i in range(log.option_count) if not log.get_option_at_index(i).disabled)
+        event = SimpleNamespace(style=Style(meta={"option": target}))
+        await log._on_click(event)  # type: ignore[arg-type]
+        await pilot.pause()
+        await pilot.pause()
+
+        assert log.highlighted == target
+        assert state.read_markers == {}
+
+
+@pytest.mark.asyncio
+async def test_input_history_up_down_recall() -> None:
+    """Up/Down in the input bar must recall previously sent lines —
+    muscle memory for every IRC user and previously entirely absent."""
+    from quasseltui.app.widgets.input_bar import InputBar
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1)]
+
+    class _SendingStubClient(_StubClient):
+        async def send_input(self, buffer_id: BufferId, text: str) -> None:
+            pass
+
+    client = _SendingStubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.focus()
+        input_bar.value = "first line"
+        await pilot.press("enter")
+        await pilot.pause()
+        input_bar.value = "second line"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert input_bar.value == ""
+
+        await pilot.press("up")
+        assert input_bar.value == "second line"
+        await pilot.press("up")
+        assert input_bar.value == "first line"
+        # Clamped at the oldest entry.
+        await pilot.press("up")
+        assert input_bar.value == "first line"
+        await pilot.press("down")
+        assert input_bar.value == "second line"
+        # Walking past the newest restores the (empty) in-progress text.
+        await pilot.press("down")
+        assert input_bar.value == ""
+
+
+@pytest.mark.asyncio
+async def test_input_history_preserves_in_progress_text() -> None:
+    from quasseltui.app.widgets.input_bar import InputBar
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1)]
+
+    class _SendingStubClient(_StubClient):
+        async def send_input(self, buffer_id: BufferId, text: str) -> None:
+            pass
+
+    client = _SendingStubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.focus()
+        input_bar.value = "sent already"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        input_bar.value = "half typed"
+        await pilot.press("up")
+        assert input_bar.value == "sent already"
+        await pilot.press("down")
+        assert input_bar.value == "half typed"
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_input_is_not_sent() -> None:
+    """A space + Enter accident must not broadcast a blank-looking
+    message to the whole channel (and must not move the marker)."""
+    from quasseltui.app.widgets.input_bar import InputBar
+
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=1)]
+
+    sent: list[tuple[BufferId, str]] = []
+
+    class _SendingStubClient(_StubClient):
+        async def send_input(self, buffer_id: BufferId, text: str) -> None:
+            sent.append((buffer_id, text))
+
+    client = _SendingStubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.focus()
+        input_bar.value = "   "
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        assert sent == []
+        assert state.read_markers == {}
+        assert input_bar.value == ""
+
+
+@pytest.mark.asyncio
+async def test_empty_enter_marker_move_shows_notice() -> None:
+    """Empty Enter silently overwrote the previous read marker with no
+    feedback or undo; at minimum the user must SEE that it happened."""
+    state = _empty_state_with_one_network()
+    buf = _buffer(11, name="#python")
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [_irc_message(11, msg_id=3, contents="latest")]
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        from quasseltui.app.messages import MarkerToLatestRequested
+
+        app.post_message(MarkerToLatestRequested())
+        await pilot.pause()
+        await pilot.pause()
+        assert state.read_markers[buf.buffer_id] == MsgId(3)
+        assert any("marker" in notice.lower() for notice in app.notices)
+
+
+@pytest.mark.asyncio
+async def test_line_typed_before_active_buffer_is_restored_with_notice() -> None:
+    """Typing during the startup window (input focused, handshake still
+    settling) used to silently discard the line — the widget had
+    already cleared itself. Restore the text and tell the user."""
+    from quasseltui.app.widgets.input_bar import InputBar
+
+    state = _empty_state_with_one_network()
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # No SessionOpened pushed: active_buffer_id is still None.
+        assert app.active_buffer_id is None
+        input_bar = app.screen.query_one(InputBar)
+        input_bar.focus()
+        input_bar.value = "typed too early"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+        assert input_bar.value == "typed too early"
+        assert any("buffer" in notice.lower() for notice in app.notices)
+
+
+@pytest.mark.asyncio
+async def test_anchor_capture_failure_falls_back_to_tail_not_top() -> None:
+    """When the private-Textual-API anchor capture is unavailable, a
+    scrolled-up refresh used to make NO scroll call at all — and since
+    the rebuild resets scroll to 0, the reader got dumped at the TOP
+    of the buffer. Tail is the documented degraded behavior."""
+    state = _empty_state_with_one_network()
+    buf = _buffer(11)
+    state.buffers[buf.buffer_id] = buf
+    state.messages[buf.buffer_id] = [
+        _irc_message(11, msg_id=i, contents=f"line {i}") for i in range(1, 40)
+    ]
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+
+        log = app.screen.query_one(MessageLog)
+        log.scroll_to(y=5, animate=False, immediate=True)
+        await pilot.pause()
+        assert not log.is_vertical_scroll_end
+
+        # Simulate the guarded private-API access coming up empty.
+        log._capture_scroll_anchor = lambda: None  # type: ignore[method-assign]
+        state.messages[buf.buffer_id].append(_irc_message(11, msg_id=99, contents="new"))
+        client.push_event(MessageReceived(message=_irc_message(11, msg_id=99, contents="new")))
+        await pilot.pause(0.1)
+        await pilot.pause()
+
+        assert log.is_vertical_scroll_end
+
+
+@pytest.mark.asyncio
+async def test_message_for_inactive_buffer_marks_activity_until_visited() -> None:
+    """Messages for non-active buffers used to vanish from the UI path
+    entirely — no styling, no counter, nothing. The sidebar must mark
+    the buffer (highlight-aware) and clear when the user visits it."""
+    state = _empty_state_with_one_network()
+    buf_a = _buffer(11, name="#a")
+    buf_b = _buffer(12, name="#b")
+    state.buffers[buf_a.buffer_id] = buf_a
+    state.buffers[buf_b.buffer_id] = buf_b
+    state.messages[buf_a.buffer_id] = [_irc_message(11, msg_id=1)]
+    state.messages[buf_b.buffer_id] = []
+    client = _StubClient(state)
+    app = QuasselApp(state, client=client)  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session = SessionInit(identities=(), network_ids=(), buffer_infos=(), raw={})
+        client.push_event(SessionOpened(session=session, peer_features=frozenset()))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.active_buffer_id == buf_a.buffer_id
+
+        # Live message for the NON-active buffer.
+        state.messages[buf_b.buffer_id].append(_irc_message(12, msg_id=2, contents="psst"))
+        client.push_event(MessageReceived(message=_irc_message(12, msg_id=2, contents="psst")))
+        await pilot.pause(0.1)
+        await pilot.pause()
+
+        assert app.buffer_activity.get(buf_b.buffer_id) == "message"
+        tree = app.screen.query_one(BufferTree)
+        assert tree.activity_level(buf_b.buffer_id) == "message"
+
+        # Visiting the buffer clears the indicator.
+        app.post_message(BufferSelected(buffer_id=buf_b.buffer_id))
+        await pilot.pause()
+        await pilot.pause()
+        assert buf_b.buffer_id not in app.buffer_activity
+        assert tree.activity_level(buf_b.buffer_id) is None

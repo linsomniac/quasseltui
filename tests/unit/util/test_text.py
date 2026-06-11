@@ -68,3 +68,38 @@ class TestSanitizeTerminal:
         # is a deliberate choice, not a surprise.
         raw = "[bold red]spoof[/]"
         assert sanitize_terminal(raw) == raw
+
+
+class TestStripMircFormatting:
+    """mIRC formatting codes (bold/color/etc.) are C0 bytes that appear
+    constantly in real IRC traffic; they must be STRIPPED before the
+    terminal sanitizer escapes them into literal \\x02 junk."""
+
+    def test_bold_italic_underline_strike_mono_reverse_reset(self) -> None:
+        from quasseltui.util.text import strip_mirc_formatting
+
+        raw = "\x02b\x02 \x1di\x1d \x1fu\x1f \x1es\x1e \x11m\x11 \x16r\x16 \x0fdone"
+        assert strip_mirc_formatting(raw) == "b i u s m r done"
+
+    def test_color_codes_with_fg_and_bg_args(self) -> None:
+        from quasseltui.util.text import strip_mirc_formatting
+
+        assert strip_mirc_formatting("\x034,7warning\x03 ok") == "warning ok"
+        assert strip_mirc_formatting("\x0312deep blue") == "deep blue"
+        assert strip_mirc_formatting("\x033green\x03") == "green"
+
+    def test_color_code_without_args(self) -> None:
+        from quasseltui.util.text import strip_mirc_formatting
+
+        assert strip_mirc_formatting("a\x03b") == "ab"
+
+    def test_plain_text_unchanged(self) -> None:
+        from quasseltui.util.text import strip_mirc_formatting
+
+        assert strip_mirc_formatting("hello #channel") == "hello #channel"
+
+    def test_non_mirc_controls_are_left_for_the_sanitizer(self) -> None:
+        from quasseltui.util.text import strip_mirc_formatting
+
+        # ESC is NOT a formatting code; sanitize_terminal still escapes it.
+        assert strip_mirc_formatting("\x1b[31mred") == "\x1b[31mred"

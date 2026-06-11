@@ -42,7 +42,10 @@ Escape would fight the `Input` widget's own Escape semantics.
 
 from __future__ import annotations
 
+import datetime as _dt
+
 from rich.text import Text
+from textual import events
 from textual.widgets import OptionList
 from textual.widgets.option_list import Option
 
@@ -51,7 +54,7 @@ from quasseltui.client.state import ClientState
 from quasseltui.protocol.enums import MessageType
 from quasseltui.protocol.usertypes import BufferId, MsgId
 from quasseltui.sync.events import IrcMessage
-from quasseltui.util.text import sanitize_terminal
+from quasseltui.util.text import sanitize_terminal, strip_mirc_formatting
 
 _TYPE_PREFIX: dict[MessageType, str] = {
     MessageType.Plain: "",
@@ -162,6 +165,14 @@ class MessageLog(OptionList):
             self.scroll_end(animate=False, immediate=True)
         elif anchor is not None:
             self._restore_scroll_anchor(anchor)
+        else:
+            # Anchor capture unavailable (the private Textual line cache
+            # the anchor leans on changed shape, or there was nothing to
+            # anchor). `_rebuild`'s clear_options has already reset the
+            # scroll to 0, so doing nothing here strands the reader at
+            # the TOP of the buffer — the tail is the honest degraded
+            # behavior, matching a fresh buffer switch.
+            self.scroll_end(animate=False, immediate=True)
 
     def on_focus(self) -> None:
         """Pre-select the latest message when focus arrives with no highlight.
@@ -185,10 +196,40 @@ class MessageLog(OptionList):
         """
         if self.highlighted is not None:
             return
+        # `set_reactive` rather than plain assignment: the reactive
+        # watcher scrolls the highlighted option fully into view, and
+        # when the top-visible row is partially cut off (wrapped IRC
+        # lines) that shifts the viewport the docstring promises not to
+        # move. Same precedent as `_restore_highlight`. Focus triggers
+        # a render anyway, so the cursor still paints.
         if self.is_vertical_scroll_end:
-            self.highlighted = self._last_message_index()
+            self.set_reactive(OptionList.highlighted, self._last_message_index())
         else:
-            self.highlighted = self._top_visible_message_index()
+            self.set_reactive(OptionList.highlighted, self._top_visible_message_index())
+
+    async def _on_click(self, event: events.Click) -> None:
+        """Clicks highlight a row but do NOT select it.
+
+        AIDEV-NOTE: this overrides OptionList's private `_on_click`,
+        which sets `highlighted` and then calls `action_select()` for
+        every left click — turning focus clicks and failed
+        text-selection attempts into silent read-marker moves (the
+        marker is the user's record of where they stopped reading;
+        destroying it on a stray click is data loss). Marker placement
+        stays on Enter. Same private-API dependency class as the
+        scroll-anchor helpers below; if Textual renames `_on_click`,
+        the base behavior returns (annoying but functional) rather
+        than anything crashing.
+        """
+        clicked_option: int | None = event.style.meta.get("option")
+        if clicked_option is None:
+            return
+        try:
+            disabled = self.get_option_at_index(clicked_option).disabled
+        except Exception:
+            return  # stale meta during a rebuild — nothing to land on
+        if not disabled:
+            self.highlighted = clicked_option
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         """Handle Enter / click on an option row.
@@ -214,14 +255,27 @@ class MessageLog(OptionList):
     # -- internals ---------------------------------------------------------
 
     def _rebuild(self) -> None:
-        """Tear down and recreate all options for the active buffer."""
+        """Tear down and recreate all options for the active buffer.
+
+        Inserts a disabled date-separator row whenever the (local) date
+        changes between consecutive messages, and before the first
+        message when it isn't from today — a quiet buffer's 100-message
+        backlog can span weeks, and `HH:MM:SS`-only timestamps made all
+        of it look like today's traffic. Seeding `previous_date` with
+        today means today's messages get no leading separator.
+        """
         self.clear_options()
         if self._active_buffer is None:
             return
         messages = self._state.messages.get(self._active_buffer, [])
         marker_msg_id = self._state.read_markers.get(self._active_buffer)
         options: list[Option] = []
+        previous_date = _dt.datetime.now().astimezone().date()
         for msg in messages:
+            local_date = msg.timestamp.astimezone().date()
+            if local_date != previous_date:
+                options.append(_date_separator_option(local_date))
+                previous_date = local_date
             options.append(
                 Option(
                     format_message(msg),
@@ -431,7 +485,11 @@ def format_message(msg: IrcMessage) -> Text:
     ts = msg.timestamp.astimezone().strftime("%H:%M:%S")
     prefix = _TYPE_PREFIX.get(msg.type, "")
     sender = sanitize_terminal(_short_sender(msg.sender))
-    contents = sanitize_terminal(msg.contents)
+    # mIRC formatting codes (bold/color/...) are stripped rather than
+    # escaped — they're routine in real traffic and would otherwise
+    # render as literal \x02 junk. The sanitizer stays as the net for
+    # everything that isn't benign formatting.
+    contents = sanitize_terminal(strip_mirc_formatting(msg.contents))
     if msg.type == MessageType.Action:
         return Text(f"{ts} {prefix}{sender} {contents}")
     sender_prefixes = sanitize_terminal(msg.sender_prefixes)
@@ -456,6 +514,17 @@ def _message_option_id(msg_id: MsgId) -> str:
     without a separate "which kind of option is this" lookup.
     """
     return f"{_MESSAGE_OPTION_PREFIX}{int(msg_id)}"
+
+
+def _date_separator_option(day: _dt.date) -> Option:
+    """Build a disabled "day changed" separator row.
+
+    `id=None` (several can exist per buffer) and `disabled=True` so the
+    cursor, the scroll anchor, and Enter all skip it — the same row
+    contract as the read marker.
+    """
+    text = Text(f"── {day.strftime('%A, %Y-%m-%d')} ──", style="dim")
+    return Option(text, id=None, disabled=True)
 
 
 def _marker_option() -> Option:

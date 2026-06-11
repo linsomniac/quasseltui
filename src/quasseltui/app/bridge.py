@@ -60,11 +60,13 @@ from textual.message import Message
 
 from quasseltui.app.messages import (
     ActiveBufferUpdated,
+    BufferActivity,
     BufferListUpdated,
     SessionEnded,
 )
 from quasseltui.client.state import ClientState
-from quasseltui.protocol.usertypes import BufferId
+from quasseltui.protocol.enums import MessageFlag
+from quasseltui.protocol.usertypes import BufferId, BufferType
 from quasseltui.sync.events import (
     BacklogReceived,
     BufferAdded,
@@ -251,7 +253,7 @@ class ClientBridge:
         self._maybe_pick_default_active_buffer()
 
     def _handle_message(self, event: MessageReceived) -> None:
-        """Apply a `MessageReceived` — coalesce if active, ignore if not.
+        """Apply a `MessageReceived` — coalesce if active, mark if not.
 
         Cold start only: if no buffer has ever been active, land on the
         buffer this message arrived in. That's where the activity is, and
@@ -260,6 +262,10 @@ class ClientBridge:
         the landing spot arbitrary. Once `_ever_active` is set, a later
         message never re-picks the active buffer, so a stray line can't
         hijack the user onto another channel (2026-06 review finding).
+
+        Messages for non-active buffers post `BufferActivity` so the
+        sidebar can mark them — they used to vanish from the UI path
+        entirely, making PMs and highlights arrive invisibly.
         """
         buffer_id = event.message.buffer_id
         if self._sink.active_buffer_id is None and not self._ever_active:
@@ -267,8 +273,18 @@ class ClientBridge:
             self._ever_active = True
             self._sink.post_message(ActiveBufferUpdated(buffer_id=buffer_id))
         if buffer_id != self._sink.active_buffer_id:
+            self._sink.post_message(
+                BufferActivity(buffer_id=buffer_id, highlight=self._is_highlight(event))
+            )
             return
         self._schedule_active_refresh()
+
+    def _is_highlight(self, event: MessageReceived) -> bool:
+        """Attention-worthy? Highlight flag, or any message in a query."""
+        if event.message.flags & MessageFlag.Highlight:
+            return True
+        info = self._state.buffers.get(event.message.buffer_id)
+        return info is not None and info.type == BufferType.Query
 
     def _schedule_active_refresh(self) -> None:
         """Start a debounce task if none is pending.

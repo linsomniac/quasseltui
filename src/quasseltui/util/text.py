@@ -37,6 +37,17 @@ import re
 # escaping it unconditionally is safe.
 _TERMINAL_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
+# mIRC formatting codes: bold \x02, color \x03 (with optional fg[,bg]
+# digit arguments), reset \x0f, monospace \x11, reverse \x16, italic
+# \x1d, strikethrough \x1e, underline \x1f. These appear constantly in
+# real IRC traffic (bots, topic art, colored announcements) and carry
+# no information a TUI renders today — strip them BEFORE the terminal
+# sanitizer, or every formatted message displays literal \x02 / \x034,2
+# junk. ESC and other C0 bytes are deliberately NOT in this set: they
+# are never legitimate formatting and `sanitize_terminal` escapes them
+# visibly so an operator can see what a misbehaving peer sent.
+_MIRC_FORMATTING_RE = re.compile(r"\x03(?:\d{1,2}(?:,\d{1,2})?)?|[\x02\x0f\x11\x16\x1d\x1e\x1f]")
+
 
 def sanitize_terminal(text: str) -> str:
     """Escape C0/C1 control characters so a terminal cannot interpret them.
@@ -50,6 +61,18 @@ def sanitize_terminal(text: str) -> str:
     return _TERMINAL_UNSAFE_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
 
 
+def strip_mirc_formatting(text: str) -> str:
+    """Remove mIRC bold/color/etc. formatting codes from message text.
+
+    Run BEFORE `sanitize_terminal` on message bodies: formatting codes
+    are routine, benign, and meaningless to render, so escaping them
+    into `\\x02` literals just produces junk. Everything this regex
+    does not match still goes through the sanitizer afterwards.
+    """
+    return _MIRC_FORMATTING_RE.sub("", text)
+
+
 __all__ = [
     "sanitize_terminal",
+    "strip_mirc_formatting",
 ]

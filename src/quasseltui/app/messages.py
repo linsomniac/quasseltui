@@ -125,6 +125,23 @@ class MarkerToLatestRequested(Message):
     """
 
 
+class BufferActivity(Message):
+    """A live message arrived for a buffer that is NOT the active one.
+
+    Posted by the bridge so the app can mark the buffer in the sidebar
+    instead of letting the message vanish from the UI path entirely.
+    `highlight` is `True` when the message carries the Highlight flag
+    or lands in a Query buffer (a PM is always attention-worthy); the
+    app keeps the strongest level seen until the user visits the
+    buffer, which clears it.
+    """
+
+    def __init__(self, buffer_id: BufferId, *, highlight: bool) -> None:
+        super().__init__()
+        self.buffer_id = buffer_id
+        self.highlight = highlight
+
+
 class SessionEnded(Message):
     """The live client disconnected.
 
@@ -149,6 +166,7 @@ class SessionEnded(Message):
 
 __all__ = [
     "ActiveBufferUpdated",
+    "BufferActivity",
     "BufferListUpdated",
     "BufferSelected",
     "LineSubmitted",

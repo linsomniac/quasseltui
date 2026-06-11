@@ -59,6 +59,10 @@ class BufferTree(Tree[BufferInfo | None]):
         # after a rebuild, so a sidebar refresh caused by a live event
         # doesn't lose the user's place.
         self._active_hint: BufferId | None = None
+        # Per-buffer unread indicator level ("message" / "highlight"),
+        # mirrored from the app via `set_activity`. Kept here as well
+        # so `_populate` can restyle labels across full rebuilds.
+        self._activity: dict[BufferId, str] = {}
 
     def on_mount(self) -> None:
         self._populate()
@@ -103,6 +107,35 @@ class BufferTree(Tree[BufferInfo | None]):
             self.select_node(None)
             return
         self._select_leaf_for_buffer(buffer_id)
+
+    def set_activity(self, buffer_id: BufferId, level: str | None) -> None:
+        """Set or clear the unread indicator for a buffer's leaf.
+
+        `level` is "message" (someone spoke), "highlight" (the message
+        named the user, or landed in a query), or `None` to clear. The
+        label is restyled in place; full rebuilds re-apply from the
+        `_activity` dict so a sidebar refresh can't drop indicators.
+        """
+        if level is None:
+            self._activity.pop(buffer_id, None)
+        else:
+            self._activity[buffer_id] = level
+        leaf = self._find_leaf_for_buffer(buffer_id)
+        if leaf is not None and leaf.data is not None:
+            leaf.set_label(self._styled_label(leaf.data))
+
+    def activity_level(self, buffer_id: BufferId) -> str | None:
+        """Current indicator level for a buffer ("message"/"highlight"/None)."""
+        return self._activity.get(buffer_id)
+
+    def _styled_label(self, buf: BufferInfo) -> Text:
+        label = _safe_label(_buffer_label(buf))
+        level = self._activity.get(buf.buffer_id)
+        if level == "highlight":
+            label.stylize("bold yellow")
+        elif level == "message":
+            label.stylize("bold")
+        return label
 
     def on_tree_node_selected(self, event: Tree.NodeSelected[BufferInfo | None]) -> None:
         """Forward leaf selections as `BufferSelected` messages.
@@ -194,7 +227,7 @@ class BufferTree(Tree[BufferInfo | None]):
             ]
             buffers.sort(key=_buffer_sort_key)
             for buf in buffers:
-                node.add_leaf(_safe_label(_buffer_label(buf)), data=buf)
+                node.add_leaf(self._styled_label(buf), data=buf)
 
 
 def _safe_label(raw: str) -> Text:

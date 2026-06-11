@@ -56,6 +56,7 @@ from textual.widget import Widget
 from quasseltui.app.bridge import ClientBridge
 from quasseltui.app.messages import (
     ActiveBufferUpdated,
+    BufferActivity,
     BufferListUpdated,
     BufferSelected,
     LineSubmitted,
@@ -168,6 +169,13 @@ class QuasselApp(App[None]):
         # connection) are recorded here AND surfaced as a toast via
         # `_notify_user`. A future status/log pane can render these.
         self.notices: list[str] = []
+        # Per-buffer unread/activity level for NON-active buffers:
+        # "message" or "highlight" (highlight wins and sticks until the
+        # user visits the buffer, which clears the entry). The sidebar
+        # styles its labels from the mirror copy the tree keeps; this
+        # dict is the authority and is public for tests / a future
+        # status bar.
+        self.buffer_activity: dict[BufferId, str] = {}
 
     def on_mount(self) -> None:
         self.push_screen(ChatScreen(self._state))
@@ -271,12 +279,35 @@ class QuasselApp(App[None]):
         tree = self._find(BufferTree)
         if tree is not None:
             tree.set_active_buffer(event.buffer_id)
+        if event.buffer_id is not None:
+            # Visiting a buffer consumes its unread indicator.
+            self.buffer_activity.pop(event.buffer_id, None)
+            if tree is not None:
+                tree.set_activity(event.buffer_id, None)
         if event.buffer_id is not None and self._client is not None and not self.connection_lost:
             # Don't chase backlog once the socket is gone — a post-drop
             # buffer switch (alt+up/down still fire) would otherwise spawn
             # requests that fail against the closed client and spam the
             # "Could not load history" notice.
             self.run_worker(self._request_backlog(event.buffer_id), exclusive=False)
+
+    @on(BufferActivity)
+    def _on_buffer_activity(self, event: BufferActivity) -> None:
+        """Mark a non-active buffer's sidebar entry as having activity.
+
+        "highlight" outranks "message" and sticks until the user visits
+        the buffer (`_on_active_buffer_updated` clears it). Skips the
+        active buffer defensively — a debounce race could deliver a
+        stale activity message for a buffer the user just switched to.
+        """
+        if event.buffer_id == self.active_buffer_id:
+            return
+        level = "highlight" if event.highlight else "message"
+        if self.buffer_activity.get(event.buffer_id) != "highlight":
+            self.buffer_activity[event.buffer_id] = level
+        tree = self._find(BufferTree)
+        if tree is not None:
+            tree.set_activity(event.buffer_id, self.buffer_activity[event.buffer_id])
 
     @on(BufferSelected)
     def _on_buffer_selected(self, event: BufferSelected) -> None:
@@ -340,6 +371,12 @@ class QuasselApp(App[None]):
             return
         self._state.read_markers[buffer_id] = messages[-1].msg_id
         self._sync_marker_to_core(buffer_id, messages[-1].msg_id)
+        # The empty-Enter trigger is easy to hit by accident and it
+        # overwrites the previous marker with no undo — make the move
+        # visible so an accidental press is at least noticeable.
+        info = self._state.buffers.get(buffer_id)
+        where = info.name if info is not None and info.name else f"buffer {int(buffer_id)}"
+        self._notify_user(f"Read marker moved to latest in {where}")
         self.post_message(ActiveBufferUpdated(buffer_id=buffer_id))
 
     @on(LineSubmitted)
@@ -366,7 +403,15 @@ class QuasselApp(App[None]):
         if self._client is None:
             return
         if self.active_buffer_id is None:
-            _log.debug("dropping input line with no active buffer: %r", event.text)
+            # The startup window: the input bar is focused and enabled
+            # from first paint while the handshake settles. The widget
+            # already cleared itself — restore the text and say why,
+            # instead of silently eating the user's first line.
+            self._restore_input(event.text)
+            self._notify_user(
+                "No active buffer yet — still connecting; try again in a moment",
+                severity="warning",
+            )
             return
         try:
             await self._client.send_input(self.active_buffer_id, event.text)

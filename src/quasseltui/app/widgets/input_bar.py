@@ -31,23 +31,51 @@ from __future__ import annotations
 
 from typing import ClassVar
 
+from textual.binding import Binding, BindingType
 from textual.widgets import Input
 
 from quasseltui.app.messages import LineSubmitted, MarkerToLatestRequested
 
+# Bounded history so an extremely chatty session can't grow memory
+# forever. 100 lines covers any realistic "what did I type earlier"
+# recall; irssi defaults to the same order of magnitude.
+_HISTORY_LIMIT = 100
+
 
 class InputBar(Input):
-    """Single-line text input docked at the bottom of the chat screen."""
+    """Single-line text input docked at the bottom of the chat screen.
+
+    Keeps a per-session history of submitted lines, recalled with
+    Up/Down — muscle memory for every IRC user (fix a typo'd line,
+    repeat a command). Up from a fresh prompt stashes any in-progress
+    text and walks backwards; Down walks forward and restores the
+    stash past the newest entry.
+    """
 
     DEFAULT_PLACEHOLDER: ClassVar[str] = "Type a message and press Enter…"
     """Exposed so the app can restore it after the disconnected-state
     placeholder (which names the disconnect reason) on reconnect."""
+
+    # `Input` doesn't use up/down; binding them here doesn't shadow any
+    # cursor movement. The app's buffer-cycle bindings are alt+arrow,
+    # so plain arrows are free for history.
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("up", "history_prev", "Previous input", show=False),
+        Binding("down", "history_next", "Next input", show=False),
+    ]
 
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(
             placeholder=self.DEFAULT_PLACEHOLDER,
             id=id,
         )
+        self._history: list[str] = []
+        # `None` = not browsing history (live prompt); otherwise the
+        # index into `_history` currently shown.
+        self._history_index: int | None = None
+        # In-progress text stashed when the user starts browsing, so
+        # walking past the newest entry gives their draft back.
+        self._history_stash: str = ""
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Route an Enter press to the right intent message.
@@ -64,6 +92,10 @@ class InputBar(Input):
         the keyboard. The app resolves the active buffer and the
         actual `MsgId`; the widget has no state to consult for that.
 
+        Whitespace-only Enter is a no-op that just clears the bar — a
+        space + Enter accident must neither broadcast a blank-looking
+        message to the channel nor count as a deliberate marker move.
+
         Non-empty Enter clears `self.value` eagerly to close the
         duplicate-submit window. The app restores on failure.
         """
@@ -72,8 +104,42 @@ class InputBar(Input):
         if not text:
             self.post_message(MarkerToLatestRequested())
             return
+        if not text.strip():
+            self.value = ""
+            return
         self.value = ""
+        self._remember(text)
         self.post_message(LineSubmitted(text=text))
+
+    def _remember(self, text: str) -> None:
+        if not self._history or self._history[-1] != text:
+            self._history.append(text)
+            if len(self._history) > _HISTORY_LIMIT:
+                del self._history[: len(self._history) - _HISTORY_LIMIT]
+        self._history_index = None
+        self._history_stash = ""
+
+    def action_history_prev(self) -> None:
+        if not self._history:
+            return
+        if self._history_index is None:
+            self._history_stash = self.value
+            self._history_index = len(self._history) - 1
+        else:
+            self._history_index = max(0, self._history_index - 1)
+        self.value = self._history[self._history_index]
+        self.cursor_position = len(self.value)
+
+    def action_history_next(self) -> None:
+        if self._history_index is None:
+            return
+        self._history_index += 1
+        if self._history_index >= len(self._history):
+            self._history_index = None
+            self.value = self._history_stash
+        else:
+            self.value = self._history[self._history_index]
+        self.cursor_position = len(self.value)
 
 
 __all__ = [

@@ -21,6 +21,7 @@ from textual.message import Message
 from quasseltui.app.bridge import ClientBridge, _pick_default_buffer
 from quasseltui.app.messages import (
     ActiveBufferUpdated,
+    BufferActivity,
     BufferListUpdated,
     SessionEnded,
 )
@@ -571,3 +572,71 @@ class TestSessionReopen:
         # The pointer must not have been re-picked away from the user's
         # buffer.
         assert sink.active_buffer_id == BufferId(11)
+
+
+class TestBufferActivity:
+    async def test_message_for_non_active_buffer_posts_activity(self) -> None:
+        buf_a, buf_b = _buffer_info(1, name="#a"), _buffer_info(2, name="#b")
+        state = _state_with_buffers(buf_a, buf_b)
+        sink = _StubSink()
+        sink.active_buffer_id = BufferId(1)
+        bridge = ClientBridge(
+            events=_iter(MessageReceived(message=_irc_message(2, msg_id=5))),
+            sink=sink,
+            state=state,
+        )
+        await bridge.run()
+        activity = [m for m in sink.posted if isinstance(m, BufferActivity)]
+        assert len(activity) == 1
+        assert activity[0].buffer_id == BufferId(2)
+        assert activity[0].highlight is False
+
+    async def test_highlight_flag_marks_activity_as_highlight(self) -> None:
+        import dataclasses
+
+        buf_a, buf_b = _buffer_info(1, name="#a"), _buffer_info(2, name="#b")
+        state = _state_with_buffers(buf_a, buf_b)
+        sink = _StubSink()
+        sink.active_buffer_id = BufferId(1)
+        msg = dataclasses.replace(_irc_message(2, msg_id=5), flags=MessageFlag.Highlight)
+        bridge = ClientBridge(
+            events=_iter(MessageReceived(message=msg)),
+            sink=sink,
+            state=state,
+        )
+        await bridge.run()
+        activity = [m for m in sink.posted if isinstance(m, BufferActivity)]
+        assert len(activity) == 1
+        assert activity[0].highlight is True
+
+    async def test_query_buffer_message_counts_as_highlight(self) -> None:
+        """A PM landing in a query buffer is always attention-worthy."""
+        import dataclasses
+
+        buf_a = _buffer_info(1, name="#a")
+        query = dataclasses.replace(_buffer_info(2, name="friend"), type=BufferType.Query)
+        state = _state_with_buffers(buf_a, query)
+        sink = _StubSink()
+        sink.active_buffer_id = BufferId(1)
+        bridge = ClientBridge(
+            events=_iter(MessageReceived(message=_irc_message(2, msg_id=5))),
+            sink=sink,
+            state=state,
+        )
+        await bridge.run()
+        activity = [m for m in sink.posted if isinstance(m, BufferActivity)]
+        assert len(activity) == 1
+        assert activity[0].highlight is True
+
+    async def test_message_for_active_buffer_posts_no_activity(self) -> None:
+        buf_a = _buffer_info(1, name="#a")
+        state = _state_with_buffers(buf_a)
+        sink = _StubSink()
+        sink.active_buffer_id = BufferId(1)
+        bridge = ClientBridge(
+            events=_iter(MessageReceived(message=_irc_message(1, msg_id=5))),
+            sink=sink,
+            state=state,
+        )
+        await bridge.run()
+        assert not [m for m in sink.posted if isinstance(m, BufferActivity)]

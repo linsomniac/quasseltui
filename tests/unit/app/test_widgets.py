@@ -183,3 +183,17 @@ class TestSafeLabel:
         assert "\n" not in label.plain
         assert "line1" in label.plain
         assert "line2" in label.plain
+
+
+class TestMircFormattingInMessages:
+    def test_mirc_codes_are_stripped_not_escaped(self) -> None:
+        """Bold/color codes from bots and colored announcements used to
+        render as literal \\x02 / \\x034,2 junk in every formatted
+        message. They carry no information a TUI renders today, so
+        strip them; sanitize_terminal stays as the safety net for
+        non-formatting control bytes."""
+        msg = _message(sender="bot", contents="\x02important\x02 \x034,2alert\x03 over")
+        plain = format_message(msg).plain
+        assert "important alert over" in plain
+        assert "\\x02" not in plain
+        assert "\\x03" not in plain
